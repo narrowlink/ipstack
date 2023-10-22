@@ -1,0 +1,12 @@
+[package]
+authors = ['Sajjad Pourali <sajjad@pourali.com>']
+description = 'Asynchronous lightweight implementation of TCP/IP stack for Tun device'
+name = "ipstack"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = 'https://github.com/SajjadPourali/ipstack'
+# homepage = 'https://github.com/SajjadPourali/ipstack'
+readme = "README.md"
+
+[dependencies]
