@@ -100,10 +100,10 @@ impl IpStackUdpStream {
             _ => unreachable!(),
         }
     }
-    pub fn get_src_addr(&self) -> SocketAddr {
+    pub fn local_addr(&self) -> SocketAddr {
         self.src_addr
     }
-    pub fn get_dst_addr(&self) -> SocketAddr {
+    pub fn peer_addr(&self) -> SocketAddr {
         self.dst_addr
     }
 }
