@@ -1,6 +1,6 @@
 use crate::{
     error::IpStackError,
-    packet::{tcp_flags, TcpPacket, IpStackPacketProtocol},
+    packet::{tcp_flags, IpStackPacketProtocol, TcpPacket},
     stream::tcb::{Tcb, TcpState},
 };
 use etherparse::{Ipv4Extensions, Ipv4Header, Ipv6Extensions, TransportHeader};
@@ -391,7 +391,7 @@ impl AsyncWrite for IpStackTcpStream {
             } else {
                 match self.tcb.timeout.as_mut().poll(cx) {
                     std::task::Poll::Ready(_) => {
-                        dbg!("timeout");
+                        // dbg!("timeout");
                         retransmission_full = true;
                         self.tcb.retransmission = Some(self.tcb.last_ack);
                         (self.tcb.last_ack, 0)

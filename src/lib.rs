@@ -58,11 +58,11 @@ impl IpStack {
                                 let t = packet.transport_protocol();
                                 if let Err(_x) = entry.get().send(packet){
                                     match t{
-                                        IpStackPacketProtocol::Tcp(t) => {
-                                            dbg!(t.flags());
+                                        IpStackPacketProtocol::Tcp(_t) => {
+                                            // dbg!(t.flags());
                                         }
                                         IpStackPacketProtocol::Udp => {
-                                            dbg!("udp");
+                                            // dbg!("udp");
                                         }
                                     }
 
