@@ -46,7 +46,7 @@ impl IpStackTcpStream {
             dst_addr,
             stream_sender,
             stream_receiver,
-            packet_sender: (pkt_sender.clone()),
+            packet_sender: pkt_sender.clone(),
             packet_to_send: None,
             tcb: Tcb::new(tcp.inner().sequence_number + 1),
             mtu,

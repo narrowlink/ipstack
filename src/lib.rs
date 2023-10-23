@@ -82,7 +82,7 @@ impl IpStack {
                                         }
                                     }
                                     IpStackPacketProtocol::Udp => {
-                                        let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(), pkt_sender.clone(),mtu);
+                                        let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(),packet.payload, pkt_sender.clone(),mtu);
                                         entry.insert(stream.stream_sender());
                                         accept_sender.send(IpStackStream::Udp(stream)).unwrap();
                                     }

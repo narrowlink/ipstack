@@ -22,6 +22,7 @@ thiserror = { version = "1.0", default-features = false }
 
 [dev-dependencies]
 tun = { version = "0.6", features = ["async"], default-features = false }
+udp-stream = { version = "0.0.9", default-features = false }
 
 [profile.release]
 opt-level = 'z'          # Optimize for size.

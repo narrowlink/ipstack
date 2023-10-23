@@ -1,5 +1,5 @@
 use core::task;
-use std::{io, net::SocketAddr, pin::Pin, task::Poll, time::Duration};
+use std::{future::Future, io, net::SocketAddr, pin::Pin, task::Poll, time::Duration};
 
 use etherparse::{
     Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header, TransportHeader, UdpHeader,
@@ -19,6 +19,7 @@ pub struct IpStackUdpStream {
     stream_sender: UnboundedSender<NetworkPacket>,
     stream_receiver: UnboundedReceiver<NetworkPacket>,
     packet_sender: UnboundedSender<NetworkPacket>,
+    first_paload: Option<Vec<u8>>,
     timeout: Pin<Box<Sleep>>,
     mtu: u16,
 }
@@ -27,6 +28,7 @@ impl IpStackUdpStream {
     pub fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
+        payload: Vec<u8>,
         pkt_sender: UnboundedSender<NetworkPacket>,
         mtu: u16,
     ) -> Self {
@@ -36,7 +38,8 @@ impl IpStackUdpStream {
             dst_addr,
             stream_sender,
             stream_receiver,
-            packet_sender: pkt_sender,
+            packet_sender: pkt_sender.clone(),
+            first_paload: Some(payload),
             timeout: Box::pin(tokio::time::sleep_until(
                 tokio::time::Instant::now() + UDP_TIMEOUT,
             )),
@@ -49,7 +52,7 @@ impl IpStackUdpStream {
     fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> NetworkPacket {
         match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, 6, dst.octets(), src.octets());
+                let mut ip_h = Ipv4Header::new(0, ttl, 17, dst.octets(), src.octets());
                 let line_buffer = self.mtu.saturating_sub(ip_h.header_len() as u16 + 8); // 8 is udp header size
                 payload.truncate(line_buffer as usize);
                 ip_h.payload_len = payload.len() as u16 + 8; // 8 is udp header size
@@ -60,7 +63,6 @@ impl IpStackUdpStream {
                     &payload,
                 )
                 .unwrap();
-
                 NetworkPacket {
                     ip: etherparse::IpHeader::Version4(ip_h, Ipv4Extensions::default()),
                     transport: TransportHeader::Udp(udp_header),
@@ -72,13 +74,15 @@ impl IpStackUdpStream {
                     traffic_class: 0,
                     flow_label: 0,
                     payload_length: 0,
-                    next_header: 6,
+                    next_header: 17,
                     hop_limit: ttl,
                     source: dst.octets(),
                     destination: src.octets(),
                 };
                 let line_buffer = self.mtu.saturating_sub(ip_h.header_len() as u16 + 8); // 8 is udp header size
+
                 payload.truncate(line_buffer as usize);
+
                 ip_h.payload_length = payload.len() as u16 + 8; // 8 is udp header size
                 let udp_header = UdpHeader::with_ipv6_checksum(
                     self.dst_addr.port(),
@@ -87,7 +91,6 @@ impl IpStackUdpStream {
                     &payload,
                 )
                 .unwrap();
-
                 NetworkPacket {
                     ip: etherparse::IpHeader::Version6(ip_h, Ipv6Extensions::default()),
                     transport: TransportHeader::Udp(udp_header),
@@ -111,18 +114,24 @@ impl AsyncRead for IpStackUdpStream {
         cx: &mut task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> task::Poll<io::Result<()>> {
-        loop {
-            match self.stream_receiver.poll_recv(cx) {
-                Poll::Ready(Some(p)) => {
-                    buf.put_slice(&p.payload);
-                    self.timeout
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + UDP_TIMEOUT);
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
+        if let Some(p) = self.first_paload.take() {
+            buf.put_slice(&p);
+            return Poll::Ready(Ok(()));
+        }
+        if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
+            return Poll::Ready(Ok(())); // todo: return timeout error
+        }
+
+        match self.stream_receiver.poll_recv(cx) {
+            Poll::Ready(Some(p)) => {
+                buf.put_slice(&p.payload);
+                self.timeout
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + UDP_TIMEOUT);
+                Poll::Ready(Ok(()))
             }
+            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

@@ -4,7 +4,7 @@ use etherparse::{IpHeader, PacketHeaders, TcpHeader, TransportHeader};
 
 use crate::error::IpStackError;
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Eq, Hash, PartialEq, Debug)]
 pub struct NetworkTuple {
     pub src: SocketAddr,
     pub dst: SocketAddr,
@@ -158,3 +158,21 @@ impl From<&TcpHeader> for TcpPacket {
         }
     }
 }
+
+// pub struct UdpPacket {
+//     header: UdpHeader,
+// }
+
+// impl UdpPacket {
+//     pub fn inner(&self) -> &UdpHeader {
+//         &self.header
+//     }
+// }
+
+// impl From<&UdpHeader> for UdpPacket {
+//     fn from(header: &UdpHeader) -> Self {
+//         UdpPacket {
+//             header: header.clone(),
+//         }
+//     }
+// }
