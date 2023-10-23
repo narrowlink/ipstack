@@ -2,7 +2,7 @@
 authors = ['Sajjad Pourali <sajjad@pourali.com>']
 description = 'Asynchronous lightweight implementation of TCP/IP stack for Tun device'
 name = "ipstack"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = 'https://github.com/SajjadPourali/ipstack'
@@ -10,11 +10,18 @@ repository = 'https://github.com/SajjadPourali/ipstack'
 readme = "README.md"
 
 [dependencies]
-tokio = { version = "1.14", features = ["full"] }
-tun = { version = "0.6", features = ["async"] }
-etherparse = { version = "0.13" }
-thiserror = { version = "1.0.49", default-features = false }
+tokio = { version = "1.33", features = [
+    "sync",
+    "rt",
+    "time",
+    "io-util",
+    "macros",
+], default-features = false }
+etherparse = { version = "0.13", default-features = false }
+thiserror = { version = "1.0", default-features = false }
 
+[dev-dependencies]
+tun = { version = "0.6", features = ["async"], default-features = false }
 
 [profile.release]
 opt-level = 'z'          # Optimize for size.

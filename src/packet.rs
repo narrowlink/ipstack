@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use etherparse::{IpHeader, PacketHeaders, TcpHeader, TransportHeader, UdpHeader};
+use etherparse::{IpHeader, PacketHeaders, TcpHeader, TransportHeader};
 
 use crate::error::IpStackError;
 
@@ -21,9 +21,9 @@ pub mod tcp_flags {
     pub const FIN: u8 = 0b00000001;
 }
 
-pub(crate) enum TunPacketProtocol {
+pub(crate) enum IpStackPacketProtocol {
     Tcp(TcpPacket),
-    Udp(UdpPacket),
+    Udp,
 }
 pub struct NetworkPacket {
     pub ip: IpHeader,
@@ -48,10 +48,10 @@ impl NetworkPacket {
             payload,
         })
     }
-    pub(crate) fn transport_protocol(&self) -> TunPacketProtocol {
+    pub(crate) fn transport_protocol(&self) -> IpStackPacketProtocol {
         match self.transport {
-            TransportHeader::Udp(ref h) => TunPacketProtocol::Udp(h.into()),
-            TransportHeader::Tcp(ref h) => TunPacketProtocol::Tcp(h.into()),
+            TransportHeader::Udp(_) => IpStackPacketProtocol::Udp,
+            TransportHeader::Tcp(ref h) => IpStackPacketProtocol::Tcp(h.into()),
             _ => unreachable!(),
         }
     }
@@ -96,10 +96,10 @@ impl NetworkPacket {
         let mut buf = Vec::new();
         self.ip
             .write(&mut buf)
-            .map_err(|e| IpStackError::PacketWriteError(e))?;
+            .map_err(IpStackError::PacketWriteError)?;
         self.transport
             .write(&mut buf)
-            .map_err(|e| IpStackError::PacketWriteError(e))?;
+            .map_err(IpStackError::PacketWriteError)?;
         buf.extend_from_slice(&self.payload);
         Ok(buf)
     }
@@ -154,24 +154,6 @@ impl TcpPacket {
 impl From<&TcpHeader> for TcpPacket {
     fn from(header: &TcpHeader) -> Self {
         TcpPacket {
-            header: header.clone(),
-        }
-    }
-}
-
-pub struct UdpPacket {
-    header: UdpHeader,
-}
-
-impl UdpPacket {
-    pub fn inner(&self) -> &UdpHeader {
-        &self.header
-    }
-}
-
-impl From<&UdpHeader> for UdpPacket {
-    fn from(header: &UdpHeader) -> Self {
-        UdpPacket {
             header: header.clone(),
         }
     }

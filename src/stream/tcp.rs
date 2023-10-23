@@ -1,6 +1,6 @@
 use crate::{
     error::IpStackError,
-    packet::{tcp_flags, TcpPacket, TunPacketProtocol},
+    packet::{tcp_flags, TcpPacket, IpStackPacketProtocol},
     stream::tcb::{Tcb, TcpState},
 };
 use etherparse::{Ipv4Extensions, Ipv4Header, Ipv6Extensions, TransportHeader};
@@ -17,7 +17,7 @@ use crate::packet::NetworkPacket;
 
 use super::tcb::PacketStatus;
 
-pub struct TunTcpStream {
+pub struct IpStackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     stream_sender: UnboundedSender<NetworkPacket>,
@@ -31,17 +31,17 @@ pub struct TunTcpStream {
     write_notify: Option<Waker>,
 }
 
-impl TunTcpStream {
+impl IpStackTcpStream {
     pub(crate) async fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         tcp: TcpPacket,
         pkt_sender: UnboundedSender<NetworkPacket>,
         mtu: u16,
-    ) -> Result<TunTcpStream, IpStackError> {
+    ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
-        let stream = TunTcpStream {
+        let stream = IpStackTcpStream {
             src_addr,
             dst_addr,
             stream_sender,
@@ -66,7 +66,7 @@ impl TunTcpStream {
         }
         Ok(stream)
     }
-    pub fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
+    pub(crate) fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
         self.stream_sender.clone()
     }
     fn calculate_payload_len(
@@ -169,9 +169,15 @@ impl TunTcpStream {
             payload,
         }
     }
+    pub fn local_addr(&self) -> SocketAddr {
+        self.src_addr
+    }
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.dst_addr
+    }
 }
 
-impl AsyncRead for TunTcpStream {
+impl AsyncRead for IpStackTcpStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -213,7 +219,7 @@ impl AsyncRead for TunTcpStream {
             }
             match self.stream_receiver.poll_recv(cx) {
                 std::task::Poll::Ready(Some(p)) => {
-                    let TunPacketProtocol::Tcp(t) = p.transport_protocol() else {
+                    let IpStackPacketProtocol::Tcp(t) = p.transport_protocol() else {
                         unreachable!()
                     };
 
@@ -329,7 +335,7 @@ impl AsyncRead for TunTcpStream {
     }
 }
 
-impl AsyncWrite for TunTcpStream {
+impl AsyncWrite for IpStackTcpStream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

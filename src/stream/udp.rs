@@ -1,0 +1,158 @@
+use core::task;
+use std::{io, net::SocketAddr, pin::Pin, task::Poll, time::Duration};
+
+use etherparse::{
+    Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header, TransportHeader, UdpHeader,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    time::Sleep,
+};
+
+use crate::packet::NetworkPacket;
+const UDP_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub struct IpStackUdpStream {
+    src_addr: SocketAddr,
+    dst_addr: SocketAddr,
+    stream_sender: UnboundedSender<NetworkPacket>,
+    stream_receiver: UnboundedReceiver<NetworkPacket>,
+    packet_sender: UnboundedSender<NetworkPacket>,
+    timeout: Pin<Box<Sleep>>,
+    mtu: u16,
+}
+
+impl IpStackUdpStream {
+    pub fn new(
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
+        pkt_sender: UnboundedSender<NetworkPacket>,
+        mtu: u16,
+    ) -> Self {
+        let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
+        IpStackUdpStream {
+            src_addr,
+            dst_addr,
+            stream_sender,
+            stream_receiver,
+            packet_sender: pkt_sender,
+            timeout: Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::now() + UDP_TIMEOUT,
+            )),
+            mtu,
+        }
+    }
+    pub(crate) fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
+        self.stream_sender.clone()
+    }
+    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> NetworkPacket {
+        match (self.dst_addr.ip(), self.src_addr.ip()) {
+            (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
+                let mut ip_h = Ipv4Header::new(0, ttl, 6, dst.octets(), src.octets());
+                let line_buffer = self.mtu.saturating_sub(ip_h.header_len() as u16 + 8); // 8 is udp header size
+                payload.truncate(line_buffer as usize);
+                ip_h.payload_len = payload.len() as u16 + 8; // 8 is udp header size
+                let udp_header = UdpHeader::with_ipv4_checksum(
+                    self.dst_addr.port(),
+                    self.src_addr.port(),
+                    &ip_h,
+                    &payload,
+                )
+                .unwrap();
+
+                NetworkPacket {
+                    ip: etherparse::IpHeader::Version4(ip_h, Ipv4Extensions::default()),
+                    transport: TransportHeader::Udp(udp_header),
+                    payload,
+                }
+            }
+            (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
+                let mut ip_h = Ipv6Header {
+                    traffic_class: 0,
+                    flow_label: 0,
+                    payload_length: 0,
+                    next_header: 6,
+                    hop_limit: ttl,
+                    source: dst.octets(),
+                    destination: src.octets(),
+                };
+                let line_buffer = self.mtu.saturating_sub(ip_h.header_len() as u16 + 8); // 8 is udp header size
+                payload.truncate(line_buffer as usize);
+                ip_h.payload_length = payload.len() as u16 + 8; // 8 is udp header size
+                let udp_header = UdpHeader::with_ipv6_checksum(
+                    self.dst_addr.port(),
+                    self.src_addr.port(),
+                    &ip_h,
+                    &payload,
+                )
+                .unwrap();
+
+                NetworkPacket {
+                    ip: etherparse::IpHeader::Version6(ip_h, Ipv6Extensions::default()),
+                    transport: TransportHeader::Udp(udp_header),
+                    payload,
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    pub fn get_src_addr(&self) -> SocketAddr {
+        self.src_addr
+    }
+    pub fn get_dst_addr(&self) -> SocketAddr {
+        self.dst_addr
+    }
+}
+
+impl AsyncRead for IpStackUdpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> task::Poll<io::Result<()>> {
+        loop {
+            match self.stream_receiver.poll_recv(cx) {
+                Poll::Ready(Some(p)) => {
+                    buf.put_slice(&p.payload);
+                    self.timeout
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + UDP_TIMEOUT);
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for IpStackUdpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> task::Poll<Result<usize, io::Error>> {
+        self.timeout
+            .as_mut()
+            .reset(tokio::time::Instant::now() + UDP_TIMEOUT);
+        let packet = self.create_rev_packet(64, buf.to_vec());
+        let payload_len = packet.payload.len();
+        self.packet_sender.send(packet).unwrap();
+        std::task::Poll::Ready(Ok(payload_len))
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut task::Context<'_>,
+    ) -> task::Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut task::Context<'_>,
+    ) -> task::Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}

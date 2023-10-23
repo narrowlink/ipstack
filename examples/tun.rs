@@ -1,29 +1,26 @@
 use std::net::Ipv4Addr;
 
-use ipstack::stream::TunStream;
+use ipstack::stream::IpStackStream;
 use tokio::{join, net::TcpStream};
 
 const MTU: u16 = 1500;
 // const MTU: u16 = 1u16 << 16 - 1;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let ipv4 = Ipv4Addr::new(10, 10, 10, 10);
     let mut config = tun::Configuration::default();
     config
         .address(ipv4)
-        // .destination(ipv4)
-        // .netmask((255, 255, 255, 255))
+        .netmask((255, 255, 255, 0))
         .mtu(MTU as i32)
         .up();
     let mut ip_stack = ipstack::IpStack::new(tun::create_as_async(&config).unwrap(), MTU, true);
 
     loop {
-        let x = ip_stack.accept().await;
-        // let s = TcpStream::connect("155.248.228.149:80").await.unwrap();
-        let s = TcpStream::connect("127.0.0.1:8000").await.unwrap();
-        match x {
-            TunStream::Tcp(t) => {
+        match ip_stack.accept().await {
+            IpStackStream::Tcp(t) => {
+                let s = TcpStream::connect("127.0.0.1:8000").await.unwrap();
                 let (mut t_rx, mut t_tx) = tokio::io::split(t);
                 let (mut s_rx, mut s_tx) = tokio::io::split(s);
                 tokio::spawn(async move {
@@ -34,7 +31,11 @@ async fn main() {
                     }
                     // }
                 });
-            } // TunStream::Udp(_t) => {}
+            }
+            IpStackStream::Udp(udp) => {
+                dbg!(udp.get_dst_addr());
+                dbg!(udp.get_src_addr());
+            }
         };
     }
 }

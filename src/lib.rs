@@ -4,14 +4,17 @@ use std::collections::{
 };
 
 use packet::{NetworkPacket, NetworkTuple};
-use stream::TunStream;
+use stream::IpStackStream;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 
-use crate::{packet::TunPacketProtocol, stream::TunTcpStream};
+use crate::{
+    packet::IpStackPacketProtocol,
+    stream::{IpStackTcpStream, IpStackUdpStream},
+};
 mod error;
 mod packet;
 pub mod stream;
@@ -28,7 +31,7 @@ const TUN_PROTO_IP6: [u8; 2] = [0x00, 0x02];
 const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 
 pub struct IpStack {
-    accept_receiver: UnboundedReceiver<TunStream>,
+    accept_receiver: UnboundedReceiver<IpStackStream>,
 }
 
 impl IpStack {
@@ -36,7 +39,7 @@ impl IpStack {
     where
         D: AsyncRead + AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
     {
-        let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<TunStream>();
+        let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
 
         tokio::spawn(async move {
             let mut streams: HashMap<NetworkTuple, UnboundedSender<NetworkPacket>> = HashMap::new();
@@ -53,12 +56,12 @@ impl IpStack {
                         match streams.entry(packet.network_tuple()){
                             Occupied(entry) =>{
                                 let t = packet.transport_protocol();
-                                if let Err(x) = entry.get().send(packet){
+                                if let Err(_x) = entry.get().send(packet){
                                     match t{
-                                        TunPacketProtocol::Tcp(t) => {
+                                        IpStackPacketProtocol::Tcp(t) => {
                                             dbg!(t.flags());
                                         }
-                                        TunPacketProtocol::Udp(_) => {
+                                        IpStackPacketProtocol::Udp => {
                                             dbg!("udp");
                                         }
                                     }
@@ -67,25 +70,23 @@ impl IpStack {
                             }
                             Vacant(entry) => {
                                 match packet.transport_protocol(){
-                                    TunPacketProtocol::Tcp(h) => {
-                                        match TunTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),mtu).await{
+                                    IpStackPacketProtocol::Tcp(h) => {
+                                        match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),mtu).await{
                                             Ok(stream) => {
                                                 entry.insert(stream.stream_sender());
-                                                accept_sender.send(TunStream::Tcp(stream)).unwrap();
+                                                accept_sender.send(IpStackStream::Tcp(stream)).unwrap();
                                             }
                                             Err(e) => {
                                                 dbg!(e);
                                             }
                                         }
                                     }
-                                    TunPacketProtocol::Udp(_) => {
-                                        // let stream = TunUdpStream::new(packet.src_addr(),packet.dst_addr(), pkt_sender.clone());
-                                        // entry.insert(stream.stream_sender());
-                                        // accept_sender.send(TunStream::Udp(stream)).await.unwrap();
+                                    IpStackPacketProtocol::Udp => {
+                                        let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(), pkt_sender.clone(),mtu);
+                                        entry.insert(stream.stream_sender());
+                                        accept_sender.send(IpStackStream::Udp(stream)).unwrap();
                                     }
                                 }
-                                // TunStream::Tcp(TunTcpStream::new(packet, pkt_sender.clone()));
-                                // entry.insert();
                             }
                         }
                     }
@@ -114,7 +115,7 @@ impl IpStack {
 
         IpStack { accept_receiver }
     }
-    pub async fn accept(&mut self) -> TunStream {
+    pub async fn accept(&mut self) -> IpStackStream {
         self.accept_receiver.recv().await.unwrap()
     }
 }
