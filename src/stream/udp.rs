@@ -1,5 +1,12 @@
 use core::task;
-use std::{future::Future, io, net::SocketAddr, pin::Pin, task::Poll, time::Duration};
+use std::{
+    future::Future,
+    io::{self, Error, ErrorKind},
+    net::SocketAddr,
+    pin::Pin,
+    task::Poll,
+    time::Duration,
+};
 
 use etherparse::{
     Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header, TransportHeader, UdpHeader,
@@ -49,7 +56,7 @@ impl IpStackUdpStream {
     pub(crate) fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
         self.stream_sender.clone()
     }
-    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> NetworkPacket {
+    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> Result<NetworkPacket, Error> {
         match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
                 let mut ip_h = Ipv4Header::new(0, ttl, 17, dst.octets(), src.octets());
@@ -62,12 +69,12 @@ impl IpStackUdpStream {
                     &ip_h,
                     &payload,
                 )
-                .unwrap();
-                NetworkPacket {
+                .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;
+                Ok(NetworkPacket {
                     ip: etherparse::IpHeader::Version4(ip_h, Ipv4Extensions::default()),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
-                }
+                })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
                 let mut ip_h = Ipv6Header {
@@ -90,12 +97,12 @@ impl IpStackUdpStream {
                     &ip_h,
                     &payload,
                 )
-                .unwrap();
-                NetworkPacket {
+                .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;
+                Ok(NetworkPacket {
                     ip: etherparse::IpHeader::Version6(ip_h, Ipv6Extensions::default()),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
-                }
+                })
             }
             _ => unreachable!(),
         }
@@ -145,9 +152,11 @@ impl AsyncWrite for IpStackUdpStream {
         self.timeout
             .as_mut()
             .reset(tokio::time::Instant::now() + UDP_TIMEOUT);
-        let packet = self.create_rev_packet(64, buf.to_vec());
+        let packet = self.create_rev_packet(64, buf.to_vec())?;
         let payload_len = packet.payload.len();
-        self.packet_sender.send(packet).unwrap();
+        self.packet_sender
+            .send(packet)
+            .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
         std::task::Poll::Ready(Ok(payload_len))
     }
 

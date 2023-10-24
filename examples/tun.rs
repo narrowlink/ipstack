@@ -5,7 +5,7 @@ use tokio::{join, net::TcpStream};
 use udp_stream::UdpStream;
 
 // const MTU: u16 = 1500;
-const MTU: u16 = 1u16 << 16 - 1;
+const MTU: u16 = u16::MAX;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

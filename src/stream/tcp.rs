@@ -4,7 +4,14 @@ use crate::{
     stream::tcb::{Tcb, TcpState},
 };
 use etherparse::{Ipv4Extensions, Ipv4Header, Ipv6Extensions, TransportHeader};
-use std::{cmp, future::Future, net::SocketAddr, pin::Pin, task::Waker};
+use std::{
+    cmp,
+    future::Future,
+    io::{Error, ErrorKind},
+    net::SocketAddr,
+    pin::Pin,
+    task::Waker,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{
@@ -61,7 +68,7 @@ impl IpStackTcpStream {
                     64,
                     None,
                     Vec::new(),
-                ))
+                )?)
                 .map_err(|_| IpStackError::InvalidTcpPacket)?;
         }
         Ok(stream)
@@ -92,7 +99,7 @@ impl IpStackTcpStream {
         ttl: u8,
         seq: Option<u32>,
         mut payload: Vec<u8>,
-    ) -> NetworkPacket {
+    ) -> Result<NetworkPacket, Error> {
         let mut tcp_header = etherparse::TcpHeader::new(
             self.dst_addr.port(),
             self.src_addr.port(),
@@ -157,17 +164,21 @@ impl IpStackTcpStream {
 
         match ip_header {
             etherparse::IpHeader::Version4(ref ip_header, _) => {
-                tcp_header.checksum = tcp_header.calc_checksum_ipv4(ip_header, &payload).unwrap();
+                tcp_header.checksum = tcp_header
+                    .calc_checksum_ipv4(ip_header, &payload)
+                    .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;
             }
             etherparse::IpHeader::Version6(ref ip_header, _) => {
-                tcp_header.checksum = tcp_header.calc_checksum_ipv6(ip_header, &payload).unwrap();
+                tcp_header.checksum = tcp_header
+                    .calc_checksum_ipv6(ip_header, &payload)
+                    .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;
             }
         }
-        NetworkPacket {
+        Ok(NetworkPacket {
             ip: ip_header,
             transport: TransportHeader::Tcp(tcp_header),
             payload,
-        }
+        })
     }
     pub fn local_addr(&self) -> SocketAddr {
         self.src_addr
@@ -193,13 +204,15 @@ impl AsyncRead for IpStackTcpStream {
                     64,
                     None,
                     Vec::new(),
-                ));
+                )?);
                 self.tcb.add_seq_one();
                 self.tcb.change_state(TcpState::SynReceived(true));
             }
 
             if let Some(packet) = self.packet_to_send.take() {
-                self.packet_sender.send(packet).unwrap();
+                self.packet_sender
+                    .send(packet)
+                    .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
                 if matches!(self.tcb.get_state(), TcpState::Closed) {
                     if let Some(shutdown) = self.shutdown.take() {
                         shutdown.notify_one();
@@ -214,7 +227,7 @@ impl AsyncRead for IpStackTcpStream {
                     64,
                     None,
                     Vec::new(),
-                ));
+                )?);
                 continue;
             }
             match self.stream_receiver.poll_recv(cx) {
@@ -224,7 +237,8 @@ impl AsyncRead for IpStackTcpStream {
                     };
 
                     if t.flags() & tcp_flags::RST != 0 {
-                        self.packet_to_send = Some(self.create_rev_packet(0, 0, None, Vec::new()));
+                        self.packet_to_send =
+                            Some(self.create_rev_packet(0, 0, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
                         continue;
                     }
@@ -267,7 +281,7 @@ impl AsyncRead for IpStackTcpStream {
                                         64,
                                         None,
                                         Vec::new(),
-                                    ));
+                                    )?);
                                     self.tcb.change_send_window(t.inner().window_size);
                                     if let Some(ref n) = self.flush_notify {
                                         n.wake_by_ref();
@@ -294,7 +308,7 @@ impl AsyncRead for IpStackTcpStream {
                                 64,
                                 None,
                                 Vec::new(),
-                            ));
+                            )?);
                             self.tcb.change_state(TcpState::FinWait2);
                             continue;
                         }
@@ -309,21 +323,30 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.add_ack(p.payload.len() as u32);
                             self.tcb.change_send_window(t.inner().window_size);
                             buf.put_slice(&p.payload);
-                            self.packet_to_send =
-                                Some(self.create_rev_packet(tcp_flags::ACK, 64, None, Vec::new()));
+                            self.packet_to_send = Some(self.create_rev_packet(
+                                tcp_flags::ACK,
+                                64,
+                                None,
+                                Vec::new(),
+                            )?);
                             return std::task::Poll::Ready(Ok(()));
                         }
                     } else if matches!(self.tcb.get_state(), TcpState::FinWait1) {
                         if t.flags() == (tcp_flags::FIN | tcp_flags::ACK) {
-                            self.packet_to_send =
-                                Some(self.create_rev_packet(tcp_flags::ACK, 64, None, Vec::new()));
+                            self.packet_to_send = Some(self.create_rev_packet(
+                                tcp_flags::ACK,
+                                64,
+                                None,
+                                Vec::new(),
+                            )?);
                             self.tcb.change_send_window(t.inner().window_size);
                             self.tcb.add_seq_one();
                             self.tcb.change_state(TcpState::FinWait2);
                             continue;
                         }
                     } else if matches!(self.tcb.get_state(), TcpState::FinWait2) {
-                        self.packet_to_send = Some(self.create_rev_packet(0, 0, None, Vec::new()));
+                        self.packet_to_send =
+                            Some(self.create_rev_packet(0, 0, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
                         continue;
                     }
@@ -358,14 +381,16 @@ impl AsyncWrite for IpStackTcpStream {
             }
 
             let packet =
-                self.create_rev_packet(tcp_flags::PSH | tcp_flags::ACK, 64, None, buf.to_vec());
+                self.create_rev_packet(tcp_flags::PSH | tcp_flags::ACK, 64, None, buf.to_vec())?;
             let payload_len = packet.payload.len();
             let payload = packet.payload.clone();
             if payload_len == 0 {
                 continue; // require end condition
             }
 
-            self.packet_sender.send(packet).unwrap();
+            self.packet_sender
+                .send(packet)
+                .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
             self.tcb.add_send_buffer(&payload);
 
             return std::task::Poll::Ready(Ok(payload_len));
@@ -410,9 +435,11 @@ impl AsyncWrite for IpStackTcpStream {
             };
 
             let packet =
-                self.create_rev_packet(tcp_flags::PSH | tcp_flags::ACK, 64, Some(from_seq), buf);
+                self.create_rev_packet(tcp_flags::PSH | tcp_flags::ACK, 64, Some(from_seq), buf)?;
             let buf_len = packet.payload.len();
-            self.packet_sender.send(packet).unwrap();
+            self.packet_sender
+                .send(packet)
+                .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
 
             if let Some(s) = self.tcb.retransmission.take() {
                 if retransmission_full {
