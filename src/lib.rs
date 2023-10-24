@@ -19,6 +19,7 @@ mod error;
 mod packet;
 pub mod stream;
 
+#[cfg(not(target_os = "windows"))]
 const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
 #[cfg(target_os = "linux")]
 const TUN_PROTO_IP6: [u8; 2] = [0x86, 0xdd];
@@ -49,7 +50,9 @@ impl IpStack {
             loop {
                 select! {
                     Ok(n) = device.read(&mut buffer) => {
-                        let Ok(packet) = NetworkPacket::parse(&buffer[4..n])else{
+                        let offset = if packet_info && cfg!(not(target_os = "windows")) {4} else {0};
+                        // dbg!(&buffer[offset..n]);
+                        let Ok(packet) = NetworkPacket::parse(&buffer[offset..n])else{
                             dbg!("parse error");
                             continue;
                         };
@@ -95,10 +98,17 @@ impl IpStack {
                             streams.remove(&packet.network_tuple());
                             continue;
                         }
+                        #[cfg(not(target_os = "windows"))]
                         let Ok(mut packet_byte) = packet.to_bytes() else{
                             dbg!("to_bytes error");
                             continue;
                         };
+                        #[cfg(target_os = "windows")]
+                        let Ok(packet_byte) = packet.to_bytes() else{
+                            dbg!("to_bytes error");
+                            continue;
+                        };
+                        #[cfg(not(target_os = "windows"))]
                         if packet_info {
                             if packet.src_addr().is_ipv4(){
                                 packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
