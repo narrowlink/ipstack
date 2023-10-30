@@ -48,6 +48,7 @@ impl IpStack {
 
             let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
             loop {
+                // dbg!(streams.len());
                 select! {
                     Ok(n) = device.read(&mut buffer) => {
                         let offset = if packet_info && cfg!(not(target_os = "windows")) {4} else {0};
@@ -60,6 +61,7 @@ impl IpStack {
                             Occupied(entry) =>{
                                 let t = packet.transport_protocol();
                                 if let Err(_x) = entry.get().send(packet){
+                                    dbg!(_x);
                                     match t{
                                         IpStackPacketProtocol::Tcp(_t) => {
                                             // dbg!(t.flags());
@@ -95,7 +97,7 @@ impl IpStack {
                     }
                     Some(packet) = pkt_receiver.recv() => {
                         if packet.ttl() == 0{
-                            streams.remove(&packet.network_tuple());
+                            streams.remove(&packet.reverse_network_tuple());
                             continue;
                         }
                         #[cfg(not(target_os = "windows"))]

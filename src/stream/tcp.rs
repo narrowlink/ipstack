@@ -232,7 +232,7 @@ impl AsyncRead for IpStackTcpStream {
                         self.packet_to_send =
                             Some(self.create_rev_packet(0, 0, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
-                        continue;
+                        return std::task::Poll::Ready(Err(Error::from(ErrorKind::ConnectionReset)));
                     }
                     if matches!(
                         self.tcb.check_pkt_type(&t, &p.payload),
@@ -351,7 +351,7 @@ impl AsyncRead for IpStackTcpStream {
                         self.packet_to_send =
                             Some(self.create_rev_packet(0, 0, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
-                        continue;
+                        return std::task::Poll::Ready(Ok(()));
                     }
                 }
                 std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(())),
@@ -430,7 +430,6 @@ impl AsyncWrite for IpStackTcpStream {
             }
             panic!("Please report these values at: https://github.com/SajjadPourali/ipstack/");
         }
-
         std::task::Poll::Ready(Ok(()))
     }
 
@@ -442,6 +441,14 @@ impl AsyncWrite for IpStackTcpStream {
         match Pin::new(&mut Box::pin(notified)).poll(cx) {
             std::task::Poll::Ready(_) => std::task::Poll::Ready(Ok(())),
             std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for IpStackTcpStream {
+    fn drop(&mut self) {
+        if let Ok(p) = self.create_rev_packet(0, 0, None, Vec::new()) {
+            _ = self.packet_sender.send(p);
         }
     }
 }

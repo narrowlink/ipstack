@@ -92,6 +92,13 @@ impl NetworkPacket {
             tcp: matches!(self.transport, TransportHeader::Tcp(_)),
         }
     }
+    pub fn reverse_network_tuple(&self) -> NetworkTuple {
+        NetworkTuple {
+            src: self.dst_addr(),
+            dst: self.src_addr(),
+            tcp: matches!(self.transport, TransportHeader::Tcp(_)),
+        }
+    }
     pub fn to_bytes(&self) -> Result<Vec<u8>, IpStackError> {
         let mut buf = Vec::new();
         self.ip
