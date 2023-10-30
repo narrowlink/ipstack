@@ -232,7 +232,9 @@ impl AsyncRead for IpStackTcpStream {
                         self.packet_to_send =
                             Some(self.create_rev_packet(0, 0, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
-                        return std::task::Poll::Ready(Err(Error::from(ErrorKind::ConnectionReset)));
+                        return std::task::Poll::Ready(Err(Error::from(
+                            ErrorKind::ConnectionReset,
+                        )));
                     }
                     if matches!(
                         self.tcb.check_pkt_type(&t, &p.payload),
@@ -368,7 +370,7 @@ impl AsyncWrite for IpStackTcpStream {
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         if matches!(self.tcb.get_state(), TcpState::Closed) {
-            return std::task::Poll::Pending;
+            return std::task::Poll::Ready(Ok(0));
         }
         if (self.tcb.send_window as u64) < self.tcb.avg_send_window.0 / 2
             || self.tcb.is_send_buffer_full()
