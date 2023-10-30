@@ -18,8 +18,14 @@ async fn main() {
         .netmask((255, 255, 255, 0))
         .mtu(MTU as i32)
         .up();
+
+    #[cfg(target_os = "linux")]
+    config.platform(|config| {
+        config.packet_information(true);
+    });
+
     #[cfg(not(target_os = "windows"))]
-    let mut ip_stack = ipstack::IpStack::new(tun::create_as_async(&config).unwrap(), MTU, false);
+    let mut ip_stack = ipstack::IpStack::new(tun::create_as_async(&config).unwrap(), MTU, true);
 
     #[cfg(target_os = "windows")]
     let mut ip_stack = ipstack::IpStack::new(
