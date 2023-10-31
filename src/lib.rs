@@ -3,7 +3,7 @@ use std::collections::{
     HashMap,
 };
 
-use error::IpStackError;
+pub use error::IpStackError;
 use packet::{NetworkPacket, NetworkTuple};
 use stream::IpStackStream;
 use tokio::{
@@ -19,6 +19,8 @@ use crate::{
 mod error;
 mod packet;
 pub mod stream;
+
+
 
 #[cfg(not(target_os = "windows"))]
 const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
