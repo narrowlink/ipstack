@@ -3,6 +3,7 @@ use std::collections::{
     HashMap,
 };
 
+use error::IpStackError;
 use packet::{NetworkPacket, NetworkTuple};
 use stream::IpStackStream;
 use tokio::{
@@ -127,7 +128,11 @@ impl IpStack {
 
         IpStack { accept_receiver }
     }
-    pub async fn accept(&mut self) -> IpStackStream {
-        self.accept_receiver.recv().await.unwrap()
+    pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
+        if let Some(s) = self.accept_receiver.recv().await {
+            Ok(s)
+        } else {
+            Err(IpStackError::AcceptError)
+        }
     }
 }

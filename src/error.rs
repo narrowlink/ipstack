@@ -14,4 +14,6 @@ pub enum IpStackError {
     InvalidTcpPacket,
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("Accept Error")]
+    AcceptError,
 }
