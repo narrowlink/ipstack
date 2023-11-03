@@ -1,16 +1,16 @@
+pub use error::IpStackError;
+use packet::{NetworkPacket, NetworkTuple};
 use std::collections::{
     hash_map::Entry::{Occupied, Vacant},
     HashMap,
 };
-
-pub use error::IpStackError;
-use packet::{NetworkPacket, NetworkTuple};
 use stream::IpStackStream;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
+use tracing::{error, trace};
 
 use crate::{
     packet::IpStackPacketProtocol,
@@ -19,8 +19,6 @@ use crate::{
 mod error;
 mod packet;
 pub mod stream;
-
-
 
 #[cfg(not(target_os = "windows"))]
 const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
@@ -57,14 +55,14 @@ impl IpStack {
                         let offset = if packet_info && cfg!(not(target_os = "windows")) {4} else {0};
                         // dbg!(&buffer[offset..n]);
                         let Ok(packet) = NetworkPacket::parse(&buffer[offset..n])else{
-                            dbg!("parse error");
+                            trace!("parse error");
                             continue;
                         };
                         match streams.entry(packet.network_tuple()){
                             Occupied(entry) =>{
                                 let t = packet.transport_protocol();
                                 if let Err(_x) = entry.get().send(packet){
-                                    dbg!(_x);
+                                    error!("{}", _x);
                                     match t{
                                         IpStackPacketProtocol::Tcp(_t) => {
                                             // dbg!(t.flags());
@@ -85,7 +83,7 @@ impl IpStack {
                                                 accept_sender.send(IpStackStream::Tcp(stream)).unwrap();
                                             }
                                             Err(e) => {
-                                                dbg!(e);
+                                                error!("{}",e);
                                             }
                                         }
                                     }
@@ -105,12 +103,12 @@ impl IpStack {
                         }
                         #[cfg(not(target_os = "windows"))]
                         let Ok(mut packet_byte) = packet.to_bytes() else{
-                            dbg!("to_bytes error");
+                            trace!("to_bytes error");
                             continue;
                         };
                         #[cfg(target_os = "windows")]
                         let Ok(packet_byte) = packet.to_bytes() else{
-                            dbg!("to_bytes error");
+                            trace!("to_bytes error");
                             continue;
                         };
                         #[cfg(not(target_os = "windows"))]

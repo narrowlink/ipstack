@@ -19,6 +19,7 @@ use tokio::{
         Notify,
     },
 };
+use tracing::warn;
 
 use crate::packet::NetworkPacket;
 
@@ -419,15 +420,15 @@ impl AsyncWrite for IpStackTcpStream {
                 .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
             self.tcb.retransmission = None;
         } else if let Some(i) = self.tcb.retransmission {
-            dbg!(i);
-            dbg!(self.tcb.seq);
-            dbg!(self.tcb.last_ack);
-            dbg!(self.tcb.ack);
+            warn!(i);
+            warn!(self.tcb.seq);
+            warn!(self.tcb.last_ack);
+            warn!(self.tcb.ack);
             for p in self.tcb.inflight_packets.iter() {
-                dbg!(p.seq);
-                dbg!(p.payload.len());
+                warn!(p.seq);
+                warn!("{}", p.payload.len());
             }
-            panic!("Please report these values at: https://github.com/SajjadPourali/ipstack/");
+            panic!("Please report these values at: https://github.com/narrowlink/ipstack/");
         }
         std::task::Poll::Ready(Ok(()))
     }
