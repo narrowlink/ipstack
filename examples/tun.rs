@@ -37,7 +37,7 @@ async fn main() {
     loop {
         match ip_stack.accept().await.unwrap() {
             IpStackStream::Tcp(tcp) => {
-                let s = TcpStream::connect("1.1.1.1:80").await.unwrap();
+                let s = TcpStream::connect("155.248.228.149:22").await.unwrap();
                 let (mut t_rx, mut t_tx) = tokio::io::split(tcp);
                 let (mut s_rx, mut s_tx) = tokio::io::split(s);
                 tokio::spawn(async move {

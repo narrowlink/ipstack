@@ -10,7 +10,7 @@ use tokio::{
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
-use tracing::{error, trace, warn};
+use tracing::{error, trace};
 
 use crate::{
     packet::IpStackPacketProtocol,

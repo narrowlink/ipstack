@@ -176,8 +176,8 @@ impl AsyncRead for IpStackTcpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         loop {
-            self.tcb
-                .change_recv_window(buf.initialize_unfilled().len() as u16);
+            let min = cmp::min(self.tcb.get_available_read_buffer_size() as u16, u16::MAX);
+            self.tcb.change_recv_window(min);
             if matches!(
                 Pin::new(&mut self.tcb.timeout).poll(cx),
                 std::task::Poll::Ready(_)
@@ -215,6 +215,14 @@ impl AsyncRead for IpStackTcpStream {
                     }
                     return std::task::Poll::Ready(Ok(()));
                 }
+            }
+            if let Some(b) = self.tcb.get_unordered_packets() {
+                self.tcb.add_ack(b.len() as u32);
+                buf.put_slice(&b);
+                self.packet_sender
+                    .send(self.create_rev_packet(tcp_flags::ACK, TTL, None, Vec::new())?)
+                    .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
+                return std::task::Poll::Ready(Ok(()));
             }
             if self.shutdown.is_some() && matches!(self.tcb.get_state(), TcpState::Established) {
                 self.tcb.change_state(TcpState::FinWait1);
@@ -276,21 +284,37 @@ impl AsyncRead for IpStackTcpStream {
                                     continue;
                                 }
                                 PacketStatus::NewPacket => {
+                                    // if t.inner().sequence_number != self.tcb.get_ack() {
+                                    //     dbg!(t.inner().sequence_number);
+                                    //     self.packet_to_send = Some(self.create_rev_packet(
+                                    //         tcp_flags::ACK,
+                                    //         TTL,
+                                    //         None,
+                                    //         Vec::new(),
+                                    //     )?);
+                                    //     continue;
+                                    // }
+
                                     self.tcb.change_last_ack(t.inner().acknowledgment_number);
-                                    buf.put_slice(&p.payload);
-                                    self.tcb.add_ack(p.payload.len() as u32);
-                                    self.packet_to_send = Some(self.create_rev_packet(
-                                        tcp_flags::ACK,
-                                        TTL,
-                                        None,
-                                        Vec::new(),
-                                    )?);
+                                    self.tcb.add_unordered_packet(
+                                        t.inner().sequence_number,
+                                        &p.payload,
+                                    );
+                                    // buf.put_slice(&p.payload);
+                                    // self.tcb.add_ack(p.payload.len() as u32);
+                                    // self.packet_to_send = Some(self.create_rev_packet(
+                                    //     tcp_flags::ACK,
+                                    //     TTL,
+                                    //     None,
+                                    //     Vec::new(),
+                                    // )?);
                                     self.tcb.change_send_window(t.inner().window_size);
                                     if let Some(ref n) = self.write_notify {
                                         n.wake_by_ref();
                                         self.write_notify = None;
                                     };
-                                    return std::task::Poll::Ready(Ok(()));
+                                    continue;
+                                    // return std::task::Poll::Ready(Ok(()));
                                 }
                                 PacketStatus::Ack => {
                                     self.tcb.change_last_ack(t.inner().acknowledgment_number);
@@ -328,16 +352,20 @@ impl AsyncRead for IpStackTcpStream {
                             {
                                 continue;
                             }
-                            self.tcb.add_ack(p.payload.len() as u32);
+
+                            // self.tcb.add_ack(p.payload.len() as u32);
                             self.tcb.change_send_window(t.inner().window_size);
-                            buf.put_slice(&p.payload);
-                            self.packet_to_send = Some(self.create_rev_packet(
-                                tcp_flags::ACK,
-                                TTL,
-                                None,
-                                Vec::new(),
-                            )?);
-                            return std::task::Poll::Ready(Ok(()));
+                            // buf.put_slice(&p.payload);
+                            // self.packet_to_send = Some(self.create_rev_packet(
+                            //     tcp_flags::ACK,
+                            //     TTL,
+                            //     None,
+                            //     Vec::new(),
+                            // )?);
+                            // return std::task::Poll::Ready(Ok(()));
+                            self.tcb
+                                .add_unordered_packet(t.inner().sequence_number, &p.payload);
+                            continue;
                         }
                     } else if matches!(self.tcb.get_state(), TcpState::FinWait1) {
                         if t.flags() == (tcp_flags::FIN | tcp_flags::ACK) {

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     pin::Pin,
     time::{Duration, SystemTime},
 };
@@ -8,6 +9,7 @@ use tokio::time::Sleep;
 use crate::packet::TcpPacket;
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
+const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -38,6 +40,7 @@ pub(super) struct Tcb {
     state: TcpState,
     pub(super) avg_send_window: (u64, u64),
     pub(super) inflight_packets: Vec<InflightPacket>,
+    pub(super) unordered_packets: BTreeMap<u32, UnorderedPacket>,
 }
 
 impl Tcb {
@@ -56,12 +59,36 @@ impl Tcb {
             state: TcpState::SynReceived(false),
             avg_send_window: (1, 1),
             inflight_packets: Vec::new(),
+            unordered_packets: BTreeMap::new(),
         }
     }
     pub(super) fn add_inflight_packet(&mut self, seq: u32, buf: &[u8]) {
         self.inflight_packets
             .push(InflightPacket::new(seq, buf.to_vec()));
         self.seq = self.seq.wrapping_add(buf.len() as u32);
+    }
+    pub(super) fn add_unordered_packet(&mut self, seq: u32, buf: &[u8]) {
+        if seq < self.ack {
+            return;
+        }
+        self.unordered_packets
+            .insert(seq, UnorderedPacket::new(buf.to_vec()));
+    }
+    pub(super) fn get_available_read_buffer_size(&self) -> usize {
+        READ_BUFFER_SIZE.saturating_sub(
+            self.unordered_packets
+                .iter()
+                .fold(0, |acc, (_, p)| acc + p.payload.len()),
+        )
+    }
+    pub(super) fn get_unordered_packets(&mut self) -> Option<Vec<u8>> {
+        // dbg!(self.ack);
+        // for (seq,_) in self.unordered_packets.iter() {
+        //     dbg!(seq);
+        // }
+        self.unordered_packets
+            .remove(&self.ack)
+            .map(|p| p.payload.clone())
     }
     pub(super) fn add_seq_one(&mut self) {
         self.seq = self.seq.wrapping_add(1);
@@ -186,5 +213,19 @@ impl InflightPacket {
     }
     pub(crate) fn contains(&self, seq: u32) -> bool {
         self.seq < seq && self.seq + self.payload.len() as u32 >= seq
+    }
+}
+
+pub struct UnorderedPacket {
+    pub payload: Vec<u8>,
+    pub recv_time: SystemTime,
+}
+
+impl UnorderedPacket {
+    pub(crate) fn new(payload: Vec<u8>) -> Self {
+        Self {
+            payload,
+            recv_time: SystemTime::now(),
+        }
     }
 }
