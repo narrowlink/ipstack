@@ -10,7 +10,7 @@ use tokio::{
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 use crate::{
     packet::IpStackPacketProtocol,
@@ -20,8 +20,17 @@ mod error;
 mod packet;
 pub mod stream;
 
+const DROP_TTL: u8 = 0;
+
+#[cfg(not(target_os = "windows"))]
+const TTL: u8 = 64;
+
+#[cfg(target_os = "windows")]
+const TTL: u8 = 128;
+
 #[cfg(not(target_os = "windows"))]
 const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
+
 #[cfg(target_os = "linux")]
 const TUN_PROTO_IP6: [u8; 2] = [0x86, 0xdd];
 #[cfg(target_os = "linux")]
@@ -62,7 +71,7 @@ impl IpStack {
                             Occupied(entry) =>{
                                 let t = packet.transport_protocol();
                                 if let Err(_x) = entry.get().send(packet){
-                                    error!("{}", _x);
+                                    trace!("{}", _x);
                                     match t{
                                         IpStackPacketProtocol::Tcp(_t) => {
                                             // dbg!(t.flags());

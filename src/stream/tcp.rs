@@ -2,6 +2,7 @@ use crate::{
     error::IpStackError,
     packet::{tcp_flags, IpStackPacketProtocol, TcpPacket},
     stream::tcb::{Tcb, TcpState},
+    DROP_TTL, TTL,
 };
 use etherparse::{Ipv4Extensions, Ipv4Header, Ipv6Extensions, TransportHeader};
 use std::{
@@ -19,7 +20,7 @@ use tokio::{
         Notify,
     },
 };
-use tracing::warn;
+use tracing::{trace, warn};
 
 use crate::packet::NetworkPacket;
 
@@ -64,7 +65,7 @@ impl IpStackTcpStream {
             pkt_sender
                 .send(stream.create_rev_packet(
                     tcp_flags::RST | tcp_flags::ACK,
-                    64,
+                    TTL,
                     None,
                     Vec::new(),
                 )?)
@@ -181,10 +182,11 @@ impl AsyncRead for IpStackTcpStream {
                 Pin::new(&mut self.tcb.timeout).poll(cx),
                 std::task::Poll::Ready(_)
             ) {
+                trace!("timeout reached for {:?}", self.dst_addr);
                 self.packet_sender
                     .send(self.create_rev_packet(
                         tcp_flags::RST | tcp_flags::ACK,
-                        64,
+                        TTL,
                         None,
                         Vec::new(),
                     )?)
@@ -195,7 +197,7 @@ impl AsyncRead for IpStackTcpStream {
             if matches!(self.tcb.get_state(), TcpState::SynReceived(false)) {
                 self.packet_to_send = Some(self.create_rev_packet(
                     tcp_flags::SYN | tcp_flags::ACK,
-                    64,
+                    TTL,
                     None,
                     Vec::new(),
                 )?);
@@ -218,7 +220,7 @@ impl AsyncRead for IpStackTcpStream {
                 self.tcb.change_state(TcpState::FinWait1);
                 self.packet_to_send = Some(self.create_rev_packet(
                     tcp_flags::FIN | tcp_flags::ACK,
-                    64,
+                    TTL,
                     None,
                     Vec::new(),
                 )?);
@@ -231,7 +233,7 @@ impl AsyncRead for IpStackTcpStream {
                     };
                     if t.flags() & tcp_flags::RST != 0 {
                         self.packet_to_send =
-                            Some(self.create_rev_packet(0, 0, None, Vec::new())?);
+                            Some(self.create_rev_packet(0, DROP_TTL, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
                         return std::task::Poll::Ready(Err(Error::from(
                             ErrorKind::ConnectionReset,
@@ -279,7 +281,7 @@ impl AsyncRead for IpStackTcpStream {
                                     self.tcb.add_ack(p.payload.len() as u32);
                                     self.packet_to_send = Some(self.create_rev_packet(
                                         tcp_flags::ACK,
-                                        64,
+                                        TTL,
                                         None,
                                         Vec::new(),
                                     )?);
@@ -305,7 +307,7 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.add_ack(1);
                             self.packet_to_send = Some(self.create_rev_packet(
                                 tcp_flags::FIN | tcp_flags::ACK,
-                                64,
+                                TTL,
                                 None,
                                 Vec::new(),
                             )?);
@@ -331,7 +333,7 @@ impl AsyncRead for IpStackTcpStream {
                             buf.put_slice(&p.payload);
                             self.packet_to_send = Some(self.create_rev_packet(
                                 tcp_flags::ACK,
-                                64,
+                                TTL,
                                 None,
                                 Vec::new(),
                             )?);
@@ -341,7 +343,7 @@ impl AsyncRead for IpStackTcpStream {
                         if t.flags() == (tcp_flags::FIN | tcp_flags::ACK) {
                             self.packet_to_send = Some(self.create_rev_packet(
                                 tcp_flags::ACK,
-                                64,
+                                TTL,
                                 None,
                                 Vec::new(),
                             )?);
@@ -352,7 +354,7 @@ impl AsyncRead for IpStackTcpStream {
                         }
                     } else if matches!(self.tcb.get_state(), TcpState::FinWait2) {
                         self.packet_to_send =
-                            Some(self.create_rev_packet(0, 0, None, Vec::new())?);
+                            Some(self.create_rev_packet(0, DROP_TTL, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
                         return std::task::Poll::Ready(Ok(()));
                     }
@@ -385,7 +387,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         let packet =
-            self.create_rev_packet(tcp_flags::PSH | tcp_flags::ACK, 64, None, buf.to_vec())?;
+            self.create_rev_packet(tcp_flags::PSH | tcp_flags::ACK, TTL, None, buf.to_vec())?;
         let seq = self.tcb.seq;
         let payload_len = packet.payload.len();
         let payload = packet.payload.clone();
@@ -410,7 +412,7 @@ impl AsyncWrite for IpStackTcpStream {
         {
             let packet = self.create_rev_packet(
                 tcp_flags::PSH | tcp_flags::ACK,
-                64,
+                TTL,
                 Some(i.seq),
                 i.payload.to_vec(),
             )?;
@@ -447,7 +449,7 @@ impl AsyncWrite for IpStackTcpStream {
 
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
-        if let Ok(p) = self.create_rev_packet(0, 0, None, Vec::new()) {
+        if let Ok(p) = self.create_rev_packet(0, DROP_TTL, None, Vec::new()) {
             _ = self.packet_sender.send(p);
         }
     }

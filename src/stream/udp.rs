@@ -17,7 +17,7 @@ use tokio::{
     time::Sleep,
 };
 
-use crate::packet::NetworkPacket;
+use crate::{packet::NetworkPacket, TTL};
 const UDP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct IpStackUdpStream {
@@ -152,7 +152,7 @@ impl AsyncWrite for IpStackUdpStream {
         self.timeout
             .as_mut()
             .reset(tokio::time::Instant::now() + UDP_TIMEOUT);
-        let packet = self.create_rev_packet(64, buf.to_vec())?;
+        let packet = self.create_rev_packet(TTL, buf.to_vec())?;
         let payload_len = packet.payload.len();
         self.packet_sender
             .send(packet)
