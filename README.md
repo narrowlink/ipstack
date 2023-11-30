@@ -44,3 +44,5 @@ async fn main(){
 	}
 }
 ````
+
+We also suggest that you take a look at the complete [examples](https://github.com/narrowlink/ipstack/tree/main/examples).
