@@ -10,25 +10,22 @@ repository = 'https://github.com/narrowlink/ipstack'
 readme = "README.md"
 
 [dependencies]
-tokio = { version = "1.33", features = [
+tokio = { version = "1.34", features = [
     "sync",
     "rt",
     "time",
     "io-util",
     "macros",
+    "rt-multi-thread",
 ], default-features = false }
 etherparse = { version = "0.13", default-features = false }
 thiserror = { version = "1.0", default-features = false }
 tracing = { version = "0.1.40", default-features = false }
 
 [dev-dependencies]
+clap = { version = "4.4", features = ["derive"] }
 udp-stream = { version = "0.0.9", default-features = false }
-
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
-tun = { version = "0.6", features = ["async"], default-features = false }
-
-[target.'cfg(target_os = "windows")'.dev-dependencies]
-wintun = { version = "0.3", default-features = false }
+tun = { git = "https://github.com/ssrlive/rust-tun.git", features = ["async"] }
 
 [profile.release]
 opt-level = 'z'          # Optimize for size.

@@ -110,13 +110,8 @@ impl IpStack {
                             streams.remove(&packet.reverse_network_tuple());
                             continue;
                         }
-                        #[cfg(not(target_os = "windows"))]
+                        #[allow(unused_mut)]
                         let Ok(mut packet_byte) = packet.to_bytes() else{
-                            trace!("to_bytes error");
-                            continue;
-                        };
-                        #[cfg(target_os = "windows")]
-                        let Ok(packet_byte) = packet.to_bytes() else{
                             trace!("to_bytes error");
                             continue;
                         };
