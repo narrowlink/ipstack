@@ -17,3 +17,14 @@ pub enum IpStackError {
     #[error("Accept Error")]
     AcceptError,
 }
+
+impl From<IpStackError> for std::io::Error {
+    fn from(e: IpStackError) -> Self {
+        match e {
+            IpStackError::IoError(e) => e,
+            _ => std::io::Error::new(std::io::ErrorKind::Other, e),
+        }
+    }
+}
+
+pub type Result<T, E = IpStackError> = std::result::Result<T, E>;

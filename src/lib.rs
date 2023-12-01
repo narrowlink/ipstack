@@ -1,4 +1,4 @@
-pub use error::IpStackError;
+pub use error::{IpStackError, Result};
 use packet::{NetworkPacket, NetworkTuple};
 use std::collections::{
     hash_map::Entry::{Occupied, Vacant},
@@ -28,7 +28,7 @@ const TTL: u8 = 64;
 #[cfg(target_os = "windows")]
 const TTL: u8 = 128;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
 
 #[cfg(target_os = "linux")]
@@ -115,7 +115,7 @@ impl IpStack {
                             trace!("to_bytes error");
                             continue;
                         };
-                        #[cfg(not(target_os = "windows"))]
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
                         if packet_info {
                             if packet.src_addr().is_ipv4(){
                                 packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
