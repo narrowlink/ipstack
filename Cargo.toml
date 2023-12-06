@@ -24,7 +24,7 @@ tracing = { version = "0.1.40", default-features = false }
 
 [dev-dependencies]
 clap = { version = "4.4", features = ["derive"] }
-udp-stream = { version = "0.0.9", default-features = false }
+udp-stream = { version = "0.0", default-features = false }
 tun = { git = "https://github.com/ssrlive/rust-tun.git", features = ["async"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]

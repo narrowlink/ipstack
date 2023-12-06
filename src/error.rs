@@ -16,6 +16,9 @@ pub enum IpStackError {
     IoError(#[from] std::io::Error),
     #[error("Accept Error")]
     AcceptError,
+
+    #[error("Send Error {0}")]
+    SendError(#[from] tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>),
 }
 
 impl From<IpStackError> for std::io::Error {

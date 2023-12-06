@@ -89,7 +89,7 @@ impl IpStack {
                                         match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),mtu).await{
                                             Ok(stream) => {
                                                 entry.insert(stream.stream_sender());
-                                                accept_sender.send(IpStackStream::Tcp(stream)).unwrap();
+                                                accept_sender.send(IpStackStream::Tcp(stream))?;
                                             }
                                             Err(e) => {
                                                 error!("{}",e);
@@ -99,7 +99,7 @@ impl IpStack {
                                     IpStackPacketProtocol::Udp => {
                                         let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(),packet.payload, pkt_sender.clone(),mtu);
                                         entry.insert(stream.stream_sender());
-                                        accept_sender.send(IpStackStream::Udp(stream)).unwrap();
+                                        accept_sender.send(IpStackStream::Udp(stream))?;
                                     }
                                 }
                             }
@@ -123,11 +123,13 @@ impl IpStack {
                                 packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
                             }
                         }
-                        device.write_all(&packet_byte).await.unwrap();
+                        device.write_all(&packet_byte).await?;
                         // device.flush().await.unwrap();
                     }
                 }
             }
+            #[allow(unreachable_code)]
+            Ok::<(), IpStackError>(())
         });
 
         IpStack { accept_receiver }
