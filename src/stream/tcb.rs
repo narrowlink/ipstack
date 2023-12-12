@@ -35,7 +35,7 @@ pub(super) struct Tcb {
     pub(super) ack: u32,
     pub(super) last_ack: u32,
     pub(super) timeout: Pin<Box<Sleep>>,
-	tcp_timeout:Option<Duration>,
+    tcp_timeout: Option<Duration>,
     recv_window: u16,
     pub(super) send_window: u16,
     state: TcpState,
@@ -45,14 +45,14 @@ pub(super) struct Tcb {
 }
 
 impl Tcb {
-    pub(super) fn new(ack: u32,tcp_timeout:Option<Duration>) -> Tcb {
+    pub(super) fn new(ack: u32, tcp_timeout: Option<Duration>) -> Tcb {
         let seq = 100;
         Tcb {
             seq,
             retransmission: None,
             ack,
             last_ack: seq,
-			tcp_timeout,
+            tcp_timeout,
             timeout: Box::pin(tokio::time::sleep_until(
                 tokio::time::Instant::now() + tcp_timeout.unwrap_or(TCP_TIMEOUT),
             )),

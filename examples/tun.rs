@@ -23,7 +23,13 @@ async fn main() {
         config.packet_information(true);
     });
 
-    let mut ip_stack = ipstack::IpStack::new(tun::create_as_async(&config).unwrap(), MTU, true,None,None);
+    let mut ip_stack = ipstack::IpStack::new(
+        tun::create_as_async(&config).unwrap(),
+        MTU,
+        true,
+        None,
+        None,
+    );
 
     #[cfg(target_os = "macos")]
     {

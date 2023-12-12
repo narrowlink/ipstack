@@ -1,9 +1,12 @@
 pub use error::IpStackError;
 use packet::{NetworkPacket, NetworkTuple};
-use std::{collections::{
-    hash_map::Entry::{Occupied, Vacant},
-    HashMap,
-}, time::Duration};
+use std::{
+    collections::{
+        hash_map::Entry::{Occupied, Vacant},
+        HashMap,
+    },
+    time::Duration,
+};
 use stream::IpStackStream;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -46,7 +49,13 @@ pub struct IpStack {
 }
 
 impl IpStack {
-    pub fn new<D>(mut device: D, mtu: u16, packet_info: bool,tcp_timeout:Option<Duration>,udp_timeout:Option<Duration>) -> IpStack
+    pub fn new<D>(
+        mut device: D,
+        mtu: u16,
+        packet_info: bool,
+        tcp_timeout: Option<Duration>,
+        udp_timeout: Option<Duration>,
+    ) -> IpStack
     where
         D: AsyncRead + AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
     {
