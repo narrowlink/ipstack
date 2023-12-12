@@ -11,7 +11,7 @@ use std::{
     io::{Error, ErrorKind},
     net::SocketAddr,
     pin::Pin,
-    task::Waker,
+    task::Waker, time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -46,6 +46,7 @@ impl IpStackTcpStream {
         tcp: TcpPacket,
         pkt_sender: UnboundedSender<NetworkPacket>,
         mtu: u16,
+		tcp_timeout:Option<Duration>
     ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
@@ -56,7 +57,7 @@ impl IpStackTcpStream {
             stream_receiver,
             packet_sender: pkt_sender.clone(),
             packet_to_send: None,
-            tcb: Tcb::new(tcp.inner().sequence_number + 1),
+            tcb: Tcb::new(tcp.inner().sequence_number + 1,tcp_timeout),
             mtu,
             shutdown: None,
             write_notify: None,

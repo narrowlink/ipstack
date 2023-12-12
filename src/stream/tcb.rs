@@ -35,6 +35,7 @@ pub(super) struct Tcb {
     pub(super) ack: u32,
     pub(super) last_ack: u32,
     pub(super) timeout: Pin<Box<Sleep>>,
+	tcp_timeout:Option<Duration>,
     recv_window: u16,
     pub(super) send_window: u16,
     state: TcpState,
@@ -44,15 +45,16 @@ pub(super) struct Tcb {
 }
 
 impl Tcb {
-    pub(super) fn new(ack: u32) -> Tcb {
+    pub(super) fn new(ack: u32,tcp_timeout:Option<Duration>) -> Tcb {
         let seq = 100;
         Tcb {
             seq,
             retransmission: None,
             ack,
             last_ack: seq,
+			tcp_timeout,
             timeout: Box::pin(tokio::time::sleep_until(
-                tokio::time::Instant::now() + TCP_TIMEOUT,
+                tokio::time::Instant::now() + tcp_timeout.unwrap_or(TCP_TIMEOUT),
             )),
             send_window: u16::MAX,
             recv_window: 0,
@@ -175,7 +177,7 @@ impl Tcb {
     pub(super) fn change_last_ack(&mut self, ack: u32) {
         self.timeout
             .as_mut()
-            .reset(tokio::time::Instant::now() + TCP_TIMEOUT);
+            .reset(tokio::time::Instant::now() + self.tcp_timeout.unwrap_or(TCP_TIMEOUT));
         let distance = ack.wrapping_sub(self.last_ack);
 
         if matches!(self.state, TcpState::Established) {

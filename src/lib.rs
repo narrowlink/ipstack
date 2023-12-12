@@ -1,9 +1,9 @@
 pub use error::IpStackError;
 use packet::{NetworkPacket, NetworkTuple};
-use std::collections::{
+use std::{collections::{
     hash_map::Entry::{Occupied, Vacant},
     HashMap,
-};
+}, time::Duration};
 use stream::IpStackStream;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -46,7 +46,7 @@ pub struct IpStack {
 }
 
 impl IpStack {
-    pub fn new<D>(mut device: D, mtu: u16, packet_info: bool) -> IpStack
+    pub fn new<D>(mut device: D, mtu: u16, packet_info: bool,tcp_timeout:Option<Duration>,udp_timeout:Option<Duration>) -> IpStack
     where
         D: AsyncRead + AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
     {
@@ -86,7 +86,7 @@ impl IpStack {
                             Vacant(entry) => {
                                 match packet.transport_protocol(){
                                     IpStackPacketProtocol::Tcp(h) => {
-                                        match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),mtu).await{
+                                        match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),mtu,tcp_timeout).await{
                                             Ok(stream) => {
                                                 entry.insert(stream.stream_sender());
                                                 accept_sender.send(IpStackStream::Tcp(stream)).unwrap();
@@ -97,7 +97,7 @@ impl IpStack {
                                         }
                                     }
                                     IpStackPacketProtocol::Udp => {
-                                        let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(),packet.payload, pkt_sender.clone(),mtu);
+                                        let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(),packet.payload, pkt_sender.clone(),mtu,udp_timeout);
                                         entry.insert(stream.stream_sender());
                                         accept_sender.send(IpStackStream::Udp(stream)).unwrap();
                                     }
