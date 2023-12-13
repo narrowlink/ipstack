@@ -17,7 +17,7 @@ pub enum TcpState {
     SynReceived(bool), // bool means if syn/ack is sent
     Established,
     FinWait1,
-    FinWait2,
+    FinWait2(bool), // bool means waiting for ack
     Closed,
 }
 #[derive(Clone, Debug)]
@@ -145,10 +145,9 @@ impl Tcb {
         let current_ack_distance = self.seq.wrapping_sub(self.last_ack);
         if received_ack_distance > current_ack_distance
             || (incoming_packet.inner().acknowledgment_number != self.seq
-                && incoming_packet
-                    .inner()
-                    .acknowledgment_number
-                    .saturating_sub(self.seq)
+                && self
+                    .seq
+                    .saturating_sub(incoming_packet.inner().acknowledgment_number)
                     == 0)
         {
             PacketStatus::Invalid
