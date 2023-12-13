@@ -24,11 +24,8 @@ async fn main() {
     });
 
     let mut ip_stack = ipstack::IpStack::new(
+        ipstack::IpStackConfig::default(),
         tun::create_as_async(&config).unwrap(),
-        MTU,
-        true,
-        None,
-        None,
     );
 
     #[cfg(target_os = "macos")]

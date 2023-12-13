@@ -18,7 +18,6 @@ use tokio::{
 };
 
 use crate::{packet::NetworkPacket, TTL};
-const UDP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
@@ -28,7 +27,7 @@ pub struct IpStackUdpStream {
     packet_sender: UnboundedSender<NetworkPacket>,
     first_paload: Option<Vec<u8>>,
     timeout: Pin<Box<Sleep>>,
-    udp_timeout: Option<Duration>,
+    udp_timeout: Duration,
     mtu: u16,
 }
 
@@ -39,7 +38,7 @@ impl IpStackUdpStream {
         payload: Vec<u8>,
         pkt_sender: UnboundedSender<NetworkPacket>,
         mtu: u16,
-        udp_timeout: Option<Duration>,
+        udp_timeout: Duration,
     ) -> Self {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
         IpStackUdpStream {
@@ -50,7 +49,7 @@ impl IpStackUdpStream {
             packet_sender: pkt_sender.clone(),
             first_paload: Some(payload),
             timeout: Box::pin(tokio::time::sleep_until(
-                tokio::time::Instant::now() + udp_timeout.unwrap_or(UDP_TIMEOUT),
+                tokio::time::Instant::now() + udp_timeout,
             )),
             udp_timeout,
             mtu,
@@ -138,7 +137,7 @@ impl AsyncRead for IpStackUdpStream {
                 buf.put_slice(&p.payload);
                 self.timeout
                     .as_mut()
-                    .reset(tokio::time::Instant::now() + udp_timeout.unwrap_or(UDP_TIMEOUT));
+                    .reset(tokio::time::Instant::now() + udp_timeout);
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
@@ -156,7 +155,7 @@ impl AsyncWrite for IpStackUdpStream {
         let udp_timeout = self.udp_timeout;
         self.timeout
             .as_mut()
-            .reset(tokio::time::Instant::now() + udp_timeout.unwrap_or(UDP_TIMEOUT));
+            .reset(tokio::time::Instant::now() + udp_timeout);
         let packet = self.create_rev_packet(TTL, buf.to_vec())?;
         let payload_len = packet.payload.len();
         self.packet_sender

@@ -47,7 +47,7 @@ impl IpStackTcpStream {
         tcp: TcpPacket,
         pkt_sender: UnboundedSender<NetworkPacket>,
         mtu: u16,
-        tcp_timeout: Option<Duration>,
+        tcp_timeout: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
