@@ -12,6 +12,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     task::Waker,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -46,6 +47,7 @@ impl IpStackTcpStream {
         tcp: TcpPacket,
         pkt_sender: UnboundedSender<NetworkPacket>,
         mtu: u16,
+        tcp_timeout: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
@@ -56,7 +58,7 @@ impl IpStackTcpStream {
             stream_receiver,
             packet_sender: pkt_sender.clone(),
             packet_to_send: None,
-            tcb: Tcb::new(tcp.inner().sequence_number + 1),
+            tcb: Tcb::new(tcp.inner().sequence_number + 1, tcp_timeout),
             mtu,
             shutdown: None,
             write_notify: None,
@@ -176,6 +178,12 @@ impl AsyncRead for IpStackTcpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         loop {
+            if matches!(self.tcb.get_state(), TcpState::FinWait2(false)) {
+                self.packet_to_send =
+                    Some(self.create_rev_packet(0, DROP_TTL, None, Vec::new())?);
+                self.tcb.change_state(TcpState::Closed);
+                return std::task::Poll::Ready(Ok(()));
+            }
             let min = cmp::min(self.tcb.get_available_read_buffer_size() as u16, u16::MAX);
             self.tcb.change_recv_window(min);
             if matches!(
@@ -335,7 +343,8 @@ impl AsyncRead for IpStackTcpStream {
                                 None,
                                 Vec::new(),
                             )?);
-                            self.tcb.change_state(TcpState::FinWait2);
+                            self.tcb.add_seq_one();
+                            self.tcb.change_state(TcpState::FinWait2(true));
                             continue;
                         }
                         if t.flags() == (tcp_flags::PSH | tcp_flags::ACK) {
@@ -377,14 +386,13 @@ impl AsyncRead for IpStackTcpStream {
                             )?);
                             self.tcb.change_send_window(t.inner().window_size);
                             self.tcb.add_seq_one();
-                            self.tcb.change_state(TcpState::FinWait2);
+                            self.tcb.change_state(TcpState::FinWait2(false));
                             continue;
                         }
-                    } else if matches!(self.tcb.get_state(), TcpState::FinWait2) {
-                        self.packet_to_send =
-                            Some(self.create_rev_packet(0, DROP_TTL, None, Vec::new())?);
-                        self.tcb.change_state(TcpState::Closed);
-                        return std::task::Poll::Ready(Ok(()));
+                    } else if matches!(self.tcb.get_state(), TcpState::FinWait2(true))
+                        && t.flags() == tcp_flags::ACK
+                    {
+                        self.tcb.change_state(TcpState::FinWait2(false));
                     }
                 }
                 std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(())),

@@ -21,7 +21,12 @@ async fn main(){
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
     let mut config = tun::Configuration::default();
     config.address(ipv4).netmask(netmask).mtu(MTU as i32).up();
-    let mut ip_stack = ipstack::IpStack::new(tun::create_as_async(&config).unwrap(), MTU, true);
+
+    let mut ipstack_config = ipstack::IpStackConfig::default();
+    ipstack_config.mtu(MTU);
+    ipstack_config.packet_info(cfg!(target_family = "unix"));
+    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config).unwrap());
+
     while let Ok(stream) = ip_stack.accept().await {
         match stream {
             IpStackStream::Tcp(tcp) => {

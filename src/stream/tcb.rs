@@ -10,14 +10,13 @@ use crate::packet::TcpPacket;
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
-const TCP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub enum TcpState {
     SynReceived(bool), // bool means if syn/ack is sent
     Established,
     FinWait1,
-    FinWait2,
+    FinWait2(bool), // bool means waiting for ack
     Closed,
 }
 #[derive(Clone, Debug)]
@@ -35,6 +34,7 @@ pub(super) struct Tcb {
     pub(super) ack: u32,
     pub(super) last_ack: u32,
     pub(super) timeout: Pin<Box<Sleep>>,
+    tcp_timeout: Duration,
     recv_window: u16,
     pub(super) send_window: u16,
     state: TcpState,
@@ -44,15 +44,16 @@ pub(super) struct Tcb {
 }
 
 impl Tcb {
-    pub(super) fn new(ack: u32) -> Tcb {
+    pub(super) fn new(ack: u32, tcp_timeout: Duration) -> Tcb {
         let seq = 100;
         Tcb {
             seq,
             retransmission: None,
             ack,
             last_ack: seq,
+            tcp_timeout,
             timeout: Box::pin(tokio::time::sleep_until(
-                tokio::time::Instant::now() + TCP_TIMEOUT,
+                tokio::time::Instant::now() + tcp_timeout,
             )),
             send_window: u16::MAX,
             recv_window: 0,
@@ -145,10 +146,9 @@ impl Tcb {
         let current_ack_distance = self.seq.wrapping_sub(self.last_ack);
         if received_ack_distance > current_ack_distance
             || (incoming_packet.inner().acknowledgment_number != self.seq
-                && incoming_packet
-                    .inner()
-                    .acknowledgment_number
-                    .saturating_sub(self.seq)
+                && self
+                    .seq
+                    .saturating_sub(incoming_packet.inner().acknowledgment_number)
                     == 0)
         {
             PacketStatus::Invalid
@@ -175,7 +175,7 @@ impl Tcb {
     pub(super) fn change_last_ack(&mut self, ack: u32) {
         self.timeout
             .as_mut()
-            .reset(tokio::time::Instant::now() + TCP_TIMEOUT);
+            .reset(tokio::time::Instant::now() + self.tcp_timeout);
         let distance = ack.wrapping_sub(self.last_ack);
 
         if matches!(self.state, TcpState::Established) {
