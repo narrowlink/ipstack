@@ -51,7 +51,7 @@ impl IpStackTcpStream {
     ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
-        let stream = IpStackTcpStream {
+        let mut stream = IpStackTcpStream {
             src_addr,
             dst_addr,
             stream_sender,
@@ -72,6 +72,7 @@ impl IpStackTcpStream {
                     Vec::new(),
                 )?)
                 .map_err(|_| IpStackError::InvalidTcpPacket)?;
+            stream.tcb.change_state(TcpState::Closed);
         }
         Ok(stream)
     }
