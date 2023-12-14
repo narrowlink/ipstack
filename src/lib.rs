@@ -13,7 +13,6 @@ use tokio::{
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
-use tracing::{error, trace};
 
 use crate::{
     packet::IpStackPacketProtocol,
@@ -100,14 +99,14 @@ impl IpStack {
                         let offset = if config.packet_info && cfg!(not(target_os = "windows")) {4} else {0};
                         // dbg!(&buffer[offset..n]);
                         let Ok(packet) = NetworkPacket::parse(&buffer[offset..n])else{
-                            trace!("parse error");
+                            log::trace!("parse error");
                             continue;
                         };
                         match streams.entry(packet.network_tuple()){
                             Occupied(entry) =>{
                                 let t = packet.transport_protocol();
                                 if let Err(_x) = entry.get().send(packet){
-                                    trace!("{}", _x);
+                                    log::trace!("{}", _x);
                                     match t{
                                         IpStackPacketProtocol::Tcp(_t) => {
                                             // dbg!(t.flags());
@@ -128,7 +127,7 @@ impl IpStack {
                                                 accept_sender.send(IpStackStream::Tcp(stream))?;
                                             }
                                             Err(e) => {
-                                                error!("{}",e);
+                                                log::error!("{}",e);
                                             }
                                         }
                                     }
@@ -148,7 +147,7 @@ impl IpStack {
                         }
                         #[allow(unused_mut)]
                         let Ok(mut packet_byte) = packet.to_bytes() else{
-                            trace!("to_bytes error");
+                            log::trace!("to_bytes error");
                             continue;
                         };
                         #[cfg(any(target_os = "macos", target_os = "linux"))]
