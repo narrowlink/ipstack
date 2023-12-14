@@ -26,6 +26,7 @@ pub(super) enum PacketStatus {
     RetransmissionRequest,
     NewPacket,
     Ack,
+    KeepAlive,
 }
 
 pub(super) struct Tcb {
@@ -159,6 +160,8 @@ impl Tcb {
                 && self.seq != self.last_ack
             {
                 PacketStatus::RetransmissionRequest
+            } else if self.ack.wrapping_sub(1) == incoming_packet.inner().sequence_number {
+                PacketStatus::KeepAlive
             } else {
                 PacketStatus::WindowUpdate
             }
