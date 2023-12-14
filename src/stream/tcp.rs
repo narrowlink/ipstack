@@ -51,7 +51,7 @@ impl IpStackTcpStream {
     ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
-        let stream = IpStackTcpStream {
+        let mut stream = IpStackTcpStream {
             src_addr,
             dst_addr,
             stream_sender,
@@ -72,6 +72,7 @@ impl IpStackTcpStream {
                     Vec::new(),
                 )?)
                 .map_err(|_| IpStackError::InvalidTcpPacket)?;
+            stream.tcb.change_state(TcpState::Closed);
         }
         Ok(stream)
     }
@@ -280,6 +281,17 @@ impl AsyncRead for IpStackTcpStream {
                                     continue;
                                 }
                                 PacketStatus::Invalid => continue,
+                                PacketStatus::KeepAlive => {
+                                    self.tcb.change_last_ack(t.inner().acknowledgment_number);
+                                    self.tcb.change_send_window(t.inner().window_size);
+                                    self.packet_to_send = Some(self.create_rev_packet(
+                                        tcp_flags::ACK,
+                                        TTL,
+                                        None,
+                                        Vec::new(),
+                                    )?);
+                                    continue;
+                                }
                                 PacketStatus::RetransmissionRequest => {
                                     self.tcb.change_send_window(t.inner().window_size);
                                     self.tcb.retransmission = Some(t.inner().acknowledgment_number);
