@@ -25,16 +25,19 @@ async fn main() {
     });
 
     #[cfg(not(target_os = "windows"))]
-    let mut ip_stack = ipstack::IpStack::new(
-        ipstack::IpStackConfig::default(),
-        tun::create_as_async(&config).unwrap(),
-    );
+    let mut ipstack_config = ipstack::IpStackConfig::default();
+
+    #[cfg(not(target_os = "windows"))]
+    ipstack_config.packet_info(true);
+
+    #[cfg(not(target_os = "windows"))]
+    let mut ip_stack =
+        ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config).unwrap());
 
     #[cfg(target_os = "windows")]
     let mut ip_stack = ipstack::IpStack::new(
+        ipstack::IpStackConfig::default(),
         wintun::WinTunDevice::new(ipv4, Ipv4Addr::new(255, 255, 255, 0)),
-        MTU,
-        false,
     );
 
     loop {

@@ -23,10 +23,17 @@ async fn main() {
         config.packet_information(true);
     });
 
-    let mut ip_stack = ipstack::IpStack::new(
-        ipstack::IpStackConfig::default(),
-        tun::create_as_async(&config).unwrap(),
-    );
+    #[cfg(not(target_os = "windows"))]
+    let mut ipstack_config = ipstack::IpStackConfig::default();
+
+    #[cfg(target_os = "windows")]
+    let ipstack_config = ipstack::IpStackConfig::default();
+
+    #[cfg(not(target_os = "windows"))]
+    ipstack_config.packet_info(true);
+
+    let mut ip_stack =
+        ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config).unwrap());
 
     #[cfg(target_os = "macos")]
     {

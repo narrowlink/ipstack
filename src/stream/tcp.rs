@@ -401,10 +401,10 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.change_state(TcpState::FinWait2(false));
                             continue;
                         }
-                    } else if matches!(self.tcb.get_state(), TcpState::FinWait2(true)) {
-                        if t.flags() == tcp_flags::ACK {
-                            self.tcb.change_state(TcpState::FinWait2(false));
-                        }
+                    } else if matches!(self.tcb.get_state(), TcpState::FinWait2(true))
+                        && t.flags() == tcp_flags::ACK
+                    {
+                        self.tcb.change_state(TcpState::FinWait2(false));
                     }
                 }
                 std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(())),
