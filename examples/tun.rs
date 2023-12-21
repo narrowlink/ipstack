@@ -23,14 +23,9 @@ async fn main() {
         config.packet_information(true);
     });
 
-    #[cfg(not(target_os = "windows"))]
     let mut ipstack_config = ipstack::IpStackConfig::default();
-
-    #[cfg(target_os = "windows")]
-    let ipstack_config = ipstack::IpStackConfig::default();
-
-    #[cfg(not(target_os = "windows"))]
-    ipstack_config.packet_info(true);
+    ipstack_config.mtu(MTU);
+    ipstack_config.packet_info(cfg!(target_family = "unix"));
 
     let mut ip_stack =
         ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config).unwrap());

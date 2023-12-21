@@ -24,11 +24,9 @@ async fn main() {
         config.packet_information(true);
     });
 
-    #[cfg(not(target_os = "windows"))]
     let mut ipstack_config = ipstack::IpStackConfig::default();
-
-    #[cfg(not(target_os = "windows"))]
-    ipstack_config.packet_info(true);
+    ipstack_config.mtu(MTU);
+    ipstack_config.packet_info(cfg!(target_family = "unix"));
 
     #[cfg(not(target_os = "windows"))]
     let mut ip_stack =
@@ -36,7 +34,7 @@ async fn main() {
 
     #[cfg(target_os = "windows")]
     let mut ip_stack = ipstack::IpStack::new(
-        ipstack::IpStackConfig::default(),
+        ipstack_config,
         wintun::WinTunDevice::new(ipv4, Ipv4Addr::new(255, 255, 255, 0)),
     );
 
