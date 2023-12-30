@@ -53,10 +53,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.initialize(Some(12324323423423434234_u128));
     });
 
-    let mut ip_stack = ipstack::IpStack::new(
-        ipstack::IpStackConfig::default(),
-        tun::create_as_async(&config)?,
-    );
+    let mut ipstack_config = ipstack::IpStackConfig::default();
+    ipstack_config.mtu(MTU);
+    ipstack_config.packet_info(cfg!(target_family = "unix"));
+
+    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config)?);
 
     let server_addr = args.server_addr;
 

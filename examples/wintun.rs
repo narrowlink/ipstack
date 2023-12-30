@@ -5,17 +5,17 @@ use tokio::{join, net::TcpStream};
 use udp_stream::UdpStream;
 
 // const MTU: u16 = 1500;
-const _MTU: i32 = u16::MAX as i32;
+const MTU: i32 = u16::MAX as i32;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let ipv4 = Ipv4Addr::new(10, 0, 0, 33);
-    let netmask = Ipv4Addr::new(255, 255, 255, 0);
+    let _netmask = Ipv4Addr::new(255, 255, 255, 0);
     let _gateway = Ipv4Addr::new(10, 0, 0, 1);
     #[cfg(not(target_os = "windows"))]
     let mut config = tun::Configuration::default();
     #[cfg(not(target_os = "windows"))]
-    config.address(ipv4).netmask(netmask).mtu(_MTU).up();
+    config.address(ipv4).netmask(_netmask).mtu(MTU).up();
     #[cfg(not(target_os = "windows"))]
     config.destination(_gateway).name("utun3");
 
@@ -24,16 +24,18 @@ async fn main() {
         config.packet_information(true);
     });
 
+    let mut ipstack_config = ipstack::IpStackConfig::default();
+    ipstack_config.mtu(MTU as u16);
+    ipstack_config.packet_info(cfg!(target_family = "unix"));
+
     #[cfg(not(target_os = "windows"))]
-    let mut ip_stack = ipstack::IpStack::new(
-        ipstack::IpStackConfig::default(),
-        tun::create_as_async(&config).unwrap(),
-    );
+    let mut ip_stack =
+        ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config).unwrap());
 
     #[cfg(target_os = "windows")]
     let mut ip_stack = ipstack::IpStack::new(
-        ipstack::IpStackConfig::default(),
-        wintun::WinTunDevice::new(ipv4, netmask),
+        ipstack_config,
+        wintun::WinTunDevice::new(ipv4, Ipv4Addr::new(255, 255, 255, 0)),
     );
 
     loop {
