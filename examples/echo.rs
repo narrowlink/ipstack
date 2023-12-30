@@ -56,9 +56,7 @@ async fn udp_main(addr: &str) -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let addr = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let addr = env::args().nth(1).unwrap_or("127.0.0.1:8080".to_string());
 
     let addr1 = addr.clone();
     let tcp = tokio::spawn(async move {
