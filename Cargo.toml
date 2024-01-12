@@ -25,10 +25,12 @@ tracing = { version = "0.1", default-features = false, features = ["log"] }
 [dev-dependencies]
 clap = { version = "4.4", features = ["derive"] }
 udp-stream = { version = "0.0", default-features = false }
-tun = { git = "https://github.com/ssrlive/rust-tun.git", features = ["async"] }
+tun = { git = "https://github.com/ssrlive/rust-tun.git", branch = "master", features = [
+    "async",
+] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
-wintun = { version = "0.3", default-features = false }
+wintun = { version = "0.4", default-features = false }
 
 [profile.release]
 opt-level = 'z'          # Optimize for size.

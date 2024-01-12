@@ -1,17 +1,28 @@
 //!
 //! Build: `cargo build --examples`
-//! Usage: `target/debug/examples/tun --server-addr 127.0.0.1:8080`
+//!
+//! Usage:
 //!
 //! This example must be run as root or administrator privileges.
+//! ```
+//! sudo target/debug/examples/tun --server-addr 127.0.0.1:8080 # Linux or macOS
+//! ```
 //! Then please run the `echo` example server, which listens on TCP & UDP ports 127.0.0.1:8080.
+//! ```
+//! target/debug/examples/echo 127.0.0.1:8080
+//! ```
 //! To route traffic to the tun interface, run the following command with root or administrator privileges:
 //! ```
 //! sudo ip route add 1.2.3.4/32 dev utun3    # Linux
 //! route add 1.2.3.4 mask 255.255.255.255 10.0.0.1 metric 100  # Windows
 //! sudo route add 1.2.3.4/32 10.0.0.1  # Apple macOS
 //! ```
-//! Now you can test it with `nc 1.2.3.4 2323` or `nc -u 1.2.3.4 2323`.
+//! Now you can test it with `nc 1.2.3.4 any_port` or `nc -u 1.2.3.4 any_port`.
 //! You can watch the echo information in the `nc` console.
+//! ```
+//! nc 1.2.3.4 2323 # TCP
+//! nc -u 1.2.3.4 2323 # UDP
+//! ```
 //!
 
 use clap::Parser;
