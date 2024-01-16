@@ -9,6 +9,10 @@ repository = 'https://github.com/narrowlink/ipstack'
 # homepage = 'https://github.com/narrowlink/ipstack'
 readme = "README.md"
 
+[features]
+default = []
+log = ["tracing/log"]
+
 [dependencies]
 tokio = { version = "1.35", features = [
     "sync",
@@ -20,7 +24,9 @@ tokio = { version = "1.35", features = [
 ], default-features = false }
 etherparse = { version = "0.13", default-features = false }
 thiserror = { version = "1.0", default-features = false }
-tracing = { version = "0.1", default-features = false, features = ["log"] }
+tracing = { version = "0.1", default-features = false, features = [
+    "log",
+], optional = true }
 
 [dev-dependencies]
 clap = { version = "4.4", features = ["derive"] }

@@ -13,6 +13,7 @@ use tokio::{
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
+#[cfg(feature = "log")]
 use tracing::{error, trace};
 
 use crate::{
@@ -99,7 +100,8 @@ impl IpStack {
                     Ok(n) = device.read(&mut buffer) => {
                         let offset = if config.packet_info && cfg!(not(target_os = "windows")) {4} else {0};
                         // dbg!(&buffer[offset..n]);
-                        let Ok(packet) = NetworkPacket::parse(&buffer[offset..n])else{
+                        let Ok(packet) = NetworkPacket::parse(&buffer[offset..n]) else {
+                            #[cfg(feature = "log")]
                             trace!("parse error");
                             continue;
                         };
@@ -107,6 +109,7 @@ impl IpStack {
                             Occupied(entry) =>{
                                 let t = packet.transport_protocol();
                                 if let Err(_x) = entry.get().send(packet){
+                                    #[cfg(feature = "log")]
                                     trace!("{}", _x);
                                     match t{
                                         IpStackPacketProtocol::Tcp(_t) => {
@@ -127,8 +130,9 @@ impl IpStack {
                                                 entry.insert(stream.stream_sender());
                                                 accept_sender.send(IpStackStream::Tcp(stream))?;
                                             }
-                                            Err(e) => {
-                                                error!("{}",e);
+                                            Err(_e) => {
+                                                #[cfg(feature = "log")]
+                                                error!("{}", _e);
                                             }
                                         }
                                     }
@@ -148,6 +152,7 @@ impl IpStack {
                         }
                         #[allow(unused_mut)]
                         let Ok(mut packet_byte) = packet.to_bytes() else{
+                            #[cfg(feature = "log")]
                             trace!("to_bytes error");
                             continue;
                         };
