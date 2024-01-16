@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
     let gateway = Ipv4Addr::new(10, 0, 0, 1);
 
-    let mut config = tun::Configuration::default();
+    let mut config = tun2::Configuration::default();
     config.address(ipv4).netmask(netmask).mtu(MTU as i32).up();
     config.destination(gateway).name("utun3");
 
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ipstack_config.mtu(MTU);
     ipstack_config.packet_info(cfg!(target_family = "unix"));
 
-    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config)?);
+    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config)?);
 
     let server_addr = args.server_addr;
 
