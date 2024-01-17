@@ -26,18 +26,18 @@ pub mod stream;
 
 const DROP_TTL: u8 = 0;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(unix)]
 const TTL: u8 = 64;
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 const TTL: u8 = 128;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 const TUN_PROTO_IP6: [u8; 2] = [0x86, 0xdd];
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 const TUN_PROTO_IP4: [u8; 2] = [0x08, 0x00];
 
 #[cfg(target_os = "macos")]
@@ -98,7 +98,7 @@ impl IpStack {
                 // dbg!(streams.len());
                 select! {
                     Ok(n) = device.read(&mut buffer) => {
-                        let offset = if config.packet_info && cfg!(not(target_os = "windows")) {4} else {0};
+                        let offset = if config.packet_info && cfg!(unix) {4} else {0};
                         // dbg!(&buffer[offset..n]);
                         let Ok(packet) = NetworkPacket::parse(&buffer[offset..n]) else {
                             #[cfg(feature = "log")]
@@ -156,7 +156,7 @@ impl IpStack {
                             trace!("to_bytes error");
                             continue;
                         };
-                        #[cfg(any(target_os = "macos", target_os = "linux"))]
+                        #[cfg(unix)]
                         if config.packet_info {
                             if packet.src_addr().is_ipv4(){
                                 packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());

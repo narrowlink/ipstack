@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
     ipstack_config.mtu(MTU);
-    ipstack_config.packet_info(cfg!(target_family = "unix"));
+    ipstack_config.packet_info(cfg!(unix));
 
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config)?);
 
