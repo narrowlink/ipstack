@@ -47,7 +47,7 @@ const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 
 pub struct IpStackConfig {
     pub mtu: u16,
-    pub packet_info: bool,
+    pub packet_information: bool,
     pub tcp_timeout: Duration,
     pub udp_timeout: Duration,
 }
@@ -56,7 +56,7 @@ impl Default for IpStackConfig {
     fn default() -> Self {
         IpStackConfig {
             mtu: u16::MAX,
-            packet_info: false,
+            packet_information: false,
             tcp_timeout: Duration::from_secs(60),
             udp_timeout: Duration::from_secs(30),
         }
@@ -73,8 +73,8 @@ impl IpStackConfig {
     pub fn mtu(&mut self, mtu: u16) {
         self.mtu = mtu;
     }
-    pub fn packet_info(&mut self, packet_info: bool) {
-        self.packet_info = packet_info;
+    pub fn packet_information(&mut self, packet_information: bool) {
+        self.packet_information = packet_information;
     }
 }
 
@@ -98,7 +98,7 @@ impl IpStack {
                 // dbg!(streams.len());
                 select! {
                     Ok(n) = device.read(&mut buffer) => {
-                        let offset = if config.packet_info && cfg!(unix) {4} else {0};
+                        let offset = if config.packet_information && cfg!(unix) {4} else {0};
                         // dbg!(&buffer[offset..n]);
                         let Ok(packet) = NetworkPacket::parse(&buffer[offset..n]) else {
                             #[cfg(feature = "log")]
@@ -157,7 +157,7 @@ impl IpStack {
                             continue;
                         };
                         #[cfg(unix)]
-                        if config.packet_info {
+                        if config.packet_information {
                             if packet.src_addr().is_ipv4(){
                                 packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
                             } else{
