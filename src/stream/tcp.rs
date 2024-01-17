@@ -21,6 +21,7 @@ use tokio::{
         Notify,
     },
 };
+#[cfg(feature = "log")]
 use tracing::{trace, warn};
 
 use crate::packet::NetworkPacket;
@@ -191,6 +192,7 @@ impl AsyncRead for IpStackTcpStream {
                 Pin::new(&mut self.tcb.timeout).poll(cx),
                 std::task::Poll::Ready(_)
             ) {
+                #[cfg(feature = "log")]
                 trace!("timeout reached for {:?}", self.dst_addr);
                 self.packet_sender
                     .send(self.create_rev_packet(
@@ -469,14 +471,17 @@ impl AsyncWrite for IpStackTcpStream {
                 .send(packet)
                 .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
             self.tcb.retransmission = None;
-        } else if let Some(i) = self.tcb.retransmission {
-            warn!(i);
-            warn!(self.tcb.seq);
-            warn!(self.tcb.last_ack);
-            warn!(self.tcb.ack);
-            for p in self.tcb.inflight_packets.iter() {
-                warn!(p.seq);
-                warn!("{}", p.payload.len());
+        } else if let Some(_i) = self.tcb.retransmission {
+            #[cfg(feature = "log")]
+            {
+                warn!(_i);
+                warn!(self.tcb.seq);
+                warn!(self.tcb.last_ack);
+                warn!(self.tcb.ack);
+                for p in self.tcb.inflight_packets.iter() {
+                    warn!(p.seq);
+                    warn!("{}", p.payload.len());
+                }
             }
             panic!("Please report these values at: https://github.com/narrowlink/ipstack/");
         }
