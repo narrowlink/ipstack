@@ -32,7 +32,7 @@ const TTL: u8 = 64;
 #[cfg(windows)]
 const TTL: u8 = 128;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+#[cfg(unix)]
 const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
