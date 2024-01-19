@@ -35,14 +35,14 @@ const TTL: u8 = 128;
 #[cfg(unix)]
 const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const TUN_PROTO_IP6: [u8; 2] = [0x86, 0xdd];
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const TUN_PROTO_IP4: [u8; 2] = [0x08, 0x00];
 
-#[cfg(target_os = "macos")]
-const TUN_PROTO_IP6: [u8; 2] = [0x00, 0x02];
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const TUN_PROTO_IP6: [u8; 2] = [0x00, 0x0A];
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 
 pub struct IpStackConfig {
