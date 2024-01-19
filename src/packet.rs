@@ -25,20 +25,47 @@ pub(crate) enum IpStackPacketProtocol {
     Tcp(TcpPacket),
     Udp,
 }
+#[derive(Debug)]
 pub struct NetworkPacket {
     pub ip: IpHeader,
     pub transport: TransportHeader,
     pub payload: Vec<u8>,
 }
 
+pub enum TunPacket {
+    NetworkPacket(Box<NetworkPacket>),
+    RawPacket,
+}
+
+pub(crate) fn parse_packet(buf: &[u8]) -> Result<TunPacket, IpStackError> {
+    let p = PacketHeaders::from_ip_slice(buf).map_err(|_| IpStackError::InvalidPacket)?;
+    let ip = p.ip.ok_or(IpStackError::InvalidPacket)?;
+    let transport = p
+        .transport
+        .ok_or(IpStackError::UnsupportedTransportProtocol)?;
+    match transport {
+        TransportHeader::Tcp(_) | TransportHeader::Udp(_) => {
+            Ok(TunPacket::NetworkPacket(Box::new(NetworkPacket {
+                ip,
+                transport,
+                payload: p.payload.to_vec(),
+            })))
+        }
+        TransportHeader::Icmpv4(_) | TransportHeader::Icmpv6(_) => Ok(TunPacket::RawPacket),
+    }
+}
+
 impl NetworkPacket {
-    pub fn parse(buf: &[u8]) -> Result<Self, IpStackError> {
+    pub fn parse_from(buf: &[u8]) -> Result<Self, IpStackError> {
         let p = PacketHeaders::from_ip_slice(buf).map_err(|_| IpStackError::InvalidPacket)?;
         let ip = p.ip.ok_or(IpStackError::InvalidPacket)?;
         let transport = p
             .transport
             .filter(|t| {
-                (matches!(t, TransportHeader::Tcp(_)) || matches!(t, TransportHeader::Udp(_)))
+                (matches!(t, TransportHeader::Tcp(_))
+                    || matches!(t, TransportHeader::Udp(_))
+                    || matches!(t, TransportHeader::Icmpv4(_))
+                    || matches!(t, TransportHeader::Icmpv6(_)))
             })
             .ok_or(IpStackError::UnsupportedTransportProtocol)?;
         let payload = p.payload.to_vec();
@@ -61,13 +88,12 @@ impl NetworkPacket {
             TransportHeader::Tcp(tcp) => tcp.source_port,
             _ => unreachable!(),
         };
+        SocketAddr::new(self.src_ip(), port)
+    }
+    pub fn src_ip(&self) -> IpAddr {
         match &self.ip {
-            IpHeader::Version4(ip, _) => {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip.source)), port)
-            }
-            IpHeader::Version6(ip, _) => {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip.source)), port)
-            }
+            IpHeader::Version4(ip, _) => IpAddr::V4(Ipv4Addr::from(ip.source)),
+            IpHeader::Version6(ip, _) => IpAddr::V6(Ipv6Addr::from(ip.source)),
         }
     }
     pub fn dst_addr(&self) -> SocketAddr {
@@ -76,13 +102,12 @@ impl NetworkPacket {
             TransportHeader::Tcp(tcp) => tcp.destination_port,
             _ => unreachable!(),
         };
+        SocketAddr::new(self.dst_ip(), port)
+    }
+    pub fn dst_ip(&self) -> IpAddr {
         match &self.ip {
-            IpHeader::Version4(ip, _) => {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip.destination)), port)
-            }
-            IpHeader::Version6(ip, _) => {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip.destination)), port)
-            }
+            IpHeader::Version4(ip, _) => IpAddr::V4(Ipv4Addr::from(ip.destination)),
+            IpHeader::Version6(ip, _) => IpAddr::V6(Ipv6Addr::from(ip.destination)),
         }
     }
     pub fn network_tuple(&self) -> NetworkTuple {

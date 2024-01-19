@@ -26,7 +26,7 @@
 //!
 
 use clap::Parser;
-use ipstack::stream::IpStackStream;
+use ipstack::stream::{IpStackStream, RawPacket};
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::{join, net::TcpStream};
 use udp_stream::UdpStream;
@@ -70,6 +70,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config)?);
 
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sudo route -n add -net 10.0.0.0/24 10.0.0.33")
+        .output()
+        .unwrap();
+
     let server_addr = args.server_addr;
 
     loop {
@@ -108,6 +115,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("==== end UDP connection ====");
                 });
             }
+            IpStackStream::RawPacket(_pkt) => {
+                //println!("{:?}", _pkt);
+                icmp_reply(_pkt).await;
+            }
         };
     }
+}
+
+async fn icmp_reply(raw_pkt: RawPacket) {
+    use ::packet::{builder::Builder, Packet};
+    let pkt = ::packet::ip::v4::Packet::new(raw_pkt.bytes()).unwrap();
+    let icmp = ::packet::icmp::Packet::new(pkt.payload()).unwrap();
+    let icmp = icmp.echo().unwrap();
+    let reply = ::packet::ip::v4::Builder::default()
+        .id(0x42)
+        .unwrap()
+        .ttl(64)
+        .unwrap()
+        .source(pkt.destination())
+        .unwrap()
+        .destination(pkt.source())
+        .unwrap()
+        .icmp()
+        .unwrap()
+        .echo()
+        .unwrap()
+        .reply()
+        .unwrap()
+        .identifier(icmp.identifier())
+        .unwrap()
+        .sequence(icmp.sequence())
+        .unwrap()
+        .payload(icmp.payload())
+        .unwrap()
+        .build()
+        .unwrap();
+    raw_pkt.send(&reply).await.unwrap();
 }

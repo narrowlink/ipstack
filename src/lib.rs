@@ -1,4 +1,5 @@
 pub use error::{IpStackError, Result};
+use etherparse::TransportHeader;
 use packet::{NetworkPacket, NetworkTuple};
 use std::{
     collections::{
@@ -7,7 +8,7 @@ use std::{
     },
     time::Duration,
 };
-use stream::IpStackStream;
+use stream::{IpStackStream, RawPacket};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
@@ -100,53 +101,62 @@ impl IpStack {
                     Ok(n) = device.read(&mut buffer) => {
                         let offset = if config.packet_information && cfg!(unix) {4} else {0};
                         // dbg!(&buffer[offset..n]);
-                        let Ok(packet) = NetworkPacket::parse(&buffer[offset..n]) else {
+                        let Ok(packet) = packet::parse_packet(&buffer[offset..n]) else {
                             #[cfg(feature = "log")]
                             trace!("parse error");
                             continue;
                         };
-                        match streams.entry(packet.network_tuple()){
-                            Occupied(entry) =>{
-                                let t = packet.transport_protocol();
-                                if let Err(_x) = entry.get().send(packet){
-                                    #[cfg(feature = "log")]
-                                    trace!("{}", _x);
-                                    match t{
-                                        IpStackPacketProtocol::Tcp(_t) => {
-                                            // dbg!(t.flags());
-                                        }
-                                        IpStackPacketProtocol::Udp => {
-                                            // dbg!("udp");
+                        match packet{
+                            packet::TunPacket::NetworkPacket(packet)=>{
+                                let packet = *packet;
+                                match streams.entry(packet.network_tuple()){
+                                    Occupied(entry) =>{
+                                        let t = packet.transport_protocol();
+                                        if let Err(_x) = entry.get().send(packet){
+                                            #[cfg(feature = "log")]
+                                            trace!("{}", _x);
+                                            match t{
+                                                IpStackPacketProtocol::Tcp(_t) => {
+                                                    // dbg!(t.flags());
+                                                }
+                                                IpStackPacketProtocol::Udp => {
+                                                    // dbg!("udp");
+                                                }
+                                            }
+
                                         }
                                     }
-
+                                    Vacant(entry) => {
+                                        match packet.transport_protocol(){
+                                            IpStackPacketProtocol::Tcp(h) => {
+                                                match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),config.mtu,config.tcp_timeout).await{
+                                                    Ok(stream) => {
+                                                        entry.insert(stream.stream_sender());
+                                                        accept_sender.send(IpStackStream::Tcp(stream))?;
+                                                    }
+                                                    Err(_e) => {
+                                                        #[cfg(feature = "log")]
+                                                        error!("{}", _e);
+                                                    }
+                                                }
+                                            }
+                                            IpStackPacketProtocol::Udp => {
+                                                let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(),packet.payload, pkt_sender.clone(),config.mtu,config.udp_timeout);
+                                                entry.insert(stream.stream_sender());
+                                                accept_sender.send(IpStackStream::Udp(stream))?;
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                            Vacant(entry) => {
-                                match packet.transport_protocol(){
-                                    IpStackPacketProtocol::Tcp(h) => {
-                                        match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),config.mtu,config.tcp_timeout).await{
-                                            Ok(stream) => {
-                                                entry.insert(stream.stream_sender());
-                                                accept_sender.send(IpStackStream::Tcp(stream))?;
-                                            }
-                                            Err(_e) => {
-                                                #[cfg(feature = "log")]
-                                                error!("{}", _e);
-                                            }
-                                        }
-                                    }
-                                    IpStackPacketProtocol::Udp => {
-                                        let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(),packet.payload, pkt_sender.clone(),config.mtu,config.udp_timeout);
-                                        entry.insert(stream.stream_sender());
-                                        accept_sender.send(IpStackStream::Udp(stream))?;
-                                    }
-                                }
+                            packet::TunPacket::RawPacket=>{
+                                accept_sender.send(IpStackStream::RawPacket(RawPacket::new(buffer[offset..n].to_vec(), pkt_sender.clone(),config.mtu)))?;
                             }
                         }
                     }
                     Some(packet) = pkt_receiver.recv() => {
-                        if packet.ttl() == 0{
+                        let t = packet.transport.clone();
+                        if (matches!(t, TransportHeader::Tcp(_)) || matches!(t, TransportHeader::Udp(_))) && packet.ttl() == 0{
                             streams.remove(&packet.reverse_network_tuple());
                             continue;
                         }
@@ -158,7 +168,7 @@ impl IpStack {
                         };
                         #[cfg(unix)]
                         if config.packet_information {
-                            if packet.src_addr().is_ipv4(){
+                            if packet.src_ip().is_ipv4(){
                                 packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
                             } else{
                                 packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
