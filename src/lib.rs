@@ -18,7 +18,7 @@ use tracing::{error, trace};
 
 use crate::{
     packet::IpStackPacketProtocol,
-    stream::{IpStackTcpStream, IpStackUdpStream},
+    stream::{IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
 };
 mod error;
 mod packet;
@@ -99,26 +99,32 @@ impl IpStack {
                 select! {
                     Ok(n) = device.read(&mut buffer) => {
                         let offset = if config.packet_information && cfg!(unix) {4} else {0};
-                        // dbg!(&buffer[offset..n]);
                         let Ok(packet) = NetworkPacket::parse(&buffer[offset..n]) else {
-                            #[cfg(feature = "log")]
-                            trace!("parse error");
+                            accept_sender.send(IpStackStream::UnknownNetwork(buffer[offset..n].to_vec()))?;
                             continue;
                         };
+                        if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
+                            accept_sender.send(IpStackStream::UnknownTransport(IpStackUnknownTransport::new(packet.src_addr().ip(),packet.dst_addr().ip(),packet.payload,packet.ip,pkt_sender.clone())))?;
+                            continue;
+                        }
+
                         match streams.entry(packet.network_tuple()){
                             Occupied(entry) =>{
-                                let t = packet.transport_protocol();
+                                // let t = packet.transport_protocol();
                                 if let Err(_x) = entry.get().send(packet){
                                     #[cfg(feature = "log")]
                                     trace!("{}", _x);
-                                    match t{
-                                        IpStackPacketProtocol::Tcp(_t) => {
-                                            // dbg!(t.flags());
-                                        }
-                                        IpStackPacketProtocol::Udp => {
-                                            // dbg!("udp");
-                                        }
-                                    }
+                                    // match t{
+                                    //     IpStackPacketProtocol::Tcp(_t) => {
+                                    //         // dbg!(t.flags());
+                                    //     }
+                                    //     IpStackPacketProtocol::Udp => {
+                                    //         // dbg!("udp");
+                                    //     }
+                                    //     IpStackPacketProtocol::Unknown => {
+                                    //         // dbg!("unknown");
+                                    //     }
+                                    // }
 
                                 }
                             }
@@ -140,6 +146,9 @@ impl IpStack {
                                         let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(),packet.payload, pkt_sender.clone(),config.mtu,config.udp_timeout);
                                         entry.insert(stream.stream_sender());
                                         accept_sender.send(IpStackStream::Udp(stream))?;
+                                    }
+                                    IpStackPacketProtocol::Unknown => {
+                                        unreachable!()
                                     }
                                 }
                             }

@@ -109,6 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("==== end UDP connection ====");
                 });
             }
+            _ => {
+                continue;
+            }
         };
     }
 }

@@ -8,16 +8,17 @@ use std::{
     time::Duration,
 };
 
-use etherparse::{
-    Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header, TransportHeader, UdpHeader,
-};
+use etherparse::{Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header, UdpHeader};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::Sleep,
 };
-
-use crate::{packet::NetworkPacket, TTL};
+// use crate::packet::TransportHeader;
+use crate::{
+    packet::{NetworkPacket, TransportHeader},
+    TTL,
+};
 
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
