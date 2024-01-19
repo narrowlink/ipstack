@@ -24,7 +24,8 @@ async fn main(){
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
     ipstack_config.mtu(MTU);
-    ipstack_config.packet_information(cfg!(unix));
+    let packet_information = cfg!(all(target_family = "unix", not(target_os = "android")));
+    ipstack_config.packet_information(packet_information);
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config).unwrap());
 
     while let Ok(stream) = ip_stack.accept().await {
