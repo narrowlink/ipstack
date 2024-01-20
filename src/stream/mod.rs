@@ -12,8 +12,8 @@ mod unknown;
 pub enum IpStackStream {
     Tcp(IpStackTcpStream),
     Udp(IpStackUdpStream),
-    UnknownTransport(IpStackUnknownTransport), // todo: fix lint error
-    UnknownNetwork(Vec<u8>),                   // todo: fix lint errorP
+    UnknownTransport(IpStackUnknownTransport),
+    UnknownNetwork(Vec<u8>),
 }
 
 impl IpStackStream {

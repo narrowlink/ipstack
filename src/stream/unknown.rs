@@ -9,7 +9,7 @@ pub struct IpStackUnknownTransport {
     src_addr: IpAddr,
     dst_addr: IpAddr,
     payload: Vec<u8>,
-    ip: IpHeader,
+    protocol: u8,
     // packet_sender: UnboundedSender<NetworkPacket>,
 }
 
@@ -18,14 +18,18 @@ impl IpStackUnknownTransport {
         src_addr: IpAddr,
         dst_addr: IpAddr,
         payload: Vec<u8>,
-        ip: IpHeader,
+        ip: &IpHeader,
         _packet_sender: UnboundedSender<NetworkPacket>,
     ) -> Self {
+        let protocol = match ip {
+            IpHeader::Version4(ip, _) => ip.protocol,
+            IpHeader::Version6(ip, _) => ip.next_header,
+        };
         IpStackUnknownTransport {
             src_addr,
             dst_addr,
             payload,
-            ip,
+            protocol,
             // packet_sender,
         }
     }
@@ -39,10 +43,7 @@ impl IpStackUnknownTransport {
         &self.payload
     }
     pub fn ip_protocol(&self) -> u8 {
-        match &self.ip {
-            IpHeader::Version4(ip, _) => ip.protocol,
-            IpHeader::Version6(ip, _) => ip.next_header,
-        }
+        self.protocol
     }
     // pub fn send(&self, payload: Vec<u8>) {
     //     let packet = NetworkPacket::new(self.ip.clone(), payload);
