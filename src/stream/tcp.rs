@@ -1,10 +1,10 @@
 use crate::{
     error::IpStackError,
-    packet::{tcp_flags, IpStackPacketProtocol, TcpPacket},
+    packet::{tcp_flags, IpStackPacketProtocol, TcpPacket, TransportHeader},
     stream::tcb::{Tcb, TcpState},
     DROP_TTL, TTL,
 };
-use etherparse::{Ipv4Extensions, Ipv4Header, Ipv6Extensions, TransportHeader};
+use etherparse::{Ipv4Extensions, Ipv4Header, Ipv6Extensions};
 use std::{
     cmp,
     future::Future,

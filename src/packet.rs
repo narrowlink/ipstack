@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use etherparse::{IpHeader, PacketHeaders, TcpHeader, TransportHeader};
+use etherparse::{IpHeader, PacketHeaders, TcpHeader, UdpHeader, WriteError};
 
 use crate::error::IpStackError;
 
@@ -23,25 +23,38 @@ pub mod tcp_flags {
 
 pub(crate) enum IpStackPacketProtocol {
     Tcp(TcpPacket),
+    Unknown,
     Udp,
 }
+
+pub(crate) enum TransportHeader {
+    Tcp(TcpHeader),
+    Udp(UdpHeader),
+    Unknown,
+}
+
 pub struct NetworkPacket {
-    pub ip: IpHeader,
-    pub transport: TransportHeader,
-    pub payload: Vec<u8>,
+    pub(crate) ip: IpHeader,
+    pub(crate) transport: TransportHeader,
+    pub(crate) payload: Vec<u8>,
 }
 
 impl NetworkPacket {
     pub fn parse(buf: &[u8]) -> Result<Self, IpStackError> {
         let p = PacketHeaders::from_ip_slice(buf).map_err(|_| IpStackError::InvalidPacket)?;
         let ip = p.ip.ok_or(IpStackError::InvalidPacket)?;
-        let transport = p
-            .transport
-            .filter(|t| {
-                (matches!(t, TransportHeader::Tcp(_)) || matches!(t, TransportHeader::Udp(_)))
-            })
-            .ok_or(IpStackError::UnsupportedTransportProtocol)?;
-        let payload = p.payload.to_vec();
+        let transport = match p.transport {
+            Some(etherparse::TransportHeader::Tcp(h)) => TransportHeader::Tcp(h),
+            Some(etherparse::TransportHeader::Udp(u)) => TransportHeader::Udp(u),
+            _ => TransportHeader::Unknown,
+        };
+
+        let payload = if let TransportHeader::Unknown = transport {
+            buf[ip.header_len()..].to_vec()
+        } else {
+            p.payload.to_vec()
+        };
+
         Ok(NetworkPacket {
             ip,
             transport,
@@ -52,14 +65,14 @@ impl NetworkPacket {
         match self.transport {
             TransportHeader::Udp(_) => IpStackPacketProtocol::Udp,
             TransportHeader::Tcp(ref h) => IpStackPacketProtocol::Tcp(h.into()),
-            _ => unreachable!(),
+            _ => IpStackPacketProtocol::Unknown,
         }
     }
     pub fn src_addr(&self) -> SocketAddr {
         let port = match &self.transport {
             TransportHeader::Udp(udp) => udp.source_port,
             TransportHeader::Tcp(tcp) => tcp.source_port,
-            _ => unreachable!(),
+            _ => 0,
         };
         match &self.ip {
             IpHeader::Version4(ip, _) => {
@@ -74,7 +87,7 @@ impl NetworkPacket {
         let port = match &self.transport {
             TransportHeader::Udp(udp) => udp.destination_port,
             TransportHeader::Tcp(tcp) => tcp.destination_port,
-            _ => unreachable!(),
+            _ => 0,
         };
         match &self.ip {
             IpHeader::Version4(ip, _) => {
@@ -104,9 +117,19 @@ impl NetworkPacket {
         self.ip
             .write(&mut buf)
             .map_err(IpStackError::PacketWriteError)?;
-        self.transport
-            .write(&mut buf)
-            .map_err(IpStackError::PacketWriteError)?;
+        match self.transport {
+            TransportHeader::Tcp(ref h) => h
+                .write(&mut buf)
+                .map_err(WriteError::from)
+                .map_err(IpStackError::PacketWriteError)?,
+            TransportHeader::Udp(ref h) => {
+                h.write(&mut buf).map_err(IpStackError::PacketWriteError)?
+            }
+            _ => {}
+        };
+        // self.transport
+        //     .write(&mut buf)
+        //     .map_err(IpStackError::PacketWriteError)?;
         buf.extend_from_slice(&self.payload);
         Ok(buf)
     }
