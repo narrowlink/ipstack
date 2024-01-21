@@ -43,14 +43,18 @@ impl NetworkPacket {
     pub fn parse(buf: &[u8]) -> Result<Self, IpStackError> {
         let p = PacketHeaders::from_ip_slice(buf).map_err(|_| IpStackError::InvalidPacket)?;
         let ip = p.ip.ok_or(IpStackError::InvalidPacket)?;
-        // p.payload;
         let transport = match p.transport {
             Some(etherparse::TransportHeader::Tcp(h)) => TransportHeader::Tcp(h),
             Some(etherparse::TransportHeader::Udp(u)) => TransportHeader::Udp(u),
             _ => TransportHeader::Unknown,
         };
 
-        let payload = p.payload.to_vec();
+        let payload = if let TransportHeader::Unknown = transport {
+            buf[ip.header_len()..].to_vec()
+        } else {
+            p.payload.to_vec()
+        };
+
         Ok(NetworkPacket {
             ip,
             transport,

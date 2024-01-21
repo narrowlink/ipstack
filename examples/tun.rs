@@ -26,6 +26,7 @@
 //!
 
 use clap::Parser;
+use etherparse::{IcmpEchoHeader, Icmpv4Header};
 use ipstack::stream::IpStackStream;
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::{join, net::TcpStream};
@@ -52,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = tun2::Configuration::default();
     config.address(ipv4).netmask(netmask).mtu(MTU as i32).up();
-    config.destination(gateway).name("utun3");
+    config.destination(gateway);
 
     #[cfg(target_os = "linux")]
     config.platform(|config| {
@@ -109,7 +110,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("==== end UDP connection ====");
                 });
             }
-            _ => {
+            IpStackStream::UnknownTransport(u) => {
+                if u.src_addr().is_ipv4() && u.ip_protocol() == 1 {
+                    let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
+                    if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
+                        println!("ICMPv4 echo");
+                        let echo = IcmpEchoHeader {
+                            id: req.id,
+                            seq: req.seq,
+                        };
+                        let mut resp = Icmpv4Header::new(etherparse::Icmpv4Type::EchoReply(echo));
+                        resp.update_checksum(req_payload);
+                        let mut payload = resp.to_bytes().to_vec();
+                        payload.extend_from_slice(req_payload);
+                        u.send(payload).await?;
+                    } else {
+                        println!("ICMPv4");
+                    }
+                    continue;
+                }
+                println!("unknown transport - Ip Protocol {}", u.ip_protocol());
+                continue;
+            }
+            IpStackStream::UnknownNetwork(payload) => {
+                println!("unknown transport - {} bytes", payload.len());
                 continue;
             }
         };

@@ -104,7 +104,7 @@ impl IpStack {
                             continue;
                         };
                         if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
-                            accept_sender.send(IpStackStream::UnknownTransport(IpStackUnknownTransport::new(packet.src_addr().ip(),packet.dst_addr().ip(),packet.payload,&packet.ip,pkt_sender.clone())))?;
+                            accept_sender.send(IpStackStream::UnknownTransport(IpStackUnknownTransport::new(packet.src_addr().ip(),packet.dst_addr().ip(),packet.payload,&packet.ip,config.mtu,pkt_sender.clone())))?;
                             continue;
                         }
 
