@@ -73,38 +73,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config)?);
 
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg("sudo route -n add -net 10.0.0.0/24 10.0.0.33")
-        .output()
-        .unwrap();
-
     let server_addr = args.server_addr;
 
     loop {
         match ip_stack.accept().await? {
             IpStackStream::Tcp(mut tcp) => {
-                let s = TcpStream::connect(server_addr).await;
-                if let Err(ref err) = s {
-                    println!("connect TCP server failed \"{}\"", err);
-                    continue;
-                }
+                let mut s = match TcpStream::connect(server_addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("connect TCP server failed \"{}\"", e);
+                        continue;
+                    }
+                };
                 println!("==== New TCP connection ====");
-                let mut s = s?;
                 tokio::spawn(async move {
                     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut s).await;
                     println!("====== end tcp connection ======");
                 });
             }
             IpStackStream::Udp(mut udp) => {
-                let s = UdpStream::connect(server_addr).await;
-                if let Err(ref err) = s {
-                    println!("connect UDP server failed \"{}\"", err);
-                    continue;
-                }
+                let mut s = match UdpStream::connect(server_addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("connect UDP server failed \"{}\"", e);
+                        continue;
+                    }
+                };
                 println!("==== New UDP connection ====");
-                let mut s = s?;
                 tokio::spawn(async move {
                     let _ = tokio::io::copy_bidirectional(&mut udp, &mut s).await;
                     println!("==== end UDP connection ====");
