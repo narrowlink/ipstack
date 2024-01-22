@@ -2,7 +2,8 @@ An asynchronous lightweight implementation of TCP/IP stack for Tun device.
 Unstable, under development.
 
 ### Usage
-````rust
+
+```rust
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use udp_stream::UdpStream;
 use tokio::io{AsyncRead, AsyncWrite};
@@ -77,6 +78,6 @@ async fn main(){
         }
     }
 }
-````
+```
 
 We also suggest that you take a look at the complete [examples](examples).
