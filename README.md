@@ -19,14 +19,20 @@ async fn main(){
     const MTU: u16 = 1500;
     let ipv4 = Ipv4Addr::new(10, 0, 0, 1);
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
-    let mut config = tun::Configuration::default();
+    let mut config = tun2::Configuration::default();
     config.address(ipv4).netmask(netmask).mtu(MTU as i32).up();
+
+    #[cfg(target_os = "linux")]
+    config.platform_config(|config| {
+        config.packet_information(true);
+        config.apply_settings(true);
+    });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
     ipstack_config.mtu(MTU);
     let packet_information = cfg!(all(target_family = "unix", not(target_os = "android")));
     ipstack_config.packet_information(packet_information);
-    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config).unwrap());
+    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config).unwrap());
 
     while let Ok(stream) = ip_stack.accept().await {
         match stream {
@@ -42,6 +48,10 @@ async fn main(){
                 tokio::spawn(async move {
                     copy_from_lhs_to_rhs(udp, rhs).await;
                 });
+            }
+            _ => {
+                println!("unknown transport");
+                continue;
             }
         }
     }

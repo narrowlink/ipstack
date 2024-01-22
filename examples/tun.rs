@@ -5,7 +5,7 @@
 //!
 //! This example must be run as root or administrator privileges.
 //! ```
-//! sudo target/debug/examples/tun --server-addr 127.0.0.1:8080 # Linux or macOS
+//! sudo target/debug/examples/tun --server-addr 127.0.0.1:8080
 //! ```
 //! Then please run the `echo` example server, which listens on TCP & UDP ports 127.0.0.1:8080.
 //! ```
@@ -13,9 +13,9 @@
 //! ```
 //! To route traffic to the tun interface, run the following command with root or administrator privileges:
 //! ```
-//! sudo ip route add 1.2.3.4/32 dev utun3    # Linux
+//! sudo ip route add 1.2.3.4/32 dev tun0                       # Linux
 //! route add 1.2.3.4 mask 255.255.255.255 10.0.0.1 metric 100  # Windows
-//! sudo route add 1.2.3.4/32 10.0.0.1  # Apple macOS
+//! sudo route add 1.2.3.4/32 10.0.0.1                          # macOS
 //! ```
 //! Now you can test it with `nc 1.2.3.4 any_port` or `nc -u 1.2.3.4 any_port`.
 //! You can watch the echo information in the `nc` console.
@@ -56,13 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.destination(gateway);
 
     #[cfg(target_os = "linux")]
-    config.platform(|config| {
+    config.platform_config(|config| {
         config.packet_information(true);
+        config.apply_settings(true);
     });
 
     #[cfg(target_os = "windows")]
-    config.platform(|config| {
-        config.initialize(Some(12324323423423434234_u128));
+    config.platform_config(|config| {
+        config.device_guid(Some(12324323423423434234_u128));
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
@@ -134,6 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             IpStackStream::UnknownNetwork(payload) => {
                 println!("unknown transport - {} bytes", payload.len());
+                continue;
+            }
+            _ => {
+                println!("unknown transport");
                 continue;
             }
         };

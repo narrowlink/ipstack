@@ -9,6 +9,7 @@ mod tcp;
 mod udp;
 mod unknown;
 
+#[non_exhaustive]
 pub enum IpStackStream {
     Tcp(IpStackTcpStream),
     Udp(IpStackUdpStream),
