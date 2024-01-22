@@ -58,11 +58,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     config.platform(|config| {
         config.packet_information(true);
+        config.apply_settings(true);
     });
 
     #[cfg(target_os = "windows")]
     config.platform(|config| {
-        config.initialize(Some(12324323423423434234_u128));
+        config.device_guid(Some(12324323423423434234_u128));
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
