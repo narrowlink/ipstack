@@ -20,7 +20,7 @@ async fn main(){
     #[cfg(target_os = "linux")]
     config.platform_config(|config| {
         config.packet_information(true);
-		config.apply_settings(true);
+        config.apply_settings(true);
     });
 
     #[cfg(target_os = "windows")]
@@ -49,7 +49,7 @@ async fn main(){
                     let _ = tokio::io::copy_bidirectional(& mut udp, & mut rhs).await;
                 });
             }
-			IpStackStream::UnknownTransport(u) => {
+            IpStackStream::UnknownTransport(u) => {
                 if u.src_addr().is_ipv4() && u.ip_protocol() == 1 {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
                     if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
