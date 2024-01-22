@@ -29,7 +29,7 @@ use clap::Parser;
 use etherparse::{IcmpEchoHeader, Icmpv4Header};
 use ipstack::stream::IpStackStream;
 use std::net::{Ipv4Addr, SocketAddr};
-use tokio::{join, net::TcpStream};
+use tokio::net::TcpStream;
 use udp_stream::UdpStream;
 
 // const MTU: u16 = 1500;
@@ -72,41 +72,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config)?);
 
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sudo route -n add -net 10.0.0.0/24 10.0.0.33")
+        .output()
+        .unwrap();
+
     let server_addr = args.server_addr;
 
     loop {
         match ip_stack.accept().await? {
-            IpStackStream::Tcp(tcp) => {
+            IpStackStream::Tcp(mut tcp) => {
                 let s = TcpStream::connect(server_addr).await;
                 if let Err(ref err) = s {
                     println!("connect TCP server failed \"{}\"", err);
                     continue;
                 }
                 println!("==== New TCP connection ====");
-                let (mut t_rx, mut t_tx) = tokio::io::split(tcp);
-                let (mut s_rx, mut s_tx) = tokio::io::split(s?);
+                let mut s = s?;
                 tokio::spawn(async move {
-                    let _r = join! {
-                         tokio::io::copy(&mut t_rx, &mut s_tx) ,
-                         tokio::io::copy(&mut s_rx, &mut t_tx),
-                    };
+                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut s).await;
                     println!("====== end tcp connection ======");
                 });
             }
-            IpStackStream::Udp(udp) => {
+            IpStackStream::Udp(mut udp) => {
                 let s = UdpStream::connect(server_addr).await;
                 if let Err(ref err) = s {
                     println!("connect UDP server failed \"{}\"", err);
                     continue;
                 }
                 println!("==== New UDP connection ====");
-                let (mut t_rx, mut t_tx) = tokio::io::split(udp);
-                let (mut s_rx, mut s_tx) = tokio::io::split(s?);
+                let mut s = s?;
                 tokio::spawn(async move {
-                    let _r = join! {
-                         tokio::io::copy(&mut t_rx, &mut s_tx) ,
-                         tokio::io::copy(&mut s_rx, &mut t_tx),
-                    };
+                    let _ = tokio::io::copy_bidirectional(&mut udp, &mut s).await;
                     println!("==== end UDP connection ====");
                 });
             }
@@ -132,8 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("unknown transport - Ip Protocol {}", u.ip_protocol());
                 continue;
             }
-            IpStackStream::UnknownNetwork(payload) => {
-                println!("unknown transport - {} bytes", payload.len());
+            IpStackStream::UnknownNetwork(pkt) => {
+                println!("unknown transport - {} bytes", pkt.len());
                 continue;
             }
         };
