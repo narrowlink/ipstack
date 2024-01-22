@@ -17,7 +17,7 @@ async fn main(){
     let mut config = tun2::Configuration::default();
     config.address(ipv4).netmask(netmask).mtu(MTU as i32).up();
 
-	#[cfg(target_os = "linux")]
+    #[cfg(target_os = "linux")]
     config.platform_config(|config| {
         config.packet_information(true);
 		config.apply_settings(true);
