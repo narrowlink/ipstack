@@ -13,9 +13,9 @@
 //! ```
 //! To route traffic to the tun interface, run the following command with root or administrator privileges:
 //! ```
-//! sudo ip route add 1.2.3.4/32 dev utun3    # Linux
+//! sudo ip route add 1.2.3.4/32 dev tun0    # Linux
 //! route add 1.2.3.4 mask 255.255.255.255 10.0.0.1 metric 100  # Windows
-//! sudo route add 1.2.3.4/32 10.0.0.1  # Apple macOS
+//! sudo route add 1.2.3.4/32 10.0.0.1  # macOS
 //! ```
 //! Now you can test it with `nc 1.2.3.4 any_port` or `nc -u 1.2.3.4 any_port`.
 //! You can watch the echo information in the `nc` console.
@@ -29,7 +29,7 @@ use clap::Parser;
 use etherparse::{IcmpEchoHeader, Icmpv4Header};
 use ipstack::stream::IpStackStream;
 use std::net::{Ipv4Addr, SocketAddr};
-use tokio::{join, net::TcpStream};
+use tokio::net::TcpStream;
 use udp_stream::UdpStream;
 
 // const MTU: u16 = 1500;
@@ -56,13 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.destination(gateway);
 
     #[cfg(target_os = "linux")]
-    config.platform(|config| {
+    config.platform_config(|config| {
         config.packet_information(true);
+        config.apply_settings(true);
     });
 
     #[cfg(target_os = "windows")]
-    config.platform(|config| {
-        config.initialize(Some(12324323423423434234_u128));
+    config.platform_config(|config| {
+        config.device_guid(Some(12324323423423434234_u128));
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
@@ -76,37 +77,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         match ip_stack.accept().await? {
-            IpStackStream::Tcp(tcp) => {
-                let s = TcpStream::connect(server_addr).await;
-                if let Err(ref err) = s {
-                    println!("connect TCP server failed \"{}\"", err);
-                    continue;
-                }
+            IpStackStream::Tcp(mut tcp) => {
+                let mut s = match TcpStream::connect(server_addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("connect TCP server failed \"{}\"", e);
+                        continue;
+                    }
+                };
                 println!("==== New TCP connection ====");
-                let (mut t_rx, mut t_tx) = tokio::io::split(tcp);
-                let (mut s_rx, mut s_tx) = tokio::io::split(s?);
                 tokio::spawn(async move {
-                    let _r = join! {
-                         tokio::io::copy(&mut t_rx, &mut s_tx) ,
-                         tokio::io::copy(&mut s_rx, &mut t_tx),
-                    };
+                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut s).await;
                     println!("====== end tcp connection ======");
                 });
             }
-            IpStackStream::Udp(udp) => {
-                let s = UdpStream::connect(server_addr).await;
-                if let Err(ref err) = s {
-                    println!("connect UDP server failed \"{}\"", err);
-                    continue;
-                }
+            IpStackStream::Udp(mut udp) => {
+                let mut s = match UdpStream::connect(server_addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("connect UDP server failed \"{}\"", e);
+                        continue;
+                    }
+                };
                 println!("==== New UDP connection ====");
-                let (mut t_rx, mut t_tx) = tokio::io::split(udp);
-                let (mut s_rx, mut s_tx) = tokio::io::split(s?);
                 tokio::spawn(async move {
-                    let _r = join! {
-                         tokio::io::copy(&mut t_rx, &mut s_tx) ,
-                         tokio::io::copy(&mut s_rx, &mut t_tx),
-                    };
+                    let _ = tokio::io::copy_bidirectional(&mut udp, &mut s).await;
                     println!("==== end UDP connection ====");
                 });
             }
@@ -132,8 +127,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("unknown transport - Ip Protocol {}", u.ip_protocol());
                 continue;
             }
-            IpStackStream::UnknownNetwork(payload) => {
-                println!("unknown transport - {} bytes", payload.len());
+            IpStackStream::UnknownNetwork(pkt) => {
+                println!("unknown transport - {} bytes", pkt.len());
                 continue;
             }
         };
