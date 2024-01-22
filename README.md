@@ -17,13 +17,13 @@ async fn main(){
     config.address(ipv4).netmask(netmask).mtu(MTU as i32).up();
 
 	#[cfg(target_os = "linux")]
-    config.platform(|config| {
+    config.platform_config(|config| {
         config.packet_information(true);
 		config.apply_settings(true);
     });
 
     #[cfg(target_os = "windows")]
-    config.platform(|config| {
+    config.platform_config(|config| {
         config.device_guid(Some(12324323423423434234_u128));
     });
 
