@@ -35,7 +35,7 @@ tokio = { version = "1.35", features = [
 ], default-features = false }
 
 #tun2.rs example
-tun2 = { version = "1.0.0", features = ["async"] }
+tun2 = { version = "1.0", features = ["async"] }
 
 #tun_wintun.rs example
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
