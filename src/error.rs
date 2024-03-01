@@ -3,14 +3,25 @@
 pub enum IpStackError {
     #[error("The transport protocol is not supported")]
     UnsupportedTransportProtocol,
+
     #[error("The packet is invalid")]
     InvalidPacket,
-    #[error("Write error: {0}")]
-    PacketWriteError(etherparse::WriteError),
+
+    #[error("ValueTooBigError<u16> {0}")]
+    ValueTooBigErrorU16(#[from] etherparse::err::ValueTooBigError<u16>),
+
+    #[error("From<ValueTooBigError<u32>> {0}")]
+    ValueTooBigErrorU32(#[from] etherparse::err::ValueTooBigError<u32>),
+
+    #[error("ValueTooBigError<usize> {0}")]
+    ValueTooBigErrorUsize(#[from] etherparse::err::ValueTooBigError<usize>),
+
     #[error("Invalid Tcp packet")]
     InvalidTcpPacket,
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+
     #[error("Accept Error")]
     AcceptError,
 

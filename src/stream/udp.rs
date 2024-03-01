@@ -17,7 +17,7 @@ use tokio::{
 // use crate::packet::TransportHeader;
 use crate::{
     packet::{NetworkPacket, TransportHeader},
-    TTL,
+    IpStackError, TTL,
 };
 
 pub struct IpStackUdpStream {
@@ -62,10 +62,12 @@ impl IpStackUdpStream {
     fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> Result<NetworkPacket, Error> {
         match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, 17, dst.octets(), src.octets());
+                let mut ip_h = Ipv4Header::new(0, ttl, 17.into(), dst.octets(), src.octets())
+                    .map_err(IpStackError::from)?;
                 let line_buffer = self.mtu.saturating_sub(ip_h.header_len() as u16 + 8); // 8 is udp header size
                 payload.truncate(line_buffer as usize);
-                ip_h.payload_len = payload.len() as u16 + 8; // 8 is udp header size
+                ip_h.set_payload_len(payload.len() + 8)
+                    .map_err(IpStackError::from)?; // 8 is udp header size
                 let udp_header = UdpHeader::with_ipv4_checksum(
                     self.dst_addr.port(),
                     self.src_addr.port(),
@@ -74,7 +76,7 @@ impl IpStackUdpStream {
                 )
                 .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;
                 Ok(NetworkPacket {
-                    ip: etherparse::IpHeader::Version4(ip_h, Ipv4Extensions::default()),
+                    ip: etherparse::NetHeaders::Ipv4(ip_h, Ipv4Extensions::default()),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
                 })
@@ -82,9 +84,9 @@ impl IpStackUdpStream {
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
                 let mut ip_h = Ipv6Header {
                     traffic_class: 0,
-                    flow_label: 0,
+                    flow_label: 0.try_into().map_err(IpStackError::from)?,
                     payload_length: 0,
-                    next_header: 17,
+                    next_header: 17.into(),
                     hop_limit: ttl,
                     source: dst.octets(),
                     destination: src.octets(),
@@ -102,7 +104,7 @@ impl IpStackUdpStream {
                 )
                 .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;
                 Ok(NetworkPacket {
-                    ip: etherparse::IpHeader::Version6(ip_h, Ipv6Extensions::default()),
+                    ip: etherparse::NetHeaders::Ipv6(ip_h, Ipv6Extensions::default()),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
                 })

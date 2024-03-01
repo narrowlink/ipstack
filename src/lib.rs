@@ -7,7 +7,6 @@ use std::{
     },
     time::Duration,
 };
-use stream::IpStackStream;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
@@ -18,7 +17,7 @@ use tracing::{error, trace};
 
 use crate::{
     packet::IpStackPacketProtocol,
-    stream::{IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
+    stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
 };
 mod error;
 mod packet;

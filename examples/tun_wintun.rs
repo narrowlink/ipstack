@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             IpStackStream::UnknownTransport(u) => {
-                if u.src_addr().is_ipv4() && u.ip_protocol() == 1 {
+                if u.src_addr().is_ipv4() && u.ip_protocol() == 1.into() {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
                     if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
                         println!("ICMPv4 echo");
@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
-                println!("unknown transport - Ip Protocol {}", u.ip_protocol());
+                println!("unknown transport - Ip Protocol {:?}", u.ip_protocol());
                 continue;
             }
             IpStackStream::UnknownNetwork(pkt) => {

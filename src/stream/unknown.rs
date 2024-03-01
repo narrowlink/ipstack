@@ -1,6 +1,6 @@
 use std::{io::Error, mem, net::IpAddr};
 
-use etherparse::{IpHeader, Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header};
+use etherparse::{IpNumber, Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header, NetHeaders};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
@@ -12,7 +12,7 @@ pub struct IpStackUnknownTransport {
     src_addr: IpAddr,
     dst_addr: IpAddr,
     payload: Vec<u8>,
-    protocol: u8,
+    protocol: IpNumber,
     mtu: u16,
     packet_sender: UnboundedSender<NetworkPacket>,
 }
@@ -22,13 +22,13 @@ impl IpStackUnknownTransport {
         src_addr: IpAddr,
         dst_addr: IpAddr,
         payload: Vec<u8>,
-        ip: &IpHeader,
+        ip: &NetHeaders,
         mtu: u16,
         packet_sender: UnboundedSender<NetworkPacket>,
     ) -> Self {
         let protocol = match ip {
-            IpHeader::Version4(ip, _) => ip.protocol,
-            IpHeader::Version6(ip, _) => ip.next_header,
+            NetHeaders::Ipv4(ip, _) => ip.protocol,
+            NetHeaders::Ipv6(ip, _) => ip.next_header,
         };
         IpStackUnknownTransport {
             src_addr,
@@ -48,7 +48,7 @@ impl IpStackUnknownTransport {
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
-    pub fn ip_protocol(&self) -> u8 {
+    pub fn ip_protocol(&self) -> IpNumber {
         self.protocol
     }
     pub async fn send(&self, mut payload: Vec<u8>) -> Result<(), Error> {
@@ -66,7 +66,8 @@ impl IpStackUnknownTransport {
     pub fn create_rev_packet(&self, payload: &mut Vec<u8>) -> Result<NetworkPacket, Error> {
         match (self.dst_addr, self.src_addr) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, TTL, self.protocol, dst.octets(), src.octets());
+                let mut ip_h = Ipv4Header::new(0, TTL, self.protocol, dst.octets(), src.octets())
+                    .map_err(crate::IpStackError::from)?;
                 let line_buffer = self.mtu.saturating_sub(ip_h.header_len() as u16);
 
                 let p = if payload.len() > line_buffer as usize {
@@ -74,9 +75,10 @@ impl IpStackUnknownTransport {
                 } else {
                     mem::take(payload)
                 };
-                ip_h.payload_len = p.len() as u16;
+                ip_h.set_payload_len(p.len())
+                    .map_err(crate::IpStackError::from)?;
                 Ok(NetworkPacket {
-                    ip: etherparse::IpHeader::Version4(ip_h, Ipv4Extensions::default()),
+                    ip: etherparse::NetHeaders::Ipv4(ip_h, Ipv4Extensions::default()),
                     transport: TransportHeader::Unknown,
                     payload: p,
                 })
@@ -84,9 +86,9 @@ impl IpStackUnknownTransport {
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
                 let mut ip_h = Ipv6Header {
                     traffic_class: 0,
-                    flow_label: 0,
+                    flow_label: 0.try_into().map_err(crate::IpStackError::from)?,
                     payload_length: 0,
-                    next_header: 17,
+                    next_header: 17.into(),
                     hop_limit: TTL,
                     source: dst.octets(),
                     destination: src.octets(),
@@ -100,7 +102,7 @@ impl IpStackUnknownTransport {
                     mem::take(payload)
                 };
                 Ok(NetworkPacket {
-                    ip: etherparse::IpHeader::Version6(ip_h, Ipv6Extensions::default()),
+                    ip: etherparse::NetHeaders::Ipv6(ip_h, Ipv6Extensions::default()),
                     transport: TransportHeader::Unknown,
                     payload: p,
                 })
