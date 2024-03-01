@@ -119,41 +119,47 @@ impl IpStackTcpStream {
 
         let ip_header = match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, 6, dst.octets(), src.octets());
-                let payload_len =
-                    self.calculate_payload_len(ip_h.header_len() as u16, tcp_header.header_len());
+                let mut ip_h = Ipv4Header::new(0, ttl, 6.into(), dst.octets(), src.octets())
+                    .map_err(IpStackError::from)?;
+                let payload_len = self.calculate_payload_len(
+                    ip_h.header_len() as u16,
+                    tcp_header.header_len() as u16,
+                );
                 payload.truncate(payload_len as usize);
-                ip_h.payload_len = payload.len() as u16 + tcp_header.header_len();
+                ip_h.set_payload_len(payload.len() + tcp_header.header_len())
+                    .map_err(IpStackError::from)?;
                 ip_h.dont_fragment = true;
-                etherparse::IpHeader::Version4(ip_h, Ipv4Extensions::default())
+                etherparse::NetHeaders::Ipv4(ip_h, Ipv4Extensions::default())
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
                 let mut ip_h = etherparse::Ipv6Header {
                     traffic_class: 0,
-                    flow_label: 0,
+                    flow_label: 0.try_into().map_err(IpStackError::from)?,
                     payload_length: 0,
-                    next_header: 6,
+                    next_header: 6.into(),
                     hop_limit: ttl,
                     source: dst.octets(),
                     destination: src.octets(),
                 };
-                let payload_len =
-                    self.calculate_payload_len(ip_h.header_len() as u16, tcp_header.header_len());
+                let payload_len = self.calculate_payload_len(
+                    ip_h.header_len() as u16,
+                    tcp_header.header_len() as u16,
+                );
                 payload.truncate(payload_len as usize);
-                ip_h.payload_length = payload.len() as u16 + tcp_header.header_len();
+                ip_h.payload_length = (payload.len() + tcp_header.header_len()) as u16;
 
-                etherparse::IpHeader::Version6(ip_h, Ipv6Extensions::default())
+                etherparse::NetHeaders::Ipv6(ip_h, Ipv6Extensions::default())
             }
             _ => unreachable!(),
         };
 
         match ip_header {
-            etherparse::IpHeader::Version4(ref ip_header, _) => {
+            etherparse::NetHeaders::Ipv4(ref ip_header, _) => {
                 tcp_header.checksum = tcp_header
                     .calc_checksum_ipv4(ip_header, &payload)
                     .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;
             }
-            etherparse::IpHeader::Version6(ref ip_header, _) => {
+            etherparse::NetHeaders::Ipv6(ref ip_header, _) => {
                 tcp_header.checksum = tcp_header
                     .calc_checksum_ipv6(ip_header, &payload)
                     .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;

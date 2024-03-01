@@ -14,28 +14,28 @@ default = []
 log = ["tracing/log"]
 
 [dependencies]
-tokio = { version = "1.35", features = [
+tokio = { version = "1.36", features = [
     "sync",
     "rt",
     "time",
     "io-util",
     "macros",
 ], default-features = false }
-etherparse = { version = "0.13", default-features = false }
+etherparse = { version = "0.14", default-features = false, features = ["std"] }
 thiserror = { version = "1.0", default-features = false }
 tracing = { version = "0.1", default-features = false, features = [
     "log",
 ], optional = true }
 
 [dev-dependencies]
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 udp-stream = { version = "0.0", default-features = false }
-tokio = { version = "1.35", features = [
+tokio = { version = "1.36", features = [
     "rt-multi-thread",
 ], default-features = false }
 
 #tun2.rs example
-tun2 = { version = "1.0", features = ["async"] }
+tun2 = { version = "1.2", features = ["async"] }
 
 #tun_wintun.rs example
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]

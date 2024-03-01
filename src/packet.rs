@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use etherparse::{IpHeader, PacketHeaders, TcpHeader, UdpHeader, WriteError};
+use etherparse::{NetHeaders, PacketHeaders, TcpHeader, UdpHeader};
 
 use crate::error::IpStackError;
 
@@ -34,7 +34,7 @@ pub(crate) enum TransportHeader {
 }
 
 pub struct NetworkPacket {
-    pub(crate) ip: IpHeader,
+    pub(crate) ip: NetHeaders,
     pub(crate) transport: TransportHeader,
     pub(crate) payload: Vec<u8>,
 }
@@ -42,7 +42,7 @@ pub struct NetworkPacket {
 impl NetworkPacket {
     pub fn parse(buf: &[u8]) -> Result<Self, IpStackError> {
         let p = PacketHeaders::from_ip_slice(buf).map_err(|_| IpStackError::InvalidPacket)?;
-        let ip = p.ip.ok_or(IpStackError::InvalidPacket)?;
+        let ip = p.net.ok_or(IpStackError::InvalidPacket)?;
         let transport = match p.transport {
             Some(etherparse::TransportHeader::Tcp(h)) => TransportHeader::Tcp(h),
             Some(etherparse::TransportHeader::Udp(u)) => TransportHeader::Udp(u),
@@ -52,7 +52,7 @@ impl NetworkPacket {
         let payload = if let TransportHeader::Unknown = transport {
             buf[ip.header_len()..].to_vec()
         } else {
-            p.payload.to_vec()
+            p.payload.slice().to_vec()
         };
 
         Ok(NetworkPacket {
@@ -75,12 +75,8 @@ impl NetworkPacket {
             _ => 0,
         };
         match &self.ip {
-            IpHeader::Version4(ip, _) => {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip.source)), port)
-            }
-            IpHeader::Version6(ip, _) => {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip.source)), port)
-            }
+            NetHeaders::Ipv4(ip, _) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip.source)), port),
+            NetHeaders::Ipv6(ip, _) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip.source)), port),
         }
     }
     pub fn dst_addr(&self) -> SocketAddr {
@@ -90,10 +86,10 @@ impl NetworkPacket {
             _ => 0,
         };
         match &self.ip {
-            IpHeader::Version4(ip, _) => {
+            NetHeaders::Ipv4(ip, _) => {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip.destination)), port)
             }
-            IpHeader::Version6(ip, _) => {
+            NetHeaders::Ipv6(ip, _) => {
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip.destination)), port)
             }
         }
@@ -114,29 +110,22 @@ impl NetworkPacket {
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>, IpStackError> {
         let mut buf = Vec::new();
-        self.ip
-            .write(&mut buf)
-            .map_err(IpStackError::PacketWriteError)?;
+        match self.ip {
+            NetHeaders::Ipv4(ref ip, _) => ip.write(&mut buf)?,
+            NetHeaders::Ipv6(ref ip, _) => ip.write(&mut buf)?,
+        }
         match self.transport {
-            TransportHeader::Tcp(ref h) => h
-                .write(&mut buf)
-                .map_err(WriteError::from)
-                .map_err(IpStackError::PacketWriteError)?,
-            TransportHeader::Udp(ref h) => {
-                h.write(&mut buf).map_err(IpStackError::PacketWriteError)?
-            }
+            TransportHeader::Tcp(ref h) => h.write(&mut buf)?,
+            TransportHeader::Udp(ref h) => h.write(&mut buf)?,
             _ => {}
         };
-        // self.transport
-        //     .write(&mut buf)
-        //     .map_err(IpStackError::PacketWriteError)?;
         buf.extend_from_slice(&self.payload);
         Ok(buf)
     }
     pub fn ttl(&self) -> u8 {
         match &self.ip {
-            IpHeader::Version4(ip, _) => ip.time_to_live,
-            IpHeader::Version6(ip, _) => ip.hop_limit,
+            NetHeaders::Ipv4(ip, _) => ip.time_to_live,
+            NetHeaders::Ipv6(ip, _) => ip.hop_limit,
         }
     }
 }
