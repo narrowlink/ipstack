@@ -4,7 +4,7 @@ use etherparse::{NetHeaders, PacketHeaders, TcpHeader, UdpHeader};
 
 use crate::error::IpStackError;
 
-#[derive(Eq, Hash, PartialEq, Debug)]
+#[derive(Eq, Hash, PartialEq, Debug, Clone, Copy)]
 pub struct NetworkTuple {
     pub src: SocketAddr,
     pub dst: SocketAddr,
@@ -21,18 +21,21 @@ pub mod tcp_flags {
     pub const FIN: u8 = 0b00000001;
 }
 
+#[derive(Debug, Clone)]
 pub(crate) enum IpStackPacketProtocol {
     Tcp(TcpPacket),
     Unknown,
     Udp,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) enum TransportHeader {
     Tcp(TcpHeader),
     Udp(UdpHeader),
     Unknown,
 }
 
+#[derive(Debug, Clone)]
 pub struct NetworkPacket {
     pub(crate) ip: NetHeaders,
     pub(crate) transport: TransportHeader,
@@ -130,6 +133,7 @@ impl NetworkPacket {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(super) struct TcpPacket {
     header: TcpHeader,
 }

@@ -88,7 +88,7 @@ impl IpStackUnknownTransport {
                     traffic_class: 0,
                     flow_label: 0.try_into().map_err(crate::IpStackError::from)?,
                     payload_length: 0,
-                    next_header: 17.into(),
+                    next_header: IpNumber::UDP,
                     hop_limit: TTL,
                     source: dst.octets(),
                     destination: src.octets(),

@@ -29,6 +29,7 @@ pub(super) enum PacketStatus {
     KeepAlive,
 }
 
+#[derive(Debug)]
 pub(super) struct Tcb {
     pub(super) seq: u32,
     pub(super) retransmission: Option<u32>,
@@ -47,15 +48,14 @@ pub(super) struct Tcb {
 impl Tcb {
     pub(super) fn new(ack: u32, tcp_timeout: Duration) -> Tcb {
         let seq = 100;
+        let deadline = tokio::time::Instant::now() + tcp_timeout;
         Tcb {
             seq,
             retransmission: None,
             ack,
             last_ack: seq,
             tcp_timeout,
-            timeout: Box::pin(tokio::time::sleep_until(
-                tokio::time::Instant::now() + tcp_timeout,
-            )),
+            timeout: Box::pin(tokio::time::sleep_until(deadline)),
             send_window: u16::MAX,
             recv_window: 0,
             state: TcpState::SynReceived(false),
@@ -200,6 +200,7 @@ impl Tcb {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct InflightPacket {
     pub seq: u32,
     pub payload: Vec<u8>,
@@ -219,6 +220,7 @@ impl InflightPacket {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct UnorderedPacket {
     pub payload: Vec<u8>,
     pub recv_time: SystemTime,

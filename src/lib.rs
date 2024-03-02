@@ -109,22 +109,9 @@ impl IpStack {
 
                         match streams.entry(packet.network_tuple()){
                             Occupied(entry) =>{
-                                // let t = packet.transport_protocol();
                                 if let Err(_x) = entry.get().send(packet){
                                     #[cfg(feature = "log")]
                                     trace!("{}", _x);
-                                    // match t{
-                                    //     IpStackPacketProtocol::Tcp(_t) => {
-                                    //         // dbg!(t.flags());
-                                    //     }
-                                    //     IpStackPacketProtocol::Udp => {
-                                    //         // dbg!("udp");
-                                    //     }
-                                    //     IpStackPacketProtocol::Unknown => {
-                                    //         // dbg!("unknown");
-                                    //     }
-                                    // }
-
                                 }
                             }
                             Vacant(entry) => {
@@ -183,11 +170,11 @@ impl IpStack {
 
         IpStack { accept_receiver }
     }
+
     pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
-        if let Some(s) = self.accept_receiver.recv().await {
-            Ok(s)
-        } else {
-            Err(IpStackError::AcceptError)
-        }
+        self.accept_receiver
+            .recv()
+            .await
+            .ok_or(IpStackError::AcceptError)
     }
 }

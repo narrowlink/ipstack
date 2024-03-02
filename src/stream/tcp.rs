@@ -4,7 +4,7 @@ use crate::{
     stream::tcb::{Tcb, TcpState},
     DROP_TTL, TTL,
 };
-use etherparse::{Ipv4Extensions, Ipv4Header, Ipv6Extensions};
+use etherparse::{IpNumber, Ipv4Extensions, Ipv4Header, Ipv6Extensions};
 use std::{
     cmp,
     future::Future,
@@ -28,6 +28,7 @@ use crate::packet::NetworkPacket;
 
 use super::tcb::PacketStatus;
 
+#[derive(Debug)]
 pub struct IpStackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
@@ -65,27 +66,26 @@ impl IpStackTcpStream {
             write_notify: None,
         };
         if !tcp.inner().syn {
+            let flags = tcp_flags::RST | tcp_flags::ACK;
             pkt_sender
-                .send(stream.create_rev_packet(
-                    tcp_flags::RST | tcp_flags::ACK,
-                    TTL,
-                    None,
-                    Vec::new(),
-                )?)
+                .send(stream.create_rev_packet(flags, TTL, None, Vec::new())?)
                 .map_err(|_| IpStackError::InvalidTcpPacket)?;
             stream.tcb.change_state(TcpState::Closed);
         }
         Ok(stream)
     }
+
     pub(crate) fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
         self.stream_sender.clone()
     }
+
     fn calculate_payload_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
         cmp::min(
             self.tcb.get_send_window(),
             self.mtu.saturating_sub(ip_header_size + tcp_header_size),
         )
     }
+
     fn create_rev_packet(
         &self,
         flags: u8,
@@ -119,7 +119,7 @@ impl IpStackTcpStream {
 
         let ip_header = match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, 6.into(), dst.octets(), src.octets())
+                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::TCP, dst.octets(), src.octets())
                     .map_err(IpStackError::from)?;
                 let payload_len = self.calculate_payload_len(
                     ip_h.header_len() as u16,
@@ -136,7 +136,7 @@ impl IpStackTcpStream {
                     traffic_class: 0,
                     flow_label: 0.try_into().map_err(IpStackError::from)?,
                     payload_length: 0,
-                    next_header: 6.into(),
+                    next_header: IpNumber::TCP,
                     hop_limit: ttl,
                     source: dst.octets(),
                     destination: src.octets(),
@@ -171,9 +171,11 @@ impl IpStackTcpStream {
             payload,
         })
     }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.src_addr
     }
+
     pub fn peer_addr(&self) -> SocketAddr {
         self.dst_addr
     }
@@ -200,24 +202,16 @@ impl AsyncRead for IpStackTcpStream {
             ) {
                 #[cfg(feature = "log")]
                 trace!("timeout reached for {:?}", self.dst_addr);
+                let flags = tcp_flags::RST | tcp_flags::ACK;
                 self.packet_sender
-                    .send(self.create_rev_packet(
-                        tcp_flags::RST | tcp_flags::ACK,
-                        TTL,
-                        None,
-                        Vec::new(),
-                    )?)
+                    .send(self.create_rev_packet(flags, TTL, None, Vec::new())?)
                     .map_err(|_| ErrorKind::UnexpectedEof)?;
                 return std::task::Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
             }
 
             if matches!(self.tcb.get_state(), TcpState::SynReceived(false)) {
-                self.packet_to_send = Some(self.create_rev_packet(
-                    tcp_flags::SYN | tcp_flags::ACK,
-                    TTL,
-                    None,
-                    Vec::new(),
-                )?);
+                let flags = tcp_flags::SYN | tcp_flags::ACK;
+                self.packet_to_send = Some(self.create_rev_packet(flags, TTL, None, Vec::new())?);
                 self.tcb.add_seq_one();
                 self.tcb.change_state(TcpState::SynReceived(true));
             }
@@ -243,12 +237,8 @@ impl AsyncRead for IpStackTcpStream {
             }
             if self.shutdown.is_some() && matches!(self.tcb.get_state(), TcpState::Established) {
                 self.tcb.change_state(TcpState::FinWait1);
-                self.packet_to_send = Some(self.create_rev_packet(
-                    tcp_flags::FIN | tcp_flags::ACK,
-                    TTL,
-                    None,
-                    Vec::new(),
-                )?);
+                let flags = tcp_flags::FIN | tcp_flags::ACK;
+                self.packet_to_send = Some(self.create_rev_packet(flags, TTL, None, Vec::new())?);
                 continue;
             }
             match self.stream_receiver.poll_recv(cx) {
@@ -357,12 +347,9 @@ impl AsyncRead for IpStackTcpStream {
                         }
                         if t.flags() == (tcp_flags::FIN | tcp_flags::ACK) {
                             self.tcb.add_ack(1);
-                            self.packet_to_send = Some(self.create_rev_packet(
-                                tcp_flags::FIN | tcp_flags::ACK,
-                                TTL,
-                                None,
-                                Vec::new(),
-                            )?);
+                            let flags = tcp_flags::FIN | tcp_flags::ACK;
+                            self.packet_to_send =
+                                Some(self.create_rev_packet(flags, TTL, None, Vec::new())?);
                             self.tcb.add_seq_one();
                             self.tcb.change_state(TcpState::FinWait2(true));
                             continue;
@@ -398,12 +385,9 @@ impl AsyncRead for IpStackTcpStream {
                         }
                     } else if matches!(self.tcb.get_state(), TcpState::FinWait1) {
                         if t.flags() == (tcp_flags::FIN | tcp_flags::ACK) {
-                            self.packet_to_send = Some(self.create_rev_packet(
-                                tcp_flags::ACK,
-                                TTL,
-                                None,
-                                Vec::new(),
-                            )?);
+                            let flags = tcp_flags::ACK;
+                            self.packet_to_send =
+                                Some(self.create_rev_packet(flags, TTL, None, Vec::new())?);
                             self.tcb.change_send_window(t.inner().window_size);
                             self.tcb.add_seq_one();
                             self.tcb.change_state(TcpState::FinWait2(false));
@@ -442,8 +426,8 @@ impl AsyncWrite for IpStackTcpStream {
             }
         }
 
-        let packet =
-            self.create_rev_packet(tcp_flags::PSH | tcp_flags::ACK, TTL, None, buf.to_vec())?;
+        let flags = tcp_flags::PSH | tcp_flags::ACK;
+        let packet = self.create_rev_packet(flags, TTL, None, buf.to_vec())?;
         let seq = self.tcb.seq;
         let payload_len = packet.payload.len();
         let payload = packet.payload.clone();
@@ -466,12 +450,8 @@ impl AsyncWrite for IpStackTcpStream {
             .and_then(|s| self.tcb.inflight_packets.iter().position(|p| p.seq == s))
             .and_then(|p| self.tcb.inflight_packets.get(p))
         {
-            let packet = self.create_rev_packet(
-                tcp_flags::PSH | tcp_flags::ACK,
-                TTL,
-                Some(i.seq),
-                i.payload.to_vec(),
-            )?;
+            let flags = tcp_flags::PSH | tcp_flags::ACK;
+            let packet = self.create_rev_packet(flags, TTL, Some(i.seq), i.payload.to_vec())?;
 
             self.packet_sender
                 .send(packet)

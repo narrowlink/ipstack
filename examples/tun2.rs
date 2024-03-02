@@ -26,7 +26,7 @@
 //!
 
 use clap::Parser;
-use etherparse::{IcmpEchoHeader, Icmpv4Header};
+use etherparse::{IcmpEchoHeader, Icmpv4Header, IpNumber};
 use ipstack::stream::IpStackStream;
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::net::TcpStream;
@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             IpStackStream::UnknownTransport(u) => {
-                if u.src_addr().is_ipv4() && u.ip_protocol() == 1.into() {
+                if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
                     if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
                         println!("ICMPv4 echo");
