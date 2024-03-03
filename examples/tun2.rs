@@ -35,17 +35,36 @@ use udp_stream::UdpStream;
 // const MTU: u16 = 1500;
 const MTU: u16 = u16::MAX;
 
+#[repr(C)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+pub enum ArgVerbosity {
+    Off = 0,
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
 #[derive(Parser)]
 #[command(author, version, about = "Testing app for tun.", long_about = None)]
 struct Args {
     /// echo server address, likes `127.0.0.1:8080`
     #[arg(short, long, value_name = "IP:port")]
     server_addr: SocketAddr,
+
+    /// Verbosity level
+    #[arg(short, long, value_name = "level", value_enum, default_value = "info")]
+    pub verbosity: ArgVerbosity,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    let default = format!("{:?}", args.verbosity);
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
 
     let ipv4 = Ipv4Addr::new(10, 0, 0, 33);
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
