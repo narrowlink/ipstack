@@ -4,7 +4,7 @@ use crate::{
     stream::tcb::{Tcb, TcpState},
     DROP_TTL, TTL,
 };
-use etherparse::{IpNumber, Ipv4Extensions, Ipv4Header, Ipv6Extensions};
+use etherparse::{IpNumber, Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6FlowLabel};
 use std::{
     cmp,
     future::Future,
@@ -90,13 +90,13 @@ impl IpStackTcpStream {
         &self,
         flags: u8,
         ttl: u8,
-        seq: Option<u32>,
+        seq: impl Into<Option<u32>>,
         mut payload: Vec<u8>,
     ) -> Result<NetworkPacket, Error> {
         let mut tcp_header = etherparse::TcpHeader::new(
             self.dst_addr.port(),
             self.src_addr.port(),
-            seq.unwrap_or(self.tcb.get_seq()),
+            seq.into().unwrap_or(self.tcb.get_seq()),
             self.tcb.get_recv_window(),
         );
 
@@ -134,7 +134,7 @@ impl IpStackTcpStream {
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
                 let mut ip_h = etherparse::Ipv6Header {
                     traffic_class: 0,
-                    flow_label: 0.try_into().map_err(IpStackError::from)?,
+                    flow_label: Ipv6FlowLabel::ZERO,
                     payload_length: 0,
                     next_header: IpNumber::TCP,
                     hop_limit: ttl,
@@ -455,7 +455,7 @@ impl AsyncWrite for IpStackTcpStream {
             .and_then(|p| self.tcb.inflight_packets.get(p))
         {
             let flags = tcp_flags::PSH | tcp_flags::ACK;
-            let packet = self.create_rev_packet(flags, TTL, Some(i.seq), i.payload.to_vec())?;
+            let packet = self.create_rev_packet(flags, TTL, i.seq, i.payload.to_vec())?;
 
             self.packet_sender
                 .send(packet)
