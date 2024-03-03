@@ -209,6 +209,8 @@ impl AsyncRead for IpStackTcpStream {
                 return std::task::Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
             }
 
+            self.tcb.reset_timeout();
+
             if matches!(self.tcb.get_state(), TcpState::SynReceived(false)) {
                 let flags = tcp_flags::SYN | tcp_flags::ACK;
                 self.packet_to_send = Some(self.create_rev_packet(flags, TTL, None, Vec::new())?);
@@ -412,6 +414,8 @@ impl AsyncWrite for IpStackTcpStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        self.tcb.reset_timeout();
+
         if (self.tcb.send_window as u64) < self.tcb.avg_send_window.0 / 2
             || self.tcb.is_send_buffer_full()
         {

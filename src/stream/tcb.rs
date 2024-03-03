@@ -172,9 +172,6 @@ impl Tcb {
         }
     }
     pub(super) fn change_last_ack(&mut self, ack: u32) {
-        self.timeout
-            .as_mut()
-            .reset(tokio::time::Instant::now() + self.tcp_timeout);
         let distance = ack.wrapping_sub(self.last_ack);
 
         if matches!(self.state, TcpState::Established) {
@@ -193,6 +190,11 @@ impl Tcb {
     }
     pub fn is_send_buffer_full(&self) -> bool {
         self.seq.wrapping_sub(self.last_ack) >= MAX_UNACK
+    }
+
+    pub(crate) fn reset_timeout(&mut self) {
+        let deadline = tokio::time::Instant::now() + self.tcp_timeout;
+        self.timeout.as_mut().reset(deadline);
     }
 }
 
