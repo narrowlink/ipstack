@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    pin::Pin,
-    time::{Duration, SystemTime},
-};
+use std::{collections::BTreeMap, pin::Pin, time::Duration};
 
 use tokio::time::Sleep;
 
@@ -42,7 +38,7 @@ pub(super) struct Tcb {
     state: TcpState,
     pub(super) avg_send_window: (u64, u64),
     pub(super) inflight_packets: Vec<InflightPacket>,
-    pub(super) unordered_packets: BTreeMap<u32, UnorderedPacket>,
+    unordered_packets: BTreeMap<u32, UnorderedPacket>,
 }
 
 impl Tcb {
@@ -204,7 +200,7 @@ impl Tcb {
 pub struct InflightPacket {
     pub seq: u32,
     pub payload: Vec<u8>,
-    pub send_time: SystemTime,
+    // pub send_time: SystemTime, // todo
 }
 
 impl InflightPacket {
@@ -212,7 +208,7 @@ impl InflightPacket {
         Self {
             seq,
             payload,
-            send_time: SystemTime::now(),
+            // send_time: SystemTime::now(), // todo
         }
     }
     pub(crate) fn contains(&self, seq: u32) -> bool {
@@ -221,16 +217,16 @@ impl InflightPacket {
 }
 
 #[derive(Debug, Clone)]
-pub struct UnorderedPacket {
-    pub payload: Vec<u8>,
-    pub recv_time: SystemTime,
+struct UnorderedPacket {
+    payload: Vec<u8>,
+    // pub recv_time: SystemTime, // todo
 }
 
 impl UnorderedPacket {
     pub(crate) fn new(payload: Vec<u8>) -> Self {
         Self {
             payload,
-            recv_time: SystemTime::now(),
+            // recv_time: SystemTime::now(), // todo
         }
     }
 }
