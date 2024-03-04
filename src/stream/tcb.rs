@@ -11,7 +11,7 @@ const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 pub enum TcpState {
     SynReceived(bool), // bool means if syn/ack is sent
     Established,
-    FinWait1,
+    FinWait1(bool),
     FinWait2(bool), // bool means waiting for ack
     Closed,
 }

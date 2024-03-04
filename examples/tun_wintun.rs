@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 println!("==== New TCP connection ====");
+                dbg!(tcp.local_addr());
                 tokio::spawn(async move {
                     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut s).await;
                     println!("====== end tcp connection ======");
