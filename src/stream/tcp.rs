@@ -478,15 +478,19 @@ impl AsyncWrite for IpStackTcpStream {
         std::task::Poll::Ready(Ok(()))
     }
 
+    #[allow(unused_mut, unused_variables)]
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
+        /*
         let notified = self.shutdown.get_or_insert(Notify::new()).notified();
         match Pin::new(&mut Box::pin(notified)).poll(cx) {
             std::task::Poll::Ready(_) => std::task::Poll::Ready(Ok(())),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
+        // */
+        std::task::Poll::Ready(Ok(()))
     }
 }
 

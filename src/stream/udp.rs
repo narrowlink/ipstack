@@ -133,7 +133,7 @@ impl AsyncRead for IpStackUdpStream {
             return std::task::Poll::Ready(Ok(()));
         }
         if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
-            return std::task::Poll::Ready(Ok(())); // todo: return timeout error
+            return std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         }
 
         self.reset_timeout();
