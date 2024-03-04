@@ -196,6 +196,9 @@ impl IpStackTcpStream {
     pub fn peer_addr(&self) -> SocketAddr {
         self.dst_addr
     }
+    pub(crate) fn is_closed(&self) -> bool {
+        matches!(self.tcb.get_state(), TcpState::Closed)
+    }
 }
 
 impl AsyncRead for IpStackTcpStream {

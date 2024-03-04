@@ -119,6 +119,9 @@ impl IpStack {
                                     IpStackPacketProtocol::Tcp(h) => {
                                         match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),config.mtu,config.tcp_timeout).await{
                                             Ok(stream) => {
+                                                if stream.is_closed(){
+                                                    continue;
+                                                }
                                                 entry.insert(stream.stream_sender());
                                                 accept_sender.send(IpStackStream::Tcp(stream))?;
                                             }
