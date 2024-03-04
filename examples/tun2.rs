@@ -26,7 +26,7 @@
 //!
 
 use clap::Parser;
-use etherparse::{IcmpEchoHeader, Icmpv4Header};
+use etherparse::{IcmpEchoHeader, Icmpv4Header, IpNumber};
 use ipstack::stream::IpStackStream;
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::net::TcpStream;
@@ -35,17 +35,36 @@ use udp_stream::UdpStream;
 // const MTU: u16 = 1500;
 const MTU: u16 = u16::MAX;
 
+#[repr(C)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+pub enum ArgVerbosity {
+    Off = 0,
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
 #[derive(Parser)]
 #[command(author, version, about = "Testing app for tun.", long_about = None)]
 struct Args {
     /// echo server address, likes `127.0.0.1:8080`
     #[arg(short, long, value_name = "IP:port")]
     server_addr: SocketAddr,
+
+    /// Verbosity level
+    #[arg(short, long, value_name = "level", value_enum, default_value = "info")]
+    pub verbosity: ArgVerbosity,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    let default = format!("{:?}", args.verbosity);
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
 
     let ipv4 = Ipv4Addr::new(10, 0, 0, 33);
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
@@ -103,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             IpStackStream::UnknownTransport(u) => {
-                if u.src_addr().is_ipv4() && u.ip_protocol() == 1.into() {
+                if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
                     if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
                         println!("ICMPv4 echo");

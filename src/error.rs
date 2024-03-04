@@ -10,9 +10,6 @@ pub enum IpStackError {
     #[error("ValueTooBigError<u16> {0}")]
     ValueTooBigErrorU16(#[from] etherparse::err::ValueTooBigError<u16>),
 
-    #[error("From<ValueTooBigError<u32>> {0}")]
-    ValueTooBigErrorU32(#[from] etherparse::err::ValueTooBigError<u32>),
-
     #[error("ValueTooBigError<usize> {0}")]
     ValueTooBigErrorUsize(#[from] etherparse::err::ValueTooBigError<usize>),
 

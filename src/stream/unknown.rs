@@ -1,6 +1,8 @@
 use std::{io::Error, mem, net::IpAddr};
 
-use etherparse::{IpNumber, Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header, NetHeaders};
+use etherparse::{
+    IpNumber, Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6FlowLabel, Ipv6Header, NetHeaders,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
@@ -86,9 +88,9 @@ impl IpStackUnknownTransport {
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
                 let mut ip_h = Ipv6Header {
                     traffic_class: 0,
-                    flow_label: 0.try_into().map_err(crate::IpStackError::from)?,
+                    flow_label: Ipv6FlowLabel::ZERO,
                     payload_length: 0,
-                    next_header: 17.into(),
+                    next_header: IpNumber::UDP,
                     hop_limit: TTL,
                     source: dst.octets(),
                     destination: src.octets(),

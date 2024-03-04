@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    pin::Pin,
-    time::{Duration, SystemTime},
-};
+use std::{collections::BTreeMap, pin::Pin, time::Duration};
 
 use tokio::time::Sleep;
 
@@ -29,6 +25,7 @@ pub(super) enum PacketStatus {
     KeepAlive,
 }
 
+#[derive(Debug)]
 pub(super) struct Tcb {
     pub(super) seq: u32,
     pub(super) retransmission: Option<u32>,
@@ -41,21 +38,20 @@ pub(super) struct Tcb {
     state: TcpState,
     pub(super) avg_send_window: (u64, u64),
     pub(super) inflight_packets: Vec<InflightPacket>,
-    pub(super) unordered_packets: BTreeMap<u32, UnorderedPacket>,
+    unordered_packets: BTreeMap<u32, UnorderedPacket>,
 }
 
 impl Tcb {
     pub(super) fn new(ack: u32, tcp_timeout: Duration) -> Tcb {
         let seq = 100;
+        let deadline = tokio::time::Instant::now() + tcp_timeout;
         Tcb {
             seq,
             retransmission: None,
             ack,
             last_ack: seq,
             tcp_timeout,
-            timeout: Box::pin(tokio::time::sleep_until(
-                tokio::time::Instant::now() + tcp_timeout,
-            )),
+            timeout: Box::pin(tokio::time::sleep_until(deadline)),
             send_window: u16::MAX,
             recv_window: 0,
             state: TcpState::SynReceived(false),
@@ -176,9 +172,6 @@ impl Tcb {
         }
     }
     pub(super) fn change_last_ack(&mut self, ack: u32) {
-        self.timeout
-            .as_mut()
-            .reset(tokio::time::Instant::now() + self.tcp_timeout);
         let distance = ack.wrapping_sub(self.last_ack);
 
         if matches!(self.state, TcpState::Established) {
@@ -198,12 +191,18 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         self.seq.wrapping_sub(self.last_ack) >= MAX_UNACK
     }
+
+    pub(crate) fn reset_timeout(&mut self) {
+        let deadline = tokio::time::Instant::now() + self.tcp_timeout;
+        self.timeout.as_mut().reset(deadline);
+    }
 }
 
+#[derive(Debug, Clone)]
 pub struct InflightPacket {
     pub seq: u32,
     pub payload: Vec<u8>,
-    pub send_time: SystemTime,
+    // pub send_time: SystemTime, // todo
 }
 
 impl InflightPacket {
@@ -211,7 +210,7 @@ impl InflightPacket {
         Self {
             seq,
             payload,
-            send_time: SystemTime::now(),
+            // send_time: SystemTime::now(), // todo
         }
     }
     pub(crate) fn contains(&self, seq: u32) -> bool {
@@ -219,16 +218,17 @@ impl InflightPacket {
     }
 }
 
-pub struct UnorderedPacket {
-    pub payload: Vec<u8>,
-    pub recv_time: SystemTime,
+#[derive(Debug, Clone)]
+struct UnorderedPacket {
+    payload: Vec<u8>,
+    // pub recv_time: SystemTime, // todo
 }
 
 impl UnorderedPacket {
     pub(crate) fn new(payload: Vec<u8>) -> Self {
         Self {
             payload,
-            recv_time: SystemTime::now(),
+            // recv_time: SystemTime::now(), // todo
         }
     }
 }
