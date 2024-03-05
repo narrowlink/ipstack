@@ -34,9 +34,9 @@ const TTL: u8 = 128;
 #[cfg(unix)]
 const TUN_FLAGS: [u8; 2] = [0x00, 0x00];
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 const TUN_PROTO_IP6: [u8; 2] = [0x86, 0xdd];
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 const TUN_PROTO_IP4: [u8; 2] = [0x08, 0x00];
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
