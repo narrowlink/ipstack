@@ -111,7 +111,7 @@ impl IpStack {
                             Occupied(entry) =>{
                                 if let Err(_x) = entry.get().send(packet){
                                     #[cfg(feature = "log")]
-                                    trace!("{}", _x);
+                                    trace!("Send packet error \"{}\"", _x);
                                 }
                             }
                             Vacant(entry) => {
