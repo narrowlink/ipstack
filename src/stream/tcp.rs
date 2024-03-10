@@ -219,16 +219,16 @@ impl AsyncRead for IpStackTcpStream {
             }
             let min = cmp::min(self.tcb.get_available_read_buffer_size() as u16, u16::MAX);
             self.tcb.change_recv_window(min);
-            if matches!(
-                Pin::new(&mut self.tcb.timeout).poll(cx),
-                std::task::Poll::Ready(_)
-            ) {
+            use std::task::Poll::Ready;
+            if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Ready(_)) {
                 #[cfg(feature = "log")]
                 trace!("timeout reached for {:?}", self.dst_addr);
                 let flags = tcp_flags::RST | tcp_flags::ACK;
                 self.packet_sender
                     .send(self.create_rev_packet(flags, TTL, None, Vec::new())?)
                     .map_err(|_| ErrorKind::UnexpectedEof)?;
+                self.tcb.change_state(TcpState::Closed);
+                self.shutdown.ready();
                 return std::task::Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
             }
 
@@ -282,9 +282,7 @@ impl AsyncRead for IpStackTcpStream {
                         self.packet_to_send =
                             Some(self.create_rev_packet(0, DROP_TTL, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
-                        return std::task::Poll::Ready(Err(Error::from(
-                            ErrorKind::ConnectionReset,
-                        )));
+                        return Ready(Err(Error::from(ErrorKind::ConnectionReset)));
                     }
                     if matches!(
                         self.tcb.check_pkt_type(&t, &p.payload),
