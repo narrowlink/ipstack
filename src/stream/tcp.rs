@@ -88,6 +88,7 @@ impl IpStackTcpStream {
                 .send(stream.create_rev_packet(flags, TTL, None, Vec::new())?)
                 .map_err(|_| IpStackError::InvalidTcpPacket)?;
             stream.tcb.change_state(TcpState::Closed);
+            stream.shutdown.ready();
         }
         Ok(stream)
     }
@@ -282,6 +283,7 @@ impl AsyncRead for IpStackTcpStream {
                         self.packet_to_send =
                             Some(self.create_rev_packet(0, DROP_TTL, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
+                        self.shutdown.ready();
                         return Ready(Err(Error::from(ErrorKind::ConnectionReset)));
                     }
                     if matches!(
