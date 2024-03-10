@@ -119,15 +119,17 @@ impl IpStack {
                                     IpStackPacketProtocol::Tcp(h) => {
                                         match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),config.mtu,config.tcp_timeout).await{
                                             Ok(stream) => {
-                                                if stream.is_closed(){
-                                                    continue;
-                                                }
                                                 entry.insert(stream.stream_sender());
                                                 accept_sender.send(IpStackStream::Tcp(stream))?;
                                             }
-                                            Err(_e) => {
+                                            Err(e) => {
+                                                if matches!(e,IpStackError::InvalidTcpPacket){
+                                                    #[cfg(feature = "log")]
+                                                    trace!("Invalid TCP packet");
+                                                    continue
+                                                }
                                                 #[cfg(feature = "log")]
-                                                error!("{}", _e);
+                                                error!("{}", e);
                                             }
                                         }
                                     }

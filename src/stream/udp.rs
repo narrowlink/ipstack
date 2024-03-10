@@ -160,7 +160,7 @@ impl AsyncWrite for IpStackUdpStream {
         let payload_len = packet.payload.len();
         self.packet_sender
             .send(packet)
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+            .or(Err(std::io::ErrorKind::UnexpectedEof))?;
         std::task::Poll::Ready(Ok(payload_len))
     }
 
