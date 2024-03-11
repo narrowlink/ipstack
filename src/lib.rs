@@ -129,7 +129,7 @@ impl IpStack {
                                                     continue;
                                                 }
                                                 #[cfg(feature = "log")]
-                                                error!("{}", e);
+                                                error!("IpStackTcpStream::new failed \"{}\"", e);
                                             }
                                         }
                                     }
