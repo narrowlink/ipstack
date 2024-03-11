@@ -441,7 +441,7 @@ impl AsyncWrite for IpStackTcpStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
+    ) -> Poll<std::io::Result<usize>> {
         if !matches!(self.tcb.get_state(), TcpState::Established) {
             return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
         }
@@ -478,7 +478,7 @@ impl AsyncWrite for IpStackTcpStream {
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    ) -> Poll<std::io::Result<()>> {
         if !matches!(self.tcb.get_state(), TcpState::Established) {
             return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
         }
@@ -515,7 +515,7 @@ impl AsyncWrite for IpStackTcpStream {
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    ) -> Poll<std::io::Result<()>> {
         match &self.shutdown {
             Shutdown::Ready => Poll::Ready(Ok(())),
             Shutdown::Pending(_) | Shutdown::None => {
