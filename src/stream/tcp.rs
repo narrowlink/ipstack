@@ -215,8 +215,7 @@ impl AsyncRead for IpStackTcpStream {
             }
             let min = cmp::min(self.tcb.get_available_read_buffer_size() as u16, u16::MAX);
             self.tcb.change_recv_window(min);
-            use Poll::Ready;
-            if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Ready(_)) {
+            if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
                 #[cfg(feature = "log")]
                 trace!("timeout reached for {:?}", self.dst_addr);
                 let flags = tcp_flags::RST | tcp_flags::ACK;
@@ -279,7 +278,7 @@ impl AsyncRead for IpStackTcpStream {
                             Some(self.create_rev_packet(0, DROP_TTL, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
                         self.shutdown.ready();
-                        return Ready(Err(Error::from(ErrorKind::ConnectionReset)));
+                        return Poll::Ready(Err(Error::from(ErrorKind::ConnectionReset)));
                     }
                     if matches!(
                         self.tcb.check_pkt_type(&t, &p.payload),
