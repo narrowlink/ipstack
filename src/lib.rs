@@ -126,7 +126,7 @@ impl IpStack {
                                                 if matches!(e,IpStackError::InvalidTcpPacket){
                                                     #[cfg(feature = "log")]
                                                     trace!("Invalid TCP packet");
-                                                    continue
+                                                    continue;
                                                 }
                                                 #[cfg(feature = "log")]
                                                 error!("{}", e);
