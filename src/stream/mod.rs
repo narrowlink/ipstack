@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 pub use self::tcp::IpStackTcpStream;
 pub use self::udp::IpStackUdpStream;
@@ -22,11 +22,11 @@ impl IpStackStream {
             IpStackStream::Tcp(tcp) => tcp.local_addr(),
             IpStackStream::Udp(udp) => udp.local_addr(),
             IpStackStream::UnknownNetwork(_) => {
-                SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), 0))
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0))
             }
             IpStackStream::UnknownTransport(unknown) => match unknown.src_addr() {
-                std::net::IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, 0)),
-                std::net::IpAddr::V6(addr) => SocketAddr::V6(SocketAddrV6::new(addr, 0, 0, 0)),
+                IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, 0)),
+                IpAddr::V6(addr) => SocketAddr::V6(SocketAddrV6::new(addr, 0, 0, 0)),
             },
         }
     }
@@ -35,11 +35,11 @@ impl IpStackStream {
             IpStackStream::Tcp(tcp) => tcp.peer_addr(),
             IpStackStream::Udp(udp) => udp.peer_addr(),
             IpStackStream::UnknownNetwork(_) => {
-                SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::new(0, 0, 0, 0), 0))
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0))
             }
             IpStackStream::UnknownTransport(unknown) => match unknown.dst_addr() {
-                std::net::IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, 0)),
-                std::net::IpAddr::V6(addr) => SocketAddr::V6(SocketAddrV6::new(addr, 0, 0, 0)),
+                IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, 0)),
+                IpAddr::V6(addr) => SocketAddr::V6(SocketAddrV6::new(addr, 0, 0, 0)),
             },
         }
     }
