@@ -26,6 +26,7 @@ thiserror = { version = "1.0", default-features = false }
 tracing = { version = "0.1", default-features = false, features = [
     "log",
 ], optional = true }
+rand = {version = "0.8.5", default-features = false, features = ["std","std_rng"] }
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -34,6 +35,7 @@ udp-stream = { version = "0.0", default-features = false }
 tokio = { version = "1.36", features = [
     "rt-multi-thread",
 ], default-features = false }
+
 
 #tun2.rs example
 tun2 = { version = "1.2", features = ["async"] }

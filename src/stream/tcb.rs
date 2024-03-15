@@ -43,7 +43,10 @@ pub(super) struct Tcb {
 
 impl Tcb {
     pub(super) fn new(ack: u32, tcp_timeout: Duration) -> Tcb {
+        #[cfg(debug_assertions)]
         let seq = 100;
+        #[cfg(not(debug_assertions))]
+        let seq = rand::random::<u32>();
         let deadline = tokio::time::Instant::now() + tcp_timeout;
         Tcb {
             seq,
