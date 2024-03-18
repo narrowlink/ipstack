@@ -215,7 +215,7 @@ impl AsyncRead for IpStackTcpStream {
                 self.shutdown.ready();
                 return Poll::Ready(Ok(()));
             }
-            let min = cmp::min(self.tcb.get_available_read_buffer_size() as u16, u16::MAX);
+            let min = self.tcb.get_available_read_buffer_size() as u16;
             self.tcb.change_recv_window(min);
             if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
                 trace!("timeout reached for {:?}", self.dst_addr);
@@ -261,11 +261,11 @@ impl AsyncRead for IpStackTcpStream {
                 continue;
             } else if matches!(self.shutdown, Shutdown::Pending(_))
                 && matches!(self.tcb.get_state(), TcpState::Established)
+                && self.tcb.last_ack == self.tcb.seq
             {
                 self.packet_to_send =
                     Some(self.create_rev_packet(FIN | ACK, TTL, None, Vec::new())?);
                 self.tcb.change_state(TcpState::FinWait1(false));
-
                 continue;
             }
             match self.stream_receiver.poll_recv(cx) {
@@ -402,9 +402,7 @@ impl AsyncRead for IpStackTcpStream {
                         }
                     } else if matches!(self.tcb.get_state(), TcpState::FinWait1(false)) {
                         if t.flags() == ACK {
-                            // panic!("ACK received in FinWait1");
-                            self.tcb.add_ack(1);
-                            self.tcb.change_state(TcpState::FinWait1(true));
+                            self.tcb.change_state(TcpState::FinWait2(true));
                             continue;
                         } else if t.flags() == (FIN | ACK) {
                             self.tcb.add_seq_one();
@@ -415,10 +413,14 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.change_state(TcpState::FinWait2(false));
                             continue;
                         }
-                    } else if matches!(self.tcb.get_state(), TcpState::FinWait2(true))
-                        && t.flags() == ACK
-                    {
-                        self.tcb.change_state(TcpState::FinWait2(false));
+                    } else if matches!(self.tcb.get_state(), TcpState::FinWait2(true)) {
+                        if t.flags() == ACK {
+                            self.tcb.change_state(TcpState::FinWait2(false));
+                        } else if t.flags() == (FIN | ACK) {
+                            self.packet_to_send =
+                                Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
+                            self.tcb.change_state(TcpState::FinWait2(false));
+                        }
                     }
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
@@ -489,12 +491,12 @@ impl AsyncWrite for IpStackTcpStream {
             self.tcb.retransmission = None;
         } else if let Some(_i) = self.tcb.retransmission {
             {
-                warn!("{}",_i);
-                warn!("{}",self.tcb.seq);
-                warn!("{}",self.tcb.last_ack);
-                warn!("{}",self.tcb.ack);
+                warn!("{}", _i);
+                warn!("{}", self.tcb.seq);
+                warn!("{}", self.tcb.last_ack);
+                warn!("{}", self.tcb.ack);
                 for p in self.tcb.inflight_packets.iter() {
-                    warn!("{}",p.seq);
+                    warn!("{}", p.seq);
                     warn!("{}", p.payload.len());
                 }
             }
@@ -509,7 +511,8 @@ impl AsyncWrite for IpStackTcpStream {
     ) -> Poll<std::io::Result<()>> {
         match &self.shutdown {
             Shutdown::Ready => Poll::Ready(Ok(())),
-            Shutdown::Pending(_) | Shutdown::None => {
+            Shutdown::Pending(_) => Poll::Pending,
+            Shutdown::None => {
                 self.shutdown.pending(cx.waker().clone());
                 Poll::Pending
             }

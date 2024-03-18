@@ -21,6 +21,8 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    env_logger::init();
+
     let ipv4 = Ipv4Addr::new(10, 0, 0, 33);
     let _netmask = Ipv4Addr::new(255, 255, 255, 0);
     let _gateway = Ipv4Addr::new(10, 0, 0, 1);
