@@ -21,8 +21,8 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
-#[cfg(feature = "log")]
-use tracing::{trace, warn};
+
+use log::{trace, warn};
 
 use crate::packet::NetworkPacket;
 
@@ -218,7 +218,6 @@ impl AsyncRead for IpStackTcpStream {
             let min = cmp::min(self.tcb.get_available_read_buffer_size() as u16, u16::MAX);
             self.tcb.change_recv_window(min);
             if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
-                #[cfg(feature = "log")]
                 trace!("timeout reached for {:?}", self.dst_addr);
                 self.packet_sender
                     .send(self.create_rev_packet(RST | ACK, TTL, None, Vec::new())?)
@@ -489,14 +488,13 @@ impl AsyncWrite for IpStackTcpStream {
                 .or(Err(ErrorKind::UnexpectedEof))?;
             self.tcb.retransmission = None;
         } else if let Some(_i) = self.tcb.retransmission {
-            #[cfg(feature = "log")]
             {
-                warn!(_i);
-                warn!(self.tcb.seq);
-                warn!(self.tcb.last_ack);
-                warn!(self.tcb.ack);
+                warn!("{}",_i);
+                warn!("{}",self.tcb.seq);
+                warn!("{}",self.tcb.last_ack);
+                warn!("{}",self.tcb.ack);
                 for p in self.tcb.inflight_packets.iter() {
-                    warn!(p.seq);
+                    warn!("{}",p.seq);
                     warn!("{}", p.payload.len());
                 }
             }

@@ -12,8 +12,8 @@ use tokio::{
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
-#[cfg(feature = "log")]
-use tracing::{error, trace};
+
+use log::{error, trace};
 
 use crate::{
     packet::IpStackPacketProtocol,
@@ -110,7 +110,6 @@ impl IpStack {
                         match streams.entry(packet.network_tuple()){
                             Occupied(entry) =>{
                                 if let Err(_x) = entry.get().send(packet){
-                                    #[cfg(feature = "log")]
                                     trace!("Send packet error \"{}\"", _x);
                                 }
                             }
@@ -124,11 +123,9 @@ impl IpStack {
                                             }
                                             Err(e) => {
                                                 if matches!(e,IpStackError::InvalidTcpPacket){
-                                                    #[cfg(feature = "log")]
                                                     trace!("Invalid TCP packet");
                                                     continue;
                                                 }
-                                                #[cfg(feature = "log")]
                                                 error!("IpStackTcpStream::new failed \"{}\"", e);
                                             }
                                         }
@@ -152,7 +149,6 @@ impl IpStack {
                         }
                         #[allow(unused_mut)]
                         let Ok(mut packet_byte) = packet.to_bytes() else{
-                            #[cfg(feature = "log")]
                             trace!("to_bytes error");
                             continue;
                         };
