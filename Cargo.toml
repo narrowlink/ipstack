@@ -16,19 +16,20 @@ tokio = { version = "1.36", features = [
     "time",
     "io-util",
     "macros",
+    "rt-multi-thread",
 ], default-features = false }
 etherparse = { version = "0.14", default-features = false, features = ["std"] }
 thiserror = { version = "1.0", default-features = false }
-log = { version = "0.4", default-features = false}
-rand = {version = "0.8.5", default-features = false, features = ["std","std_rng"] }
+log = { version = "0.4", default-features = false }
+rand = { version = "0.8.5", default-features = false, features = [
+    "std",
+    "std_rng",
+] }
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
 udp-stream = { version = "0.0", default-features = false }
-tokio = { version = "1.36", features = [
-    "rt-multi-thread",
-], default-features = false }
 
 
 #tun2.rs example
@@ -52,6 +53,3 @@ incremental = false      # Disable incremental compilation.
 overflow-checks = false  # Disable overflow checks.
 strip = true             # Automatically strip symbols from the binary.
 
-[[example]]
-name = "tun2"
-required-features = ["log"]

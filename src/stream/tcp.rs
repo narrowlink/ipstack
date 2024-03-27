@@ -531,10 +531,6 @@ impl Drop for IpStackTcpStream {
         task::block_in_place(move || {
             Handle::current().block_on(async move {
                 _ = self.shutdown().await;
-                println!(
-                    "Shudown done, Drop for IpStackTcpStream {:?}",
-                    self.dst_addr
-                );
                 if let Ok(p) = self.create_rev_packet(NON, DROP_TTL, None, Vec::new()) {
                     _ = self.packet_sender.send(p);
                 }
