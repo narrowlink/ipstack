@@ -249,7 +249,11 @@ impl AsyncRead for IpStackTcpStream {
                 }
                 continue;
             }
-            if let Some(b) = self.tcb.get_unordered_packets() {
+            if let Some(b) = self
+                .tcb
+                .get_unordered_packets()
+                .filter(|_| matches!(self.shutdown, Shutdown::None))
+            {
                 self.tcb.add_ack(b.len() as u32);
                 buf.put_slice(&b);
                 self.packet_sender
