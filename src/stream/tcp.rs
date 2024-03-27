@@ -66,7 +66,7 @@ pub struct IpStackTcpStream {
 }
 
 impl IpStackTcpStream {
-    pub(crate) async fn new(
+    pub(crate) fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         tcp: TcpPacket,
