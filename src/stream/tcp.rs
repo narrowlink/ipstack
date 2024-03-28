@@ -50,7 +50,7 @@ impl Shutdown {
 }
 
 #[derive(Debug)]
-pub struct IpStackTcpStream {
+pub(crate) struct IpStackTcpStreamInner {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     stream_sender: UnboundedSender<NetworkPacket>,
@@ -63,7 +63,7 @@ pub struct IpStackTcpStream {
     write_notify: Option<Waker>,
 }
 
-impl IpStackTcpStream {
+impl IpStackTcpStreamInner {
     pub(crate) fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
@@ -71,10 +71,10 @@ impl IpStackTcpStream {
         pkt_sender: UnboundedSender<NetworkPacket>,
         mtu: u16,
         tcp_timeout: Duration,
-    ) -> Result<IpStackTcpStream, IpStackError> {
+    ) -> Result<IpStackTcpStreamInner, IpStackError> {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
-        let stream = IpStackTcpStream {
+        let stream = IpStackTcpStreamInner {
             src_addr,
             dst_addr,
             stream_sender,
@@ -191,16 +191,16 @@ impl IpStackTcpStream {
         })
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
-        self.src_addr
-    }
+    // pub fn local_addr(&self) -> SocketAddr {
+    //     self.src_addr
+    // }
 
-    pub fn peer_addr(&self) -> SocketAddr {
-        self.dst_addr
-    }
+    // pub fn peer_addr(&self) -> SocketAddr {
+    //     self.dst_addr
+    // }
 }
 
-impl AsyncRead for IpStackTcpStream {
+impl AsyncRead for IpStackTcpStreamInner {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -439,7 +439,7 @@ impl AsyncRead for IpStackTcpStream {
     }
 }
 
-impl AsyncWrite for IpStackTcpStream {
+impl AsyncWrite for IpStackTcpStreamInner {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -528,10 +528,124 @@ impl AsyncWrite for IpStackTcpStream {
     }
 }
 
-impl Drop for IpStackTcpStream {
+impl Drop for IpStackTcpStreamInner {
     fn drop(&mut self) {
         if let Ok(p) = self.create_rev_packet(NON, DROP_TTL, None, Vec::new()) {
             _ = self.packet_sender.send(p);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct IpStackTcpStream {
+    inner: Option<IpStackTcpStreamInner>,
+    drop_sender: UnboundedSender<IpStackTcpStreamInner>,
+    src_addr: SocketAddr,
+    dst_addr: SocketAddr,
+    stream_sender: UnboundedSender<NetworkPacket>,
+}
+
+impl IpStackTcpStream {
+    pub(crate) fn new(
+        drop_sender: UnboundedSender<IpStackTcpStreamInner>,
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
+        tcp: TcpPacket,
+        pkt_sender: UnboundedSender<NetworkPacket>,
+        mtu: u16,
+        tcp_timeout: Duration,
+    ) -> Result<IpStackTcpStream, IpStackError> {
+        let stream =
+            IpStackTcpStreamInner::new(src_addr, dst_addr, tcp, pkt_sender, mtu, tcp_timeout)?;
+        Ok(IpStackTcpStream {
+            stream_sender: stream.stream_sender(),
+            inner: Some(stream),
+            drop_sender,
+            src_addr,
+            dst_addr,
+        })
+    }
+    pub(crate) fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
+        self.stream_sender.clone()
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.src_addr
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.dst_addr
+    }
+}
+
+impl AsyncRead for IpStackTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Some(inner) = &mut self.inner {
+            Pin::new(inner).poll_read(cx, buf)
+        } else {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "",
+            )))
+        }
+    }
+}
+
+impl AsyncWrite for IpStackTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        if let Some(inner) = &mut self.inner {
+            Pin::new(inner).poll_write(cx, buf)
+        } else {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "",
+            )))
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if let Some(inner) = &mut self.inner {
+            Pin::new(inner).poll_flush(cx)
+        } else {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "",
+            )))
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if let Some(inner) = &mut self.inner {
+            Pin::new(inner).poll_shutdown(cx)
+        } else {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "",
+            )))
+        }
+    }
+}
+
+impl Drop for IpStackTcpStream {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            if let Err(e) = self.drop_sender.send(inner) {
+                trace!("fail to send IpStackTcpStreamInner to drop {:?}", e);
+            }
         }
     }
 }
