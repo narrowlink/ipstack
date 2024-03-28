@@ -539,7 +539,7 @@ impl Drop for IpStackTcpStreamInner {
 #[derive(Debug)]
 pub struct IpStackTcpStream {
     inner: Option<IpStackTcpStreamInner>,
-    drop_sender: UnboundedSender<IpStackTcpStreamInner>,
+    drop_sender: UnboundedSender<Box<IpStackTcpStreamInner>>,
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     stream_sender: UnboundedSender<NetworkPacket>,
@@ -547,7 +547,7 @@ pub struct IpStackTcpStream {
 
 impl IpStackTcpStream {
     pub(crate) fn new(
-        drop_sender: UnboundedSender<IpStackTcpStreamInner>,
+        drop_sender: UnboundedSender<Box<IpStackTcpStreamInner>>,
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         tcp: TcpPacket,
@@ -643,7 +643,7 @@ impl AsyncWrite for IpStackTcpStream {
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            if let Err(e) = self.drop_sender.send(inner) {
+            if let Err(e) = self.drop_sender.send(Box::new(inner)) {
                 trace!("fail to send IpStackTcpStreamInner to drop {:?}", e);
             }
         }

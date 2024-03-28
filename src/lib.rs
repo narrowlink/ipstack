@@ -91,7 +91,8 @@ impl IpStack {
     {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
 
-        let (drop_sender, mut drop_receiver) = mpsc::unbounded_channel::<IpStackTcpStreamInner>();
+        let (drop_sender, mut drop_receiver) =
+            mpsc::unbounded_channel::<Box<IpStackTcpStreamInner>>();
         tokio::spawn(async move {
             while let Some(mut inner) = drop_receiver.recv().await {
                 tokio::spawn(async move {
