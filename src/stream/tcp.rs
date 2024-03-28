@@ -534,7 +534,7 @@ impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         task::block_in_place(move || {
             Handle::current().block_on(async move {
-                if !matches!(self.tcb.get_state(), TcpState::SynReceived(false)) {
+                if matches!(self.tcb.get_state(), TcpState::Established) {
                     _ = self.shutdown().await;
                 }
 
