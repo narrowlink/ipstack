@@ -534,7 +534,10 @@ impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         task::block_in_place(move || {
             Handle::current().block_on(async move {
-                _ = self.shutdown().await;
+                if !matches!(self.tcb.get_state(), TcpState::SynReceived(false)) {
+                    _ = self.shutdown().await;
+                }
+
                 if let Ok(p) = self.create_rev_packet(NON, DROP_TTL, None, Vec::new()) {
                     _ = self.packet_sender.send(p);
                 }
