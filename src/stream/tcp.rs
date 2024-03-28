@@ -19,10 +19,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    runtime::Handle,
+    io::{AsyncRead, AsyncWrite},
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-    task,
 };
 
 use log::{trace, warn};
