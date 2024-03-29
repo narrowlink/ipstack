@@ -263,6 +263,7 @@ impl AsyncRead for IpStackTcpStream {
                 self.packet_to_send =
                     Some(self.create_rev_packet(FIN | ACK, TTL, None, Vec::new())?);
                 self.tcb.add_seq_one();
+                self.tcb.add_ack(1);
                 self.tcb.change_state(TcpState::FinWait2(true));
                 continue;
             } else if matches!(self.shutdown, Shutdown::Pending(_))
@@ -410,22 +411,21 @@ impl AsyncRead for IpStackTcpStream {
                     } else if matches!(self.tcb.get_state(), TcpState::FinWait1(false)) {
                         if t.flags() == ACK {
                             self.tcb.change_last_ack(t.inner().acknowledgment_number);
+                            self.tcb.add_ack(1);
                             self.tcb.change_state(TcpState::FinWait2(true));
                             continue;
                         } else if t.flags() == (FIN | ACK) {
-                            self.tcb.add_seq_one();
                             self.tcb.add_ack(1);
                             self.packet_to_send =
                                 Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
                             self.tcb.change_send_window(t.inner().window_size);
-                            self.tcb.change_state(TcpState::FinWait2(false));
+                            self.tcb.change_state(TcpState::FinWait2(true));
                             continue;
                         }
                     } else if matches!(self.tcb.get_state(), TcpState::FinWait2(true)) {
                         if t.flags() == ACK {
                             self.tcb.change_state(TcpState::FinWait2(false));
                         } else if t.flags() == (FIN | ACK) {
-                            self.tcb.add_ack(1);
                             self.packet_to_send =
                                 Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
                             self.tcb.change_state(TcpState::FinWait2(false));
@@ -468,7 +468,6 @@ impl AsyncWrite for IpStackTcpStream {
         let seq = self.tcb.seq;
         let payload_len = packet.payload.len();
         let payload = packet.payload.clone();
-
         self.packet_sender
             .send(packet)
             .or(Err(ErrorKind::UnexpectedEof))?;
