@@ -186,6 +186,9 @@ impl Tcb {
                     inflight_packet.seq = ack;
                     self.inflight_packets.push(inflight_packet);
                 }
+                if i != 0 {
+                    self.inflight_packets.drain(0..i);
+                }
             }
         }
 
