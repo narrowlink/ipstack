@@ -1,7 +1,7 @@
 IpStack
 =======
 
-An asynchronous lightweight implementation of TCP/IP stack for Tun device.
+An asynchronous lightweight userspace implementation of TCP/IP stack for Tun device.
 Unstable, under development.
 
 [![Crates.io](https://img.shields.io/crates/v/ipstack.svg)](https://crates.io/crates/ipstack)
