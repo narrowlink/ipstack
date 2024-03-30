@@ -1,12 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-pub use self::tcp::IpStackTcpStream;
-pub(crate) use self::tcp::IpStackTcpStreamInner;
+pub use self::tcp_wrapper::IpStackTcpStream;
 pub use self::udp::IpStackUdpStream;
 pub use self::unknown::IpStackUnknownTransport;
 
 mod tcb;
 mod tcp;
+mod tcp_wrapper;
 mod udp;
 mod unknown;
 

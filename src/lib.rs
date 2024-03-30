@@ -17,10 +17,7 @@ use log::{error, trace};
 
 use crate::{
     packet::IpStackPacketProtocol,
-    stream::{
-        IpStackStream, IpStackTcpStream, IpStackTcpStreamInner, IpStackUdpStream,
-        IpStackUnknownTransport,
-    },
+    stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
 };
 mod error;
 mod packet;
@@ -91,25 +88,12 @@ impl IpStack {
     {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
 
-        let (drop_sender, mut drop_receiver) =
-            mpsc::unbounded_channel::<Box<IpStackTcpStreamInner>>();
-        tokio::spawn(async move {
-            while let Some(mut inner) = drop_receiver.recv().await {
-                tokio::spawn(async move {
-                    if let Err(e) = inner.shutdown().await {
-                        trace!("fail to drop {e:?}");
-                    }
-                });
-            }
-        });
-
         tokio::spawn(async move {
             let mut streams: HashMap<NetworkTuple, UnboundedSender<NetworkPacket>> = HashMap::new();
             let mut buffer = [0u8; u16::MAX as usize];
 
             let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
             loop {
-                // dbg!(streams.len());
                 select! {
                     Ok(n) = device.read(&mut buffer) => {
                         let offset = if config.packet_information && cfg!(unix) {4} else {0};
@@ -124,14 +108,14 @@ impl IpStack {
 
                         match streams.entry(packet.network_tuple()){
                             Occupied(entry) =>{
-                                if let Err(_x) = entry.get().send(packet){
-                                    trace!("Send packet error \"{}\"", _x);
+                                if let Err(e) = entry.get().send(packet){
+                                    trace!("Send packet error \"{}\"", e);
                                 }
                             }
                             Vacant(entry) => {
                                 match packet.transport_protocol(){
                                     IpStackPacketProtocol::Tcp(h) => {
-                                        match IpStackTcpStream::new(drop_sender.clone(),packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),config.mtu,config.tcp_timeout){
+                                        match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),config.mtu,config.tcp_timeout){
                                             Ok(stream) => {
                                                 entry.insert(stream.stream_sender());
                                                 accept_sender.send(IpStackStream::Tcp(stream))?;

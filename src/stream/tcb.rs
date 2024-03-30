@@ -176,6 +176,7 @@ impl Tcb {
     }
     pub(super) fn change_last_ack(&mut self, ack: u32) {
         let distance = ack.wrapping_sub(self.last_ack);
+        self.last_ack = self.last_ack.wrapping_add(distance);
 
         if matches!(self.state, TcpState::Established) {
             if let Some(i) = self.inflight_packets.iter().position(|p| p.contains(ack)) {
@@ -187,9 +188,12 @@ impl Tcb {
                     self.inflight_packets.push(inflight_packet);
                 }
             }
+            self.inflight_packets.retain(|p| {
+                let last_byte = p.seq.wrapping_add(p.payload.len() as u32);
+                last_byte.saturating_sub(self.last_ack) > 0
+                    && self.seq.saturating_sub(last_byte) > 0
+            });
         }
-
-        self.last_ack = self.last_ack.wrapping_add(distance);
     }
     pub fn is_send_buffer_full(&self) -> bool {
         self.seq.wrapping_sub(self.last_ack) >= MAX_UNACK
