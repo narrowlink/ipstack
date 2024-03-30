@@ -2,7 +2,7 @@
 authors = ['Narrowlink <opensource@narrowlink.com>']
 description = 'Asynchronous lightweight implementation of TCP/IP stack for Tun device'
 name = "ipstack"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 license = "Apache-2.0"
 repository = 'https://github.com/narrowlink/ipstack'
@@ -10,7 +10,7 @@ repository = 'https://github.com/narrowlink/ipstack'
 readme = "README.md"
 
 [dependencies]
-tokio = { version = "1.36", features = [
+tokio = { version = "1.37", features = [
     "sync",
     "rt",
     "time",
