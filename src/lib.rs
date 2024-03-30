@@ -94,7 +94,6 @@ impl IpStack {
 
             let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
             loop {
-                // dbg!(streams.len());
                 select! {
                     Ok(n) = device.read(&mut buffer) => {
                         let offset = if config.packet_information && cfg!(unix) {4} else {0};
@@ -109,8 +108,8 @@ impl IpStack {
 
                         match streams.entry(packet.network_tuple()){
                             Occupied(entry) =>{
-                                if let Err(_x) = entry.get().send(packet){
-                                    trace!("Send packet error \"{}\"", _x);
+                                if let Err(e) = entry.get().send(packet){
+                                    trace!("Send packet error \"{}\"", e);
                                 }
                             }
                             Vacant(entry) => {

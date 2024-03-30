@@ -20,7 +20,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
 };
 
 use log::{trace, warn};
@@ -50,10 +50,9 @@ impl Shutdown {
 }
 
 #[derive(Debug)]
-pub struct IpStackTcpStream {
+pub(crate) struct IpStackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
-    stream_sender: UnboundedSender<NetworkPacket>,
     stream_receiver: UnboundedReceiver<NetworkPacket>,
     packet_sender: UnboundedSender<NetworkPacket>,
     packet_to_send: Option<NetworkPacket>,
@@ -69,15 +68,13 @@ impl IpStackTcpStream {
         dst_addr: SocketAddr,
         tcp: TcpPacket,
         pkt_sender: UnboundedSender<NetworkPacket>,
+        stream_receiver: UnboundedReceiver<NetworkPacket>,
         mtu: u16,
         tcp_timeout: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
-        let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
-
         let stream = IpStackTcpStream {
             src_addr,
             dst_addr,
-            stream_sender,
             stream_receiver,
             packet_sender: pkt_sender.clone(),
             packet_to_send: None,
@@ -92,10 +89,6 @@ impl IpStackTcpStream {
         } else {
             Ok(stream)
         }
-    }
-
-    pub(crate) fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
-        self.stream_sender.clone()
     }
 
     fn calculate_payload_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
@@ -189,14 +182,6 @@ impl IpStackTcpStream {
             transport: TransportHeader::Tcp(tcp_header),
             payload,
         })
-    }
-
-    pub fn local_addr(&self) -> SocketAddr {
-        self.src_addr
-    }
-
-    pub fn peer_addr(&self) -> SocketAddr {
-        self.dst_addr
     }
 }
 
