@@ -1,8 +1,6 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
-use etherparse::{NetHeaders, PacketHeaders, TcpHeader, UdpHeader};
-
 use crate::error::IpStackError;
+use etherparse::{NetHeaders, PacketHeaders, TcpHeader, UdpHeader};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[derive(Eq, Hash, PartialEq, Debug, Clone, Copy)]
 pub struct NetworkTuple {

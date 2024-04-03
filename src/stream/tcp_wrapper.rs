@@ -1,17 +1,14 @@
+use super::tcp::IpStackTcpStream as IpStackTcpStreamInner;
+use crate::{
+    packet::{NetworkPacket, TcpPacket},
+    IpStackError,
+};
 use std::{net::SocketAddr, pin::Pin, time::Duration};
-
 use tokio::{
     io::AsyncWriteExt,
     sync::mpsc::{self, UnboundedSender},
     time::timeout,
 };
-
-use crate::{
-    packet::{NetworkPacket, TcpPacket},
-    IpStackError,
-};
-
-use super::tcp::IpStackTcpStream as IpStackTcpStreamInner;
 
 pub struct IpStackTcpStream {
     inner: Option<Box<IpStackTcpStreamInner>>,
