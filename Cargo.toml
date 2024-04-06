@@ -34,6 +34,8 @@ clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
 udp-stream = { version = "0.0", default-features = false }
 
+# Benchmarks
+criterion = { version = "0.5" }
 
 #tun2.rs example
 tun2 = { version = "1.2", features = ["async"] }
@@ -45,7 +47,7 @@ tun = { version = "0.6.1", features = ["async"], default-features = false }
 wintun = { version = "0.4", default-features = false }
 
 [profile.release]
-opt-level = 'z'          # Optimize for size.
+opt-level = 's'          # Optimize for size (with loop vectorization enabled).
 lto = true               # Enable Link Time Optimization
 codegen-units = 1        # Reduce number of codegen units to increase optimizations.
 panic = "abort"          # Abort on panic
@@ -55,3 +57,14 @@ debug-assertions = false # Remove assertions from the binary.
 incremental = false      # Disable incremental compilation.
 overflow-checks = false  # Disable overflow checks.
 strip = true             # Automatically strip symbols from the binary.
+
+# Optimize for performance *and* compilation time
+[profile.bench]
+# Inherits from `release` profile
+opt-level = 3
+lto = false
+codegen-units = 16
+debug = true # Enable debug info for `perf(1)`
+incremental = true
+strip = "none"
+
