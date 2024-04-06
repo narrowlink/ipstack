@@ -1,12 +1,10 @@
 use std::{io::Error, mem, net::IpAddr};
 
-use etherparse::{
-    IpNumber, Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6FlowLabel, Ipv6Header, NetHeaders,
-};
+use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    packet::{NetworkPacket, TransportHeader},
+    packet::{IpHeader, NetworkPacket, TransportHeader},
     TTL,
 };
 
@@ -20,17 +18,17 @@ pub struct IpStackUnknownTransport {
 }
 
 impl IpStackUnknownTransport {
-    pub fn new(
+    pub(crate) fn new(
         src_addr: IpAddr,
         dst_addr: IpAddr,
         payload: Vec<u8>,
-        ip: &NetHeaders,
+        ip: &IpHeader,
         mtu: u16,
         packet_sender: UnboundedSender<NetworkPacket>,
     ) -> Self {
         let protocol = match ip {
-            NetHeaders::Ipv4(ip, _) => ip.protocol,
-            NetHeaders::Ipv6(ip, _) => ip.next_header,
+            IpHeader::Ipv4(ip) => ip.protocol,
+            IpHeader::Ipv6(ip) => ip.next_header,
         };
         IpStackUnknownTransport {
             src_addr,
@@ -80,7 +78,7 @@ impl IpStackUnknownTransport {
                 ip_h.set_payload_len(p.len())
                     .map_err(crate::IpStackError::from)?;
                 Ok(NetworkPacket {
-                    ip: etherparse::NetHeaders::Ipv4(ip_h, Ipv4Extensions::default()),
+                    ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Unknown,
                     payload: p,
                 })
@@ -104,7 +102,7 @@ impl IpStackUnknownTransport {
                     mem::take(payload)
                 };
                 Ok(NetworkPacket {
-                    ip: etherparse::NetHeaders::Ipv6(ip_h, Ipv6Extensions::default()),
+                    ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Unknown,
                     payload: p,
                 })

@@ -7,7 +7,7 @@ use crate::{
     stream::tcb::{Tcb, TcpState},
     DROP_TTL, TTL,
 };
-use etherparse::{IpNumber, Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6FlowLabel};
+use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel};
 use std::{
     cmp,
     future::Future,
@@ -25,7 +25,7 @@ use tokio::{
 
 use log::{trace, warn};
 
-use crate::packet::NetworkPacket;
+use crate::packet::{IpHeader, NetworkPacket};
 
 use super::tcb::PacketStatus;
 
@@ -141,7 +141,7 @@ impl IpStackTcpStream {
                 ip_h.set_payload_len(payload.len() + tcp_header.header_len())
                     .map_err(IpStackError::from)?;
                 ip_h.dont_fragment = true;
-                etherparse::NetHeaders::Ipv4(ip_h, Ipv4Extensions::default())
+                IpHeader::Ipv4(ip_h)
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
                 let mut ip_h = etherparse::Ipv6Header {
@@ -160,18 +160,18 @@ impl IpStackTcpStream {
                 payload.truncate(payload_len as usize);
                 ip_h.payload_length = (payload.len() + tcp_header.header_len()) as u16;
 
-                etherparse::NetHeaders::Ipv6(ip_h, Ipv6Extensions::default())
+                IpHeader::Ipv6(ip_h)
             }
             _ => unreachable!(),
         };
 
         match ip_header {
-            etherparse::NetHeaders::Ipv4(ref ip_header, _) => {
+            IpHeader::Ipv4(ref ip_header) => {
                 tcp_header.checksum = tcp_header
                     .calc_checksum_ipv4(ip_header, &payload)
                     .or(Err(ErrorKind::InvalidInput))?;
             }
-            etherparse::NetHeaders::Ipv6(ref ip_header, _) => {
+            IpHeader::Ipv6(ref ip_header) => {
                 tcp_header.checksum = tcp_header
                     .calc_checksum_ipv6(ip_header, &payload)
                     .or(Err(ErrorKind::InvalidInput))?;

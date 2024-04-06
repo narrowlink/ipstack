@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use etherparse::{NetHeaders, PacketHeaders, TcpHeader, UdpHeader};
+use etherparse::{Ipv4Header, Ipv6Header, NetSlice, SlicedPacket, TcpHeader, UdpHeader};
 
 use crate::error::IpStackError;
 
@@ -30,6 +30,12 @@ pub(crate) enum IpStackPacketProtocol {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum IpHeader {
+    Ipv4(Ipv4Header),
+    Ipv6(Ipv6Header),
+}
+
+#[derive(Debug, Clone)]
 pub(crate) enum TransportHeader {
     Tcp(TcpHeader),
     Udp(UdpHeader),
@@ -38,26 +44,36 @@ pub(crate) enum TransportHeader {
 
 #[derive(Debug, Clone)]
 pub struct NetworkPacket {
-    pub(crate) ip: NetHeaders,
+    pub(crate) ip: IpHeader,
     pub(crate) transport: TransportHeader,
     pub(crate) payload: Vec<u8>,
 }
 
 impl NetworkPacket {
     pub fn parse(buf: &[u8]) -> Result<Self, IpStackError> {
-        let p = PacketHeaders::from_ip_slice(buf).map_err(|_| IpStackError::InvalidPacket)?;
+        let p = SlicedPacket::from_ip(buf).map_err(|_| IpStackError::InvalidPacket)?;
         let ip = p.net.ok_or(IpStackError::InvalidPacket)?;
-        let transport = match p.transport {
-            Some(etherparse::TransportHeader::Tcp(h)) => TransportHeader::Tcp(h),
-            Some(etherparse::TransportHeader::Udp(u)) => TransportHeader::Udp(u),
-            _ => TransportHeader::Unknown,
-        };
 
-        let payload = if let TransportHeader::Unknown = transport {
-            buf[ip.header_len()..].to_vec()
-        } else {
-            p.payload.slice().to_vec()
+        let (ip, ip_payload) = match ip {
+            NetSlice::Ipv4(ip) => (
+                IpHeader::Ipv4(ip.header().to_header()),
+                ip.payload().payload,
+            ),
+            NetSlice::Ipv6(ip) => (
+                IpHeader::Ipv6(ip.header().to_header()),
+                ip.payload().payload,
+            ),
         };
+        let (transport, payload) = match p.transport {
+            Some(etherparse::TransportSlice::Tcp(h)) => {
+                (TransportHeader::Tcp(h.to_header()), h.payload())
+            }
+            Some(etherparse::TransportSlice::Udp(u)) => {
+                (TransportHeader::Udp(u.to_header()), u.payload())
+            }
+            _ => (TransportHeader::Unknown, ip_payload),
+        };
+        let payload = payload.to_vec();
 
         Ok(NetworkPacket {
             ip,
@@ -79,8 +95,8 @@ impl NetworkPacket {
             _ => 0,
         };
         match &self.ip {
-            NetHeaders::Ipv4(ip, _) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip.source)), port),
-            NetHeaders::Ipv6(ip, _) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip.source)), port),
+            IpHeader::Ipv4(ip) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip.source)), port),
+            IpHeader::Ipv6(ip) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip.source)), port),
         }
     }
     pub fn dst_addr(&self) -> SocketAddr {
@@ -90,12 +106,8 @@ impl NetworkPacket {
             _ => 0,
         };
         match &self.ip {
-            NetHeaders::Ipv4(ip, _) => {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip.destination)), port)
-            }
-            NetHeaders::Ipv6(ip, _) => {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip.destination)), port)
-            }
+            IpHeader::Ipv4(ip) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip.destination)), port),
+            IpHeader::Ipv6(ip) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip.destination)), port),
         }
     }
     pub fn network_tuple(&self) -> NetworkTuple {
@@ -115,8 +127,8 @@ impl NetworkPacket {
     pub fn to_bytes(&self) -> Result<Vec<u8>, IpStackError> {
         let mut buf = Vec::new();
         match self.ip {
-            NetHeaders::Ipv4(ref ip, _) => ip.write(&mut buf)?,
-            NetHeaders::Ipv6(ref ip, _) => ip.write(&mut buf)?,
+            IpHeader::Ipv4(ref ip) => ip.write(&mut buf)?,
+            IpHeader::Ipv6(ref ip) => ip.write(&mut buf)?,
         }
         match self.transport {
             TransportHeader::Tcp(ref h) => h.write(&mut buf)?,
@@ -128,8 +140,8 @@ impl NetworkPacket {
     }
     pub fn ttl(&self) -> u8 {
         match &self.ip {
-            NetHeaders::Ipv4(ip, _) => ip.time_to_live,
-            NetHeaders::Ipv6(ip, _) => ip.hop_limit,
+            IpHeader::Ipv4(ip) => ip.time_to_live,
+            IpHeader::Ipv6(ip) => ip.hop_limit,
         }
     }
 }
