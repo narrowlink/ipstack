@@ -1,8 +1,6 @@
-use std::{collections::BTreeMap, pin::Pin, time::Duration};
-
-use tokio::time::Sleep;
-
 use crate::packet::TcpPacket;
+use std::{collections::BTreeMap, pin::Pin, time::Duration};
+use tokio::time::Sleep;
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB

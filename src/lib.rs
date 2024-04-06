@@ -1,10 +1,12 @@
-pub use error::{IpStackError, Result};
+use crate::{
+    packet::IpStackPacketProtocol,
+    stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
+};
+use ahash::AHashMap;
+use log::{error, trace};
 use packet::{NetworkPacket, NetworkTuple};
 use std::{
-    collections::{
-        hash_map::Entry::{Occupied, Vacant},
-        HashMap,
-    },
+    collections::hash_map::Entry::{Occupied, Vacant},
     time::Duration,
 };
 use tokio::{
@@ -13,15 +15,11 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 
-use log::{error, trace};
-
-use crate::{
-    packet::IpStackPacketProtocol,
-    stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
-};
 mod error;
 mod packet;
 pub mod stream;
+
+pub use self::error::{IpStackError, Result};
 
 const DROP_TTL: u8 = 0;
 
@@ -89,7 +87,8 @@ impl IpStack {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
 
         tokio::spawn(async move {
-            let mut streams: HashMap<NetworkTuple, UnboundedSender<NetworkPacket>> = HashMap::new();
+            let mut streams: AHashMap<NetworkTuple, UnboundedSender<NetworkPacket>> =
+                AHashMap::new();
             let mut buffer = [0u8; u16::MAX as usize];
 
             let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
@@ -102,7 +101,16 @@ impl IpStack {
                             continue;
                         };
                         if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
-                            accept_sender.send(IpStackStream::UnknownTransport(IpStackUnknownTransport::new(packet.src_addr().ip(),packet.dst_addr().ip(),packet.payload,&packet.ip,config.mtu,pkt_sender.clone())))?;
+                            accept_sender.send(
+                                IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
+                                    packet.src_addr().ip(),
+                                    packet.dst_addr().ip(),
+                                    packet.payload,
+                                    &packet.ip,
+                                    config.mtu,
+                                    pkt_sender.clone()
+                                ))
+                            )?;
                             continue;
                         }
 
@@ -115,7 +123,14 @@ impl IpStack {
                             Vacant(entry) => {
                                 match packet.transport_protocol(){
                                     IpStackPacketProtocol::Tcp(h) => {
-                                        match IpStackTcpStream::new(packet.src_addr(),packet.dst_addr(),h, pkt_sender.clone(),config.mtu,config.tcp_timeout){
+                                        match IpStackTcpStream::new(
+                                            packet.src_addr(),
+                                            packet.dst_addr(),
+                                            h,
+                                            pkt_sender.clone(),
+                                            config.mtu,
+                                            config.tcp_timeout
+                                        ){
                                             Ok(stream) => {
                                                 entry.insert(stream.stream_sender());
                                                 accept_sender.send(IpStackStream::Tcp(stream))?;
@@ -130,7 +145,14 @@ impl IpStack {
                                         }
                                     }
                                     IpStackPacketProtocol::Udp => {
-                                        let stream = IpStackUdpStream::new(packet.src_addr(),packet.dst_addr(),packet.payload, pkt_sender.clone(),config.mtu,config.udp_timeout);
+                                        let stream = IpStackUdpStream::new(
+                                            packet.src_addr(),
+                                            packet.dst_addr(),
+                                            packet.payload,
+                                            pkt_sender.clone(),
+                                            config.mtu,
+                                            config.udp_timeout
+                                        );
                                         entry.insert(stream.stream_sender());
                                         accept_sender.send(IpStackStream::Udp(stream))?;
                                     }

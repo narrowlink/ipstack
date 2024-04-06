@@ -1,12 +1,10 @@
-use std::{io::Error, mem, net::IpAddr};
-
-use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header};
-use tokio::sync::mpsc::UnboundedSender;
-
 use crate::{
     packet::{IpHeader, NetworkPacket, TransportHeader},
     TTL,
 };
+use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header};
+use std::{io::Error, mem, net::IpAddr};
+use tokio::sync::mpsc::UnboundedSender;
 
 pub struct IpStackUnknownTransport {
     src_addr: IpAddr,
