@@ -68,7 +68,7 @@ async fn main(){
                         resp.update_checksum(req_payload);
                         let mut payload = resp.to_bytes().to_vec();
                         payload.extend_from_slice(req_payload);
-                        u.send(payload).await?;
+                        u.send(payload)?;
                     } else {
                         println!("ICMPv4");
                     }
