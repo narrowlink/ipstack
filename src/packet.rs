@@ -287,7 +287,7 @@ pub mod tests {
         let mut c = Criterion::default()
             .with_output_color(true)
             .without_plots()
-            .with_filter(&filter)
+            .with_filter(filter)
             .warm_up_time(Duration::from_secs_f32(0.5))
             .measurement_time(Duration::from_secs_f32(0.5))
             .profile_time(profile_time.map(|s| Duration::from_secs_f32(s.parse().unwrap())));

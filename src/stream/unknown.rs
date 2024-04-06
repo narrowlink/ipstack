@@ -51,7 +51,7 @@ impl IpStackUnknownTransport {
     pub fn ip_protocol(&self) -> IpNumber {
         self.protocol
     }
-    pub async fn send(&self, mut payload: Vec<u8>) -> Result<(), Error> {
+    pub fn send(&self, mut payload: Vec<u8>) -> Result<(), Error> {
         loop {
             let packet = self.create_rev_packet(&mut payload)?;
             self.packet_sender
