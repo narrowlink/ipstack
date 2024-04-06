@@ -200,3 +200,88 @@ impl From<&TcpHeader> for TcpPacket {
 //         }
 //     }
 // }
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use criterion::{black_box, Criterion};
+    use rand::random;
+    use std::time::Duration;
+
+    fn create_raw_packet(mtu: usize) -> Vec<u8> {
+        let builder = etherparse::PacketBuilder::ipv4(random(), random(), random())
+            .tcp(random(), random(), random(), random())
+            .fin()
+            .psh()
+            .ack(random());
+
+        let payload_len = mtu - builder.size(0);
+        assert_eq!(mtu, builder.size(payload_len));
+        let payload: Vec<u8> = (0..payload_len).map(|_| random()).collect();
+
+        let mut buf = Vec::new();
+        builder.write(&mut buf, &payload[..]).unwrap();
+        assert_eq!(mtu, buf.len());
+        buf
+    }
+
+    fn create_packet(mtu: usize) -> NetworkPacket {
+        let packet = create_raw_packet(mtu);
+        NetworkPacket::parse(packet.as_slice()).unwrap()
+    }
+
+    fn benchmarks(c: &mut Criterion) {
+        for mtu in [64, 1500, 4096, 16384, 65515] {
+            let buf = create_raw_packet(mtu);
+            c.bench_function(format!("decode_mtu_{mtu}").as_str(), |b| {
+                b.iter(|| {
+                    let packet = black_box(&buf[..]);
+                    let _packet = NetworkPacket::parse(packet).unwrap();
+                })
+            });
+        }
+
+        for mtu in [64, 1500, 4096, 16384, 65515] {
+            let packet = create_packet(mtu);
+            c.bench_function(format!("encode_mtu_{mtu}").as_str(), |b| {
+                b.iter(|| {
+                    let packet = black_box(&packet);
+                    let _packet = packet.to_bytes();
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn bench() {
+        // `cargo test --profile bench -j1 -- --nocapture bench -- <benchmark_filter>
+        // This workaround allows benchmarking private interfaces with `criterion` in stable rust.
+        let args: Vec<String> = std::env::args().collect();
+        let filter = args
+            .windows(3)
+            .filter(|p| p.len() >= 2 && p[0].ends_with("bench") && p[1] == "--")
+            .map(|s| s.get(2).unwrap_or(&"".to_string()).clone())
+            .next();
+        let filter = match filter {
+            Some(f) => f,
+            None => return,
+        };
+        let profile_time = args
+            .windows(2)
+            .filter(|p| p.len() == 2 && p[0] == "--profile-time")
+            .map(|s| s[1].as_str())
+            .next();
+
+        let mut c = Criterion::default()
+            .with_output_color(true)
+            .without_plots()
+            .with_filter(&filter)
+            .warm_up_time(Duration::from_secs_f32(0.5))
+            .measurement_time(Duration::from_secs_f32(0.5))
+            .profile_time(profile_time.map(|s| Duration::from_secs_f32(s.parse().unwrap())));
+
+        benchmarks(&mut c);
+
+        Criterion::default().final_summary();
+    }
+}
