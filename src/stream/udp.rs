@@ -1,10 +1,8 @@
 use crate::{
-    packet::{NetworkPacket, TransportHeader},
+    packet::{IpHeader, NetworkPacket, TransportHeader},
     IpStackError, TTL,
 };
-use etherparse::{
-    IpNumber, Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6FlowLabel, Ipv6Header, UdpHeader,
-};
+use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
 use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -71,7 +69,7 @@ impl IpStackUdpStream {
                 )
                 .map_err(IpStackError::from)?;
                 Ok(NetworkPacket {
-                    ip: etherparse::NetHeaders::Ipv4(ip_h, Ipv4Extensions::default()),
+                    ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
                 })
@@ -99,7 +97,7 @@ impl IpStackUdpStream {
                 )
                 .map_err(IpStackError::from)?;
                 Ok(NetworkPacket {
-                    ip: etherparse::NetHeaders::Ipv6(ip_h, Ipv6Extensions::default()),
+                    ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Udp(udp_header),
                     payload,
                 })
