@@ -13,18 +13,19 @@ Unstable, under development.
 ### Usage
 
 ```rust
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use udp_stream::UdpStream;
-use tokio::io{AsyncRead, AsyncWrite};
 use etherparse::{IcmpEchoHeader, Icmpv4Header};
+use ipstack::stream::IpStackStream;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use tokio::net::TcpStream;
+use udp_stream::UdpStream;
 
 #[tokio::main]
-async fn main(){
+async fn main() {
     const MTU: u16 = 1500;
     let ipv4 = Ipv4Addr::new(10, 0, 0, 1);
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
     let mut config = tun2::Configuration::default();
-    config.address(ipv4).netmask(netmask).mtu(MTU as usize).up();
+    config.address(ipv4).netmask(netmask).mtu(MTU).up();
 
     #[cfg(target_os = "linux")]
     config.platform_config(|config| {
@@ -38,26 +39,27 @@ async fn main(){
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
     ipstack_config.mtu(MTU);
-    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config).unwrap());
+    let mut ip_stack =
+        ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config).unwrap());
 
     while let Ok(stream) = ip_stack.accept().await {
         match stream {
             IpStackStream::Tcp(mut tcp) => {
                 let mut rhs = TcpStream::connect("1.1.1.1:80").await.unwrap();
                 tokio::spawn(async move {
-                    let _ = tokio::io::copy_bidirectional(& mut tcp, & mut rhs).await;
+                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut rhs).await;
                 });
             }
             IpStackStream::Udp(mut udp) => {
                 let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
                 let mut rhs = UdpStream::connect(addr).await.unwrap();
                 tokio::spawn(async move {
-                    let _ = tokio::io::copy_bidirectional(& mut udp, & mut rhs).await;
+                    let _ = tokio::io::copy_bidirectional(&mut udp, &mut rhs).await;
                 });
             }
             IpStackStream::UnknownTransport(u) => {
-                if u.src_addr().is_ipv4() && u.ip_protocol() == 1 {
-                    let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
+                if u.src_addr().is_ipv4() && u.ip_protocol() == etherparse::IpNumber(1) {
+                    let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload()).unwrap();
                     if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
                         println!("ICMPv4 echo");
                         let echo = IcmpEchoHeader {
@@ -68,13 +70,13 @@ async fn main(){
                         resp.update_checksum(req_payload);
                         let mut payload = resp.to_bytes().to_vec();
                         payload.extend_from_slice(req_payload);
-                        u.send(payload)?;
+                        u.send(payload).unwrap();
                     } else {
                         println!("ICMPv4");
                     }
                     continue;
                 }
-                println!("unknown transport - Ip Protocol {}", u.ip_protocol());
+                println!("unknown transport - Ip Protocol {}", u.ip_protocol().0);
                 continue;
             }
             IpStackStream::UnknownNetwork(pkt) => {

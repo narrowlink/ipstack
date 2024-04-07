@@ -2,7 +2,7 @@
 authors = ['Narrowlink <opensource@narrowlink.com>']
 description = 'Asynchronous lightweight userspace implementation of TCP/IP stack for Tun device'
 name = "ipstack"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2021"
 license = "Apache-2.0"
 repository = 'https://github.com/narrowlink/ipstack'
