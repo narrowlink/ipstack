@@ -13,6 +13,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
 };
 
 mod error;
@@ -77,6 +78,7 @@ impl IpStackConfig {
 
 pub struct IpStack {
     accept_receiver: UnboundedReceiver<IpStackStream>,
+    pub handle: JoinHandle<Result<()>>,
 }
 
 impl IpStack {
@@ -86,16 +88,20 @@ impl IpStack {
     {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut streams: AHashMap<NetworkTuple, UnboundedSender<NetworkPacket>> =
                 AHashMap::new();
-            let mut buffer = [0u8; u16::MAX as usize];
+            let offset = if config.packet_information && cfg!(unix) {
+                4
+            } else {
+                0
+            };
+            let mut buffer = [0u8; u16::MAX as usize + 4];
 
             let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
             loop {
                 select! {
                     Ok(n) = device.read(&mut buffer) => {
-                        let offset = if config.packet_information && cfg!(unix) {4} else {0};
                         let Ok(packet) = NetworkPacket::parse(&buffer[offset..n]) else {
                             accept_sender.send(IpStackStream::UnknownNetwork(buffer[offset..n].to_vec()))?;
                             continue;
@@ -186,11 +192,12 @@ impl IpStack {
                     }
                 }
             }
-            #[allow(unreachable_code)]
-            Ok::<(), IpStackError>(())
         });
 
-        IpStack { accept_receiver }
+        IpStack {
+            accept_receiver,
+            handle,
+        }
     }
 
     pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
