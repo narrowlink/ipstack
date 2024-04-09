@@ -129,7 +129,7 @@ where
                         &mut streams,
                         &pkt_sender,
                         &config,
-                    )? {
+                    ) {
                         accept_sender.send(stream)?;
                     }
                 }
@@ -153,13 +153,13 @@ fn process_read(
     streams: &mut AHashMap<NetworkTuple, UnboundedSender<NetworkPacket>>,
     pkt_sender: &UnboundedSender<NetworkPacket>,
     config: &IpStackConfig,
-) -> Result<Option<IpStackStream>> {
+) -> Option<IpStackStream> {
     let Ok(packet) = NetworkPacket::parse(data) else {
-        return Ok(Some(IpStackStream::UnknownNetwork(data.to_owned())));
+        return Some(IpStackStream::UnknownNetwork(data.to_owned()));
     };
 
     if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
-        return Ok(Some(IpStackStream::UnknownTransport(
+        return Some(IpStackStream::UnknownTransport(
             IpStackUnknownTransport::new(
                 packet.src_addr().ip(),
                 packet.dst_addr().ip(),
@@ -168,14 +168,14 @@ fn process_read(
                 config.mtu,
                 pkt_sender.clone(),
             ),
-        )));
+        ));
     }
 
-    Ok(match streams.entry(packet.network_tuple()) {
+    match streams.entry(packet.network_tuple()) {
         Occupied(mut entry) => {
             if let Err(e) = entry.get().send(packet) {
                 trace!("New stream because: {}", e);
-                create_stream(e.0, config, pkt_sender)?.map(|s| {
+                create_stream(e.0, config, pkt_sender).map(|s| {
                     entry.insert(s.0);
                     s.1
                 })
@@ -183,18 +183,18 @@ fn process_read(
                 None
             }
         }
-        Vacant(entry) => create_stream(packet, config, pkt_sender)?.map(|s| {
+        Vacant(entry) => create_stream(packet, config, pkt_sender).map(|s| {
             entry.insert(s.0);
             s.1
         }),
-    })
+    }
 }
 
 fn create_stream(
     packet: NetworkPacket,
     config: &IpStackConfig,
     pkt_sender: &UnboundedSender<NetworkPacket>,
-) -> Result<Option<(UnboundedSender<NetworkPacket>, IpStackStream)>> {
+) -> Option<(UnboundedSender<NetworkPacket>, IpStackStream)> {
     match packet.transport_protocol() {
         IpStackPacketProtocol::Tcp(h) => {
             match IpStackTcpStream::new(
@@ -205,15 +205,14 @@ fn create_stream(
                 config.mtu,
                 config.tcp_timeout,
             ) {
-                Ok(stream) => Ok(Some((stream.stream_sender(), IpStackStream::Tcp(stream)))),
+                Ok(stream) => Some((stream.stream_sender(), IpStackStream::Tcp(stream))),
                 Err(e) => {
                     if matches!(e, IpStackError::InvalidTcpPacket) {
                         trace!("Invalid TCP packet");
-                        Ok(None)
                     } else {
                         error!("IpStackTcpStream::new failed \"{}\"", e);
-                        Err(e)
                     }
+                    None
                 }
             }
         }
@@ -226,7 +225,7 @@ fn create_stream(
                 config.mtu,
                 config.udp_timeout,
             );
-            Ok(Some((stream.stream_sender(), IpStackStream::Udp(stream))))
+            Some((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
         IpStackPacketProtocol::Unknown => {
             unreachable!()
