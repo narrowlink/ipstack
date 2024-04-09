@@ -209,10 +209,11 @@ fn create_stream(
                 Err(e) => {
                     if matches!(e, IpStackError::InvalidTcpPacket) {
                         trace!("Invalid TCP packet");
+                        Ok(None)
                     } else {
                         error!("IpStackTcpStream::new failed \"{}\"", e);
+                        Err(e)
                     }
-                    Ok(None)
                 }
             }
         }
