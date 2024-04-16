@@ -83,14 +83,13 @@ impl IpStackTcpStream {
             shutdown: Shutdown::default(),
             write_notify: None,
         };
-        if !tcp.inner().syn {
-            if !tcp.inner().rst {
-                _ = pkt_sender.send(stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?);
-            }
-            Err(IpStackError::InvalidTcpPacket)
-        } else {
-            Ok(stream)
+        if tcp.inner().syn {
+            return Ok(stream);
         }
+        if !tcp.inner().rst {
+            _ = pkt_sender.send(stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?);
+        }
+        Err(IpStackError::InvalidTcpPacket)
     }
 
     fn calculate_payload_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
