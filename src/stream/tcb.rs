@@ -1,4 +1,4 @@
-use crate::packet::TcpPacket;
+use crate::packet::TcpHeaderWrapper;
 use std::{collections::BTreeMap, pin::Pin, time::Duration};
 use tokio::time::Sleep;
 
@@ -136,33 +136,27 @@ impl Tcb {
     //     }
     // }
 
-    pub(super) fn check_pkt_type(&self, incoming_packet: &TcpPacket, p: &[u8]) -> PacketStatus {
-        let received_ack_distance = self
-            .seq
-            .wrapping_sub(incoming_packet.inner().acknowledgment_number);
+    pub(super) fn check_pkt_type(&self, header: &TcpHeaderWrapper, p: &[u8]) -> PacketStatus {
+        let tcp_header = header.inner();
+        let received_ack_distance = self.seq.wrapping_sub(tcp_header.acknowledgment_number);
 
         let current_ack_distance = self.seq.wrapping_sub(self.last_ack);
         if received_ack_distance > current_ack_distance
-            || (incoming_packet.inner().acknowledgment_number != self.seq
-                && self
-                    .seq
-                    .saturating_sub(incoming_packet.inner().acknowledgment_number)
-                    == 0)
+            || (tcp_header.acknowledgment_number != self.seq
+                && self.seq.saturating_sub(tcp_header.acknowledgment_number) == 0)
         {
             PacketStatus::Invalid
-        } else if self.last_ack == incoming_packet.inner().acknowledgment_number {
+        } else if self.last_ack == tcp_header.acknowledgment_number {
             if !p.is_empty() {
                 PacketStatus::NewPacket
-            } else if self.send_window == incoming_packet.inner().window_size
-                && self.seq != self.last_ack
-            {
+            } else if self.send_window == tcp_header.window_size && self.seq != self.last_ack {
                 PacketStatus::RetransmissionRequest
-            } else if self.ack.wrapping_sub(1) == incoming_packet.inner().sequence_number {
+            } else if self.ack.wrapping_sub(1) == tcp_header.sequence_number {
                 PacketStatus::KeepAlive
             } else {
                 PacketStatus::WindowUpdate
             }
-        } else if self.last_ack < incoming_packet.inner().acknowledgment_number {
+        } else if self.last_ack < tcp_header.acknowledgment_number {
             if !p.is_empty() {
                 PacketStatus::NewPacket
             } else {

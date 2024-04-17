@@ -1,6 +1,6 @@
 use super::tcp::IpStackTcpStream as IpStackTcpStreamInner;
 use crate::{
-    packet::{NetworkPacket, TcpPacket},
+    packet::{NetworkPacket, TcpHeaderWrapper},
     IpStackError,
 };
 use std::{net::SocketAddr, pin::Pin, time::Duration};
@@ -21,7 +21,7 @@ impl IpStackTcpStream {
     pub(crate) fn new(
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
-        tcp: TcpPacket,
+        tcp: TcpHeaderWrapper,
         pkt_sender: UnboundedSender<NetworkPacket>,
         mtu: u16,
         tcp_timeout: Duration,

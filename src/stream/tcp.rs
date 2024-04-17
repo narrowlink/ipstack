@@ -2,7 +2,7 @@ use crate::{
     error::IpStackError,
     packet::{
         tcp_flags::{ACK, FIN, NON, PSH, RST, SYN},
-        IpStackPacketProtocol, TcpPacket, TransportHeader,
+        IpStackPacketProtocol, TcpHeaderWrapper, TransportHeader,
     },
     stream::tcb::{Tcb, TcpState},
     DROP_TTL, TTL,
@@ -66,7 +66,7 @@ impl IpStackTcpStream {
     pub(crate) fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
-        tcp: TcpPacket,
+        tcp: TcpHeaderWrapper,
         pkt_sender: UnboundedSender<NetworkPacket>,
         stream_receiver: UnboundedReceiver<NetworkPacket>,
         mtu: u16,
