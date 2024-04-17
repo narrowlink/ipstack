@@ -5,7 +5,7 @@ use crate::{
         IpStackPacketProtocol, TcpHeaderWrapper, TransportHeader,
     },
     stream::tcb::{Tcb, TcpState},
-    DROP_TTL, TTL,
+    PacketReceiver, PacketSender, DROP_TTL, TTL,
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel};
 use std::{
@@ -18,10 +18,7 @@ use std::{
     task::{Context, Poll, Waker},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
-};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use log::{trace, warn};
 
@@ -53,8 +50,8 @@ impl Shutdown {
 pub(crate) struct IpStackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
-    stream_receiver: UnboundedReceiver<NetworkPacket>,
-    packet_sender: UnboundedSender<NetworkPacket>,
+    stream_receiver: PacketReceiver,
+    packet_sender: PacketSender,
     packet_to_send: Option<NetworkPacket>,
     tcb: Tcb,
     mtu: u16,
@@ -67,8 +64,8 @@ impl IpStackTcpStream {
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         tcp: TcpHeaderWrapper,
-        pkt_sender: UnboundedSender<NetworkPacket>,
-        stream_receiver: UnboundedReceiver<NetworkPacket>,
+        pkt_sender: PacketSender,
+        stream_receiver: PacketReceiver,
         mtu: u16,
         tcp_timeout: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {

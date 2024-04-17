@@ -1,12 +1,12 @@
 use crate::{
     packet::{IpHeader, NetworkPacket, TransportHeader},
-    IpStackError, TTL,
+    IpStackError, PacketReceiver, PacketSender, TTL,
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
 use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    sync::mpsc,
     time::Sleep,
 };
 
@@ -14,10 +14,10 @@ use tokio::{
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
-    stream_sender: UnboundedSender<NetworkPacket>,
-    stream_receiver: UnboundedReceiver<NetworkPacket>,
-    packet_sender: UnboundedSender<NetworkPacket>,
-    first_paload: Option<Vec<u8>>,
+    stream_sender: PacketSender,
+    stream_receiver: PacketReceiver,
+    packet_sender: PacketSender,
+    first_payload: Option<Vec<u8>>,
     timeout: Pin<Box<Sleep>>,
     udp_timeout: Duration,
     mtu: u16,
@@ -28,7 +28,7 @@ impl IpStackUdpStream {
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         payload: Vec<u8>,
-        packet_sender: UnboundedSender<NetworkPacket>,
+        packet_sender: PacketSender,
         mtu: u16,
         udp_timeout: Duration,
     ) -> Self {
@@ -40,14 +40,14 @@ impl IpStackUdpStream {
             stream_sender,
             stream_receiver,
             packet_sender,
-            first_paload: Some(payload),
+            first_payload: Some(payload),
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             udp_timeout,
             mtu,
         }
     }
 
-    pub(crate) fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
+    pub(crate) fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
 
@@ -126,7 +126,7 @@ impl AsyncRead for IpStackUdpStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if let Some(p) = self.first_paload.take() {
+        if let Some(p) = self.first_payload.take() {
             buf.put_slice(&p);
             return std::task::Poll::Ready(Ok(()));
         }

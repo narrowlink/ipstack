@@ -1,20 +1,16 @@
 use super::tcp::IpStackTcpStream as IpStackTcpStreamInner;
 use crate::{
     packet::{NetworkPacket, TcpHeaderWrapper},
-    IpStackError,
+    IpStackError, PacketSender,
 };
 use std::{net::SocketAddr, pin::Pin, time::Duration};
-use tokio::{
-    io::AsyncWriteExt,
-    sync::mpsc::{self, UnboundedSender},
-    time::timeout,
-};
+use tokio::{io::AsyncWriteExt, sync::mpsc, time::timeout};
 
 pub struct IpStackTcpStream {
     inner: Option<Box<IpStackTcpStreamInner>>,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
-    stream_sender: mpsc::UnboundedSender<NetworkPacket>,
+    stream_sender: PacketSender,
 }
 
 impl IpStackTcpStream {
@@ -22,7 +18,7 @@ impl IpStackTcpStream {
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
         tcp: TcpHeaderWrapper,
-        pkt_sender: UnboundedSender<NetworkPacket>,
+        pkt_sender: PacketSender,
         mtu: u16,
         tcp_timeout: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
@@ -50,7 +46,7 @@ impl IpStackTcpStream {
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
-    pub fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
+    pub fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
 }
