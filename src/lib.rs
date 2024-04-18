@@ -18,6 +18,7 @@ use tokio::{
 
 pub(crate) type PacketSender = UnboundedSender<NetworkPacket>;
 pub(crate) type PacketReceiver = UnboundedReceiver<NetworkPacket>;
+pub(crate) type SessionCollection = AHashMap<NetworkTuple, PacketSender>;
 
 mod error;
 mod packet;
@@ -118,7 +119,7 @@ fn run<D>(
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut streams: AHashMap<NetworkTuple, PacketSender> = AHashMap::new();
+    let mut sessions: SessionCollection = AHashMap::new();
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
     let mut buffer = [0_u8; u16::MAX as usize + 4];
@@ -130,7 +131,7 @@ where
                 Ok(n) = device.read(&mut buffer) => {
                     if let Some(stream) = process_device_read(
                         &buffer[offset..n],
-                        &mut streams,
+                        &mut sessions,
                         &pkt_sender,
                         &config,
                     ) {
@@ -140,7 +141,7 @@ where
                 Some(packet) = pkt_receiver.recv() => {
                     process_upstream_recv(
                         packet,
-                        &mut streams,
+                        &mut sessions,
                         &mut device,
                         #[cfg(unix)]
                         pi,
@@ -154,7 +155,7 @@ where
 
 fn process_device_read(
     data: &[u8],
-    streams: &mut AHashMap<NetworkTuple, PacketSender>,
+    sessions: &mut SessionCollection,
     pkt_sender: &PacketSender,
     config: &IpStackConfig,
 ) -> Option<IpStackStream> {
@@ -175,7 +176,7 @@ fn process_device_read(
         ));
     }
 
-    match streams.entry(packet.network_tuple()) {
+    match sessions.entry(packet.network_tuple()) {
         Occupied(mut entry) => {
             if let Err(e) = entry.get().send(packet) {
                 trace!("New stream because: {}", e);
@@ -239,7 +240,7 @@ fn create_stream(
 
 async fn process_upstream_recv<D>(
     packet: NetworkPacket,
-    streams: &mut AHashMap<NetworkTuple, PacketSender>,
+    sessions: &mut SessionCollection,
     device: &mut D,
     #[cfg(unix)] packet_information: bool,
 ) -> Result<()>
@@ -247,7 +248,7 @@ where
     D: AsyncWrite + Unpin + 'static,
 {
     if packet.ttl() == 0 {
-        streams.remove(&packet.reverse_network_tuple());
+        sessions.remove(&packet.reverse_network_tuple());
         return Ok(());
     }
     #[allow(unused_mut)]
