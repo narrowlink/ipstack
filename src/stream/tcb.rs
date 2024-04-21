@@ -5,16 +5,19 @@ use tokio::time::Sleep;
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Default)]
 pub enum TcpState {
     SynReceived(bool), // bool means if syn/ack is sent
+    #[default]
     Established,
     FinWait1(bool),
     FinWait2(bool), // bool means waiting for ack
     Closed,
 }
-#[derive(Clone, Debug)]
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Default)]
 pub(super) enum PacketStatus {
+    #[default]
     WindowUpdate,
     Invalid,
     RetransmissionRequest,
@@ -85,9 +88,7 @@ impl Tcb {
         // for (seq,_) in self.unordered_packets.iter() {
         //     dbg!(seq);
         // }
-        self.unordered_packets
-            .remove(&self.ack)
-            .map(|p| p.payload.clone())
+        self.unordered_packets.remove(&self.ack).map(|p| p.payload)
     }
     pub(super) fn add_seq_one(&mut self) {
         self.seq = self.seq.wrapping_add(1);
@@ -104,8 +105,8 @@ impl Tcb {
     pub(super) fn change_state(&mut self, state: TcpState) {
         self.state = state;
     }
-    pub(super) fn get_state(&self) -> &TcpState {
-        &self.state
+    pub(super) fn get_state(&self) -> TcpState {
+        self.state
     }
     pub(super) fn change_send_window(&mut self, window: u16) {
         let avg_send_window = ((self.avg_send_window.0 * self.avg_send_window.1) + window as u64)
@@ -170,7 +171,7 @@ impl Tcb {
         let distance = ack.wrapping_sub(self.last_ack);
         self.last_ack = self.last_ack.wrapping_add(distance);
 
-        if matches!(self.state, TcpState::Established) {
+        if self.state == TcpState::Established {
             if let Some(i) = self.inflight_packets.iter().position(|p| p.contains(ack)) {
                 let mut inflight_packet = self.inflight_packets.remove(i);
                 let distance = ack.wrapping_sub(inflight_packet.seq) as usize;

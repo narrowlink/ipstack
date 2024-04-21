@@ -32,9 +32,8 @@ impl IpStackTcpStream {
             mtu,
             tcp_timeout,
         )
-        .map(Box::new)
         .map(|inner| IpStackTcpStream {
-            inner: Some(inner),
+            inner: Some(Box::new(inner)),
             peer_addr,
             local_addr,
             stream_sender,
@@ -107,7 +106,9 @@ impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         if let Some(mut inner) = self.inner.take() {
             tokio::spawn(async move {
-                _ = timeout(Duration::from_secs(2), inner.shutdown()).await;
+                if let Err(err) = timeout(Duration::from_secs(2), inner.shutdown()).await {
+                    log::warn!("Error while dropping IpStackTcpStream: {:?}", err);
+                }
             });
         }
     }
