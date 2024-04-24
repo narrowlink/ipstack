@@ -209,7 +209,7 @@ impl AsyncRead for IpStackTcpStream {
                     Some(self.create_rev_packet(NON, DROP_TTL, None, Vec::new())?);
                 self.tcb.change_state(TcpState::Closed);
                 self.shutdown.ready();
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(Err(Error::from(ErrorKind::ConnectionAborted)));
             }
 
             let min = self.tcb.get_available_read_buffer_size() as u16;

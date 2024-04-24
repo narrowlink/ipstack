@@ -19,14 +19,6 @@
 //! sudo route add 1.2.3.4/32 10.0.0.1  # macOS
 //! ```
 //!
-//! In Windows, the route of `0.0.0.0` will be added to your tun interface automatically,
-//! it will cause all traffic to be routed to it. So you can't access the Internet anymore.
-//! To solve this problem, you must delete the route of `0.0.0.0` with the following command:
-//! ```
-//! route delete 0.0.0.0 mask 0.0.0.0 10.0.0.1 # Windows
-//! ```
-//! Then the traffic will be routed to your physical network card.
-//!
 //! Now you can test it with `nc 1.2.3.4 any_port` or `nc -u 1.2.3.4 any_port`.
 //! You can watch the echo information in the `nc` console.
 //! ```
@@ -86,11 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ipv4 = Ipv4Addr::new(10, 0, 0, 33);
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
-    let gateway = Ipv4Addr::new(10, 0, 0, 1);
+    let _gateway = Ipv4Addr::new(10, 0, 0, 1);
 
     let mut tun_config = tun2::Configuration::default();
     tun_config.address(ipv4).netmask(netmask).mtu(MTU).up();
-    tun_config.destination(gateway);
+    #[cfg(not(target_os = "windows"))]
+    tun_config.destination(_gateway); // avoid routing all traffic to tun on Windows platform
 
     #[cfg(target_os = "linux")]
     tun_config.platform_config(|p_cfg| {

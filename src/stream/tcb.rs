@@ -214,7 +214,7 @@ impl InflightPacket {
         }
     }
     pub(crate) fn contains(&self, seq: u32) -> bool {
-        self.seq < seq && self.seq + self.payload.len() as u32 >= seq
+        self.seq < seq && seq <= self.seq + self.payload.len() as u32
     }
 }
 
