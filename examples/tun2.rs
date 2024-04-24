@@ -81,10 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "windows"))]
     let gateway = Ipv4Addr::new(10, 0, 0, 1);
 
-    let mut config = tun2::Configuration::default();
-    config.address(ipv4).netmask(netmask).mtu(MTU).up();
+    let mut tun_config = tun2::Configuration::default();
+    tun_config.address(ipv4).netmask(netmask).mtu(MTU).up();
     #[cfg(not(target_os = "windows"))]
-    config.destination(gateway); // avoid routing all traffic to tun on Windows platform
+    tun_config.destination(gateway); // avoid routing all traffic to tun on Windows platform
 
     #[cfg(target_os = "linux")]
     tun_config.platform_config(|p_cfg| {
