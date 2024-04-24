@@ -1,11 +1,11 @@
-use crate::packet::TcpPacket;
+use crate::packet::TcpHeaderWrapper;
 use std::{collections::BTreeMap, pin::Pin, time::Duration};
 use tokio::time::Sleep;
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TcpState {
     SynReceived(bool), // bool means if syn/ack is sent
     Established,
@@ -13,7 +13,8 @@ pub enum TcpState {
     FinWait2(bool), // bool means waiting for ack
     Closed,
 }
-#[derive(Clone, Debug)]
+
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum PacketStatus {
     WindowUpdate,
     Invalid,
@@ -25,16 +26,16 @@ pub(super) enum PacketStatus {
 
 #[derive(Debug)]
 pub(super) struct Tcb {
-    pub(super) seq: u32,
+    seq: u32,
     pub(super) retransmission: Option<u32>,
-    pub(super) ack: u32,
-    pub(super) last_ack: u32,
+    ack: u32,
+    last_ack: u32,
     pub(super) timeout: Pin<Box<Sleep>>,
     tcp_timeout: Duration,
     recv_window: u16,
-    pub(super) send_window: u16,
+    send_window: u16,
     state: TcpState,
-    pub(super) avg_send_window: (u64, u64),
+    avg_send_window: (u64, u64), // (avg, count)
     pub(super) inflight_packets: Vec<InflightPacket>,
     unordered_packets: BTreeMap<u32, UnorderedPacket>,
 }
@@ -85,9 +86,7 @@ impl Tcb {
         // for (seq,_) in self.unordered_packets.iter() {
         //     dbg!(seq);
         // }
-        self.unordered_packets
-            .remove(&self.ack)
-            .map(|p| p.payload.clone())
+        self.unordered_packets.remove(&self.ack).map(|p| p.payload)
     }
     pub(super) fn add_seq_one(&mut self) {
         self.seq = self.seq.wrapping_add(1);
@@ -101,11 +100,14 @@ impl Tcb {
     pub(super) fn get_ack(&self) -> u32 {
         self.ack
     }
+    pub(super) fn get_last_ack(&self) -> u32 {
+        self.last_ack
+    }
     pub(super) fn change_state(&mut self, state: TcpState) {
         self.state = state;
     }
-    pub(super) fn get_state(&self) -> &TcpState {
-        &self.state
+    pub(super) fn get_state(&self) -> TcpState {
+        self.state.clone()
     }
     pub(super) fn change_send_window(&mut self, window: u16) {
         let avg_send_window = ((self.avg_send_window.0 * self.avg_send_window.1) + window as u64)
@@ -116,6 +118,9 @@ impl Tcb {
     }
     pub(super) fn get_send_window(&self) -> u16 {
         self.send_window
+    }
+    pub(super) fn get_avg_send_window(&self) -> u64 {
+        self.avg_send_window.0
     }
     pub(super) fn change_recv_window(&mut self, window: u16) {
         self.recv_window = window;
@@ -136,33 +141,27 @@ impl Tcb {
     //     }
     // }
 
-    pub(super) fn check_pkt_type(&self, incoming_packet: &TcpPacket, p: &[u8]) -> PacketStatus {
-        let received_ack_distance = self
-            .seq
-            .wrapping_sub(incoming_packet.inner().acknowledgment_number);
+    pub(super) fn check_pkt_type(&self, header: &TcpHeaderWrapper, p: &[u8]) -> PacketStatus {
+        let tcp_header = header.inner();
+        let received_ack_distance = self.seq.wrapping_sub(tcp_header.acknowledgment_number);
 
         let current_ack_distance = self.seq.wrapping_sub(self.last_ack);
         if received_ack_distance > current_ack_distance
-            || (incoming_packet.inner().acknowledgment_number != self.seq
-                && self
-                    .seq
-                    .saturating_sub(incoming_packet.inner().acknowledgment_number)
-                    == 0)
+            || (tcp_header.acknowledgment_number != self.seq
+                && self.seq.saturating_sub(tcp_header.acknowledgment_number) == 0)
         {
             PacketStatus::Invalid
-        } else if self.last_ack == incoming_packet.inner().acknowledgment_number {
+        } else if self.last_ack == tcp_header.acknowledgment_number {
             if !p.is_empty() {
                 PacketStatus::NewPacket
-            } else if self.send_window == incoming_packet.inner().window_size
-                && self.seq != self.last_ack
-            {
+            } else if self.send_window == tcp_header.window_size && self.seq != self.last_ack {
                 PacketStatus::RetransmissionRequest
-            } else if self.ack.wrapping_sub(1) == incoming_packet.inner().sequence_number {
+            } else if self.ack.wrapping_sub(1) == tcp_header.sequence_number {
                 PacketStatus::KeepAlive
             } else {
                 PacketStatus::WindowUpdate
             }
-        } else if self.last_ack < incoming_packet.inner().acknowledgment_number {
+        } else if self.last_ack < tcp_header.acknowledgment_number {
             if !p.is_empty() {
                 PacketStatus::NewPacket
             } else {
@@ -176,12 +175,12 @@ impl Tcb {
         let distance = ack.wrapping_sub(self.last_ack);
         self.last_ack = self.last_ack.wrapping_add(distance);
 
-        if matches!(self.state, TcpState::Established) {
+        if self.state == TcpState::Established {
             if let Some(i) = self.inflight_packets.iter().position(|p| p.contains(ack)) {
                 let mut inflight_packet = self.inflight_packets.remove(i);
-                let distance = ack.wrapping_sub(inflight_packet.seq);
-                if (distance as usize) < inflight_packet.payload.len() {
-                    inflight_packet.payload.drain(0..distance as usize);
+                let distance = ack.wrapping_sub(inflight_packet.seq) as usize;
+                if distance < inflight_packet.payload.len() {
+                    inflight_packet.payload.drain(0..distance);
                     inflight_packet.seq = ack;
                     self.inflight_packets.push(inflight_packet);
                 }
@@ -219,7 +218,7 @@ impl InflightPacket {
         }
     }
     pub(crate) fn contains(&self, seq: u32) -> bool {
-        self.seq < seq && self.seq + self.payload.len() as u32 >= seq
+        self.seq < seq && seq <= self.seq + self.payload.len() as u32
     }
 }
 

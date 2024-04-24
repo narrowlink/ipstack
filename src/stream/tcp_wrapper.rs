@@ -1,28 +1,24 @@
 use super::tcp::IpStackTcpStream as IpStackTcpStreamInner;
 use crate::{
-    packet::{NetworkPacket, TcpPacket},
-    IpStackError,
+    packet::{NetworkPacket, TcpHeaderWrapper},
+    IpStackError, PacketSender,
 };
 use std::{net::SocketAddr, pin::Pin, time::Duration};
-use tokio::{
-    io::AsyncWriteExt,
-    sync::mpsc::{self, UnboundedSender},
-    time::timeout,
-};
+use tokio::{io::AsyncWriteExt, sync::mpsc, time::timeout};
 
 pub struct IpStackTcpStream {
     inner: Option<Box<IpStackTcpStreamInner>>,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
-    stream_sender: mpsc::UnboundedSender<NetworkPacket>,
+    stream_sender: PacketSender,
 }
 
 impl IpStackTcpStream {
     pub(crate) fn new(
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
-        tcp: TcpPacket,
-        pkt_sender: UnboundedSender<NetworkPacket>,
+        tcp: TcpHeaderWrapper,
+        pkt_sender: PacketSender,
         mtu: u16,
         tcp_timeout: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
@@ -36,9 +32,8 @@ impl IpStackTcpStream {
             mtu,
             tcp_timeout,
         )
-        .map(Box::new)
         .map(|inner| IpStackTcpStream {
-            inner: Some(inner),
+            inner: Some(Box::new(inner)),
             peer_addr,
             local_addr,
             stream_sender,
@@ -50,7 +45,7 @@ impl IpStackTcpStream {
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
-    pub fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
+    pub fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
 }
@@ -111,7 +106,9 @@ impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         if let Some(mut inner) = self.inner.take() {
             tokio::spawn(async move {
-                _ = timeout(Duration::from_secs(2), inner.shutdown()).await;
+                if let Err(err) = timeout(Duration::from_secs(2), inner.shutdown()).await {
+                    log::warn!("Error while dropping IpStackTcpStream: {:?}", err);
+                }
             });
         }
     }

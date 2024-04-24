@@ -22,7 +22,7 @@ pub mod tcp_flags {
 
 #[derive(Debug, Clone)]
 pub(crate) enum IpStackPacketProtocol {
-    Tcp(TcpPacket),
+    Tcp(TcpHeaderWrapper),
     Unknown,
     Udp,
 }
@@ -145,11 +145,11 @@ impl NetworkPacket {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct TcpPacket {
+pub(super) struct TcpHeaderWrapper {
     header: TcpHeader,
 }
 
-impl TcpPacket {
+impl TcpHeaderWrapper {
     pub fn inner(&self) -> &TcpHeader {
         &self.header
     }
@@ -185,9 +185,9 @@ impl TcpPacket {
     }
 }
 
-impl From<&TcpHeader> for TcpPacket {
+impl From<&TcpHeader> for TcpHeaderWrapper {
     fn from(header: &TcpHeader) -> Self {
-        TcpPacket {
+        TcpHeaderWrapper {
             header: header.clone(),
         }
     }

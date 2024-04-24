@@ -1,10 +1,9 @@
 use crate::{
     packet::{IpHeader, NetworkPacket, TransportHeader},
-    TTL,
+    PacketSender, TTL,
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header};
 use std::{io::Error, mem, net::IpAddr};
-use tokio::sync::mpsc::UnboundedSender;
 
 pub struct IpStackUnknownTransport {
     src_addr: IpAddr,
@@ -12,7 +11,7 @@ pub struct IpStackUnknownTransport {
     payload: Vec<u8>,
     protocol: IpNumber,
     mtu: u16,
-    packet_sender: UnboundedSender<NetworkPacket>,
+    packet_sender: PacketSender,
 }
 
 impl IpStackUnknownTransport {
@@ -22,7 +21,7 @@ impl IpStackUnknownTransport {
         payload: Vec<u8>,
         ip: &IpHeader,
         mtu: u16,
-        packet_sender: UnboundedSender<NetworkPacket>,
+        packet_sender: PacketSender,
     ) -> Self {
         let protocol = match ip {
             IpHeader::Ipv4(ip) => ip.protocol,
