@@ -18,6 +18,7 @@
 //! route add 1.2.3.4 mask 255.255.255.255 10.0.0.1 metric 100  # Windows
 //! sudo route add 1.2.3.4/32 10.0.0.1  # macOS
 //! ```
+//!
 //! Now you can test it with `nc 1.2.3.4 any_port` or `nc -u 1.2.3.4 any_port`.
 //! You can watch the echo information in the `nc` console.
 //! ```
@@ -55,6 +56,14 @@ struct Args {
     #[arg(short, long, value_name = "IP:port")]
     server_addr: SocketAddr,
 
+    /// tcp timeout
+    #[arg(long, value_name = "seconds", default_value = "60")]
+    tcp_timeout: u64,
+
+    /// udp timeout
+    #[arg(long, value_name = "seconds", default_value = "10")]
+    udp_timeout: u64,
+
     /// Verbosity level
     #[arg(short, long, value_name = "level", value_enum, default_value = "info")]
     pub verbosity: ArgVerbosity,
@@ -69,64 +78,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ipv4 = Ipv4Addr::new(10, 0, 0, 33);
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
-    let gateway = Ipv4Addr::new(10, 0, 0, 1);
+    let _gateway = Ipv4Addr::new(10, 0, 0, 1);
 
-    let mut config = tun2::Configuration::default();
-    config.address(ipv4).netmask(netmask).mtu(MTU).up();
-    config.destination(gateway);
+    let mut tun_config = tun2::Configuration::default();
+    tun_config.address(ipv4).netmask(netmask).mtu(MTU).up();
+    #[cfg(not(target_os = "windows"))]
+    tun_config.destination(_gateway); // avoid routing all traffic to tun on Windows platform
 
     #[cfg(target_os = "linux")]
-    config.platform_config(|config| {
-        config.ensure_root_privileges(true);
+    tun_config.platform_config(|p_cfg| {
+        p_cfg.ensure_root_privileges(true);
     });
 
     #[cfg(target_os = "windows")]
-    config.platform_config(|config| {
-        config.device_guid(Some(12324323423423434234_u128));
+    tun_config.platform_config(|p_cfg| {
+        p_cfg.device_guid(Some(12324323423423434234_u128));
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
     ipstack_config.mtu(MTU);
+    ipstack_config.tcp_timeout(std::time::Duration::from_secs(args.tcp_timeout));
+    ipstack_config.udp_timeout(std::time::Duration::from_secs(args.udp_timeout));
 
-    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config)?);
+    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&tun_config)?);
 
     let server_addr = args.server_addr;
 
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let serial_number = std::sync::atomic::AtomicUsize::new(0);
+
     loop {
+        let count = count.clone();
+        let number = serial_number.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match ip_stack.accept().await? {
             IpStackStream::Tcp(mut tcp) => {
                 let mut s = match TcpStream::connect(server_addr).await {
                     Ok(s) => s,
                     Err(e) => {
-                        println!("connect TCP server failed \"{}\"", e);
+                        log::info!("connect TCP server failed \"{}\"", e);
                         continue;
                     }
                 };
-                println!("==== New TCP connection ====");
+                let c = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let number1 = number;
+                log::info!("#{number1} TCP connecting, session count {c}");
                 tokio::spawn(async move {
-                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut s).await;
-                    println!("====== end tcp connection ======");
+                    if let Err(err) = tokio::io::copy_bidirectional(&mut tcp, &mut s).await {
+                        log::info!("#{number1} TCP error: {}", err);
+                    }
+                    let c = count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+                    log::info!("#{number1} TCP closed, session count {c}");
                 });
             }
             IpStackStream::Udp(mut udp) => {
                 let mut s = match UdpStream::connect(server_addr).await {
                     Ok(s) => s,
                     Err(e) => {
-                        println!("connect UDP server failed \"{}\"", e);
+                        log::info!("connect UDP server failed \"{}\"", e);
                         continue;
                     }
                 };
-                println!("==== New UDP connection ====");
+                let c = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let number2 = number;
+                log::info!("#{number2} UDP connecting, session count {c}");
                 tokio::spawn(async move {
-                    let _ = tokio::io::copy_bidirectional(&mut udp, &mut s).await;
-                    println!("==== end UDP connection ====");
+                    if let Err(err) = tokio::io::copy_bidirectional(&mut udp, &mut s).await {
+                        log::info!("#{number2} UDP error: {}", err);
+                    }
+                    let c = count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+                    log::info!("#{number2} UDP closed, session count {c}");
                 });
             }
             IpStackStream::UnknownTransport(u) => {
+                let n = number;
                 if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
                     if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
-                        println!("ICMPv4 echo");
+                        log::info!("#{n} ICMPv4 echo");
                         let echo = IcmpEchoHeader {
                             id: req.id,
                             seq: req.seq,
@@ -137,15 +165,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         payload.extend_from_slice(req_payload);
                         u.send(payload)?;
                     } else {
-                        println!("ICMPv4");
+                        log::info!("#{n} ICMPv4");
                     }
                     continue;
                 }
-                println!("unknown transport - Ip Protocol {:?}", u.ip_protocol());
+                log::info!("#{n} unknown transport - Ip Protocol {:?}", u.ip_protocol());
                 continue;
             }
             IpStackStream::UnknownNetwork(pkt) => {
-                println!("unknown transport - {} bytes", pkt.len());
+                log::info!("#{number} unknown transport - {} bytes", pkt.len());
                 continue;
             }
         };

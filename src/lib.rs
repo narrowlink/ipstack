@@ -16,6 +16,10 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub(crate) type PacketSender = UnboundedSender<NetworkPacket>;
+pub(crate) type PacketReceiver = UnboundedReceiver<NetworkPacket>;
+pub(crate) type SessionCollection = AHashMap<NetworkTuple, PacketSender>;
+
 mod error;
 mod packet;
 pub mod stream;
@@ -62,17 +66,21 @@ impl Default for IpStackConfig {
 }
 
 impl IpStackConfig {
-    pub fn tcp_timeout(&mut self, timeout: Duration) {
+    pub fn tcp_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.tcp_timeout = timeout;
+        self
     }
-    pub fn udp_timeout(&mut self, timeout: Duration) {
+    pub fn udp_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.udp_timeout = timeout;
+        self
     }
-    pub fn mtu(&mut self, mtu: u16) {
+    pub fn mtu(&mut self, mtu: u16) -> &mut Self {
         self.mtu = mtu;
+        self
     }
-    pub fn packet_information(&mut self, packet_information: bool) {
+    pub fn packet_information(&mut self, packet_information: bool) -> &mut Self {
         self.packet_information = packet_information;
+        self
     }
 }
 
@@ -111,12 +119,9 @@ fn run<D>(
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut streams: AHashMap<NetworkTuple, UnboundedSender<NetworkPacket>> = AHashMap::new();
-    let offset = if config.packet_information && cfg!(unix) {
-        4
-    } else {
-        0
-    };
+    let mut sessions: SessionCollection = AHashMap::new();
+    let pi = config.packet_information;
+    let offset = if pi && cfg!(unix) { 4 } else { 0 };
     let mut buffer = [0_u8; u16::MAX as usize + 4];
     let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
@@ -124,9 +129,9 @@ where
         loop {
             select! {
                 Ok(n) = device.read(&mut buffer) => {
-                    if let Some(stream) = process_read(
+                    if let Some(stream) = process_device_read(
                         &buffer[offset..n],
-                        &mut streams,
+                        &mut sessions,
                         &pkt_sender,
                         &config,
                     ) {
@@ -134,12 +139,12 @@ where
                     }
                 }
                 Some(packet) = pkt_receiver.recv() => {
-                    process_recv(
+                    process_upstream_recv(
                         packet,
-                        &mut streams,
+                        &mut sessions,
                         &mut device,
                         #[cfg(unix)]
-                        config.packet_information,
+                        pi,
                     )
                     .await?;
                 }
@@ -148,10 +153,10 @@ where
     })
 }
 
-fn process_read(
+fn process_device_read(
     data: &[u8],
-    streams: &mut AHashMap<NetworkTuple, UnboundedSender<NetworkPacket>>,
-    pkt_sender: &UnboundedSender<NetworkPacket>,
+    sessions: &mut SessionCollection,
+    pkt_sender: &PacketSender,
     config: &IpStackConfig,
 ) -> Option<IpStackStream> {
     let Ok(packet) = NetworkPacket::parse(data) else {
@@ -171,7 +176,7 @@ fn process_read(
         ));
     }
 
-    match streams.entry(packet.network_tuple()) {
+    match sessions.entry(packet.network_tuple()) {
         Occupied(mut entry) => {
             if let Err(e) = entry.get().send(packet) {
                 trace!("New stream because: {}", e);
@@ -193,8 +198,8 @@ fn process_read(
 fn create_stream(
     packet: NetworkPacket,
     config: &IpStackConfig,
-    pkt_sender: &UnboundedSender<NetworkPacket>,
-) -> Option<(UnboundedSender<NetworkPacket>, IpStackStream)> {
+    pkt_sender: &PacketSender,
+) -> Option<(PacketSender, IpStackStream)> {
     match packet.transport_protocol() {
         IpStackPacketProtocol::Tcp(h) => {
             match IpStackTcpStream::new(
@@ -233,9 +238,9 @@ fn create_stream(
     }
 }
 
-async fn process_recv<D>(
+async fn process_upstream_recv<D>(
     packet: NetworkPacket,
-    streams: &mut AHashMap<NetworkTuple, UnboundedSender<NetworkPacket>>,
+    sessions: &mut SessionCollection,
     device: &mut D,
     #[cfg(unix)] packet_information: bool,
 ) -> Result<()>
@@ -243,23 +248,23 @@ where
     D: AsyncWrite + Unpin + 'static,
 {
     if packet.ttl() == 0 {
-        streams.remove(&packet.reverse_network_tuple());
+        sessions.remove(&packet.reverse_network_tuple());
         return Ok(());
     }
     #[allow(unused_mut)]
-    let Ok(mut packet_byte) = packet.to_bytes() else {
+    let Ok(mut packet_bytes) = packet.to_bytes() else {
         trace!("to_bytes error");
         return Ok(());
     };
     #[cfg(unix)]
     if packet_information {
         if packet.src_addr().is_ipv4() {
-            packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
+            packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
         } else {
-            packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
+            packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
         }
     }
-    device.write_all(&packet_byte).await?;
+    device.write_all(&packet_bytes).await?;
     // device.flush().await.unwrap();
 
     Ok(())
