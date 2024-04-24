@@ -5,19 +5,17 @@ use tokio::time::Sleep;
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TcpState {
     SynReceived(bool), // bool means if syn/ack is sent
-    #[default]
     Established,
     FinWait1(bool),
     FinWait2(bool), // bool means waiting for ack
     Closed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy, PartialOrd, Ord, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum PacketStatus {
-    #[default]
     WindowUpdate,
     Invalid,
     RetransmissionRequest,
@@ -28,16 +26,16 @@ pub(super) enum PacketStatus {
 
 #[derive(Debug)]
 pub(super) struct Tcb {
-    pub(super) seq: u32,
+    seq: u32,
     pub(super) retransmission: Option<u32>,
-    pub(super) ack: u32,
-    pub(super) last_ack: u32,
+    ack: u32,
+    last_ack: u32,
     pub(super) timeout: Pin<Box<Sleep>>,
     tcp_timeout: Duration,
     recv_window: u16,
-    pub(super) send_window: u16,
+    send_window: u16,
     state: TcpState,
-    pub(super) avg_send_window: (u64, u64),
+    avg_send_window: (u64, u64), // (avg, count)
     pub(super) inflight_packets: Vec<InflightPacket>,
     unordered_packets: BTreeMap<u32, UnorderedPacket>,
 }
@@ -102,11 +100,14 @@ impl Tcb {
     pub(super) fn get_ack(&self) -> u32 {
         self.ack
     }
+    pub(super) fn get_last_ack(&self) -> u32 {
+        self.last_ack
+    }
     pub(super) fn change_state(&mut self, state: TcpState) {
         self.state = state;
     }
     pub(super) fn get_state(&self) -> TcpState {
-        self.state
+        self.state.clone()
     }
     pub(super) fn change_send_window(&mut self, window: u16) {
         let avg_send_window = ((self.avg_send_window.0 * self.avg_send_window.1) + window as u64)
@@ -117,6 +118,9 @@ impl Tcb {
     }
     pub(super) fn get_send_window(&self) -> u16 {
         self.send_window
+    }
+    pub(super) fn get_avg_send_window(&self) -> u64 {
+        self.avg_send_window.0
     }
     pub(super) fn change_recv_window(&mut self, window: u16) {
         self.recv_window = window;

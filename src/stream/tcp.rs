@@ -255,7 +255,7 @@ impl AsyncRead for IpStackTcpStream {
                 continue;
             } else if matches!(self.shutdown, Shutdown::Pending(_))
                 && self.tcb.get_state() == TcpState::Established
-                && self.tcb.last_ack == self.tcb.seq
+                && self.tcb.get_last_ack() == self.tcb.get_seq()
             {
                 self.packet_to_send =
                     Some(self.create_rev_packet(FIN | ACK, TTL, None, Vec::new())?);
@@ -434,7 +434,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
         self.tcb.reset_timeout();
 
-        if (self.tcb.send_window as u64) < self.tcb.avg_send_window.0 / 2
+        if (self.tcb.get_send_window() as u64) < self.tcb.get_avg_send_window() / 2
             || self.tcb.is_send_buffer_full()
         {
             self.write_notify = Some(cx.waker().clone());
@@ -449,7 +449,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         let packet = self.create_rev_packet(PSH | ACK, TTL, None, buf.to_vec())?;
-        let seq = self.tcb.seq;
+        let seq = self.tcb.get_seq();
         let payload_len = packet.payload.len();
         let payload = packet.payload.clone();
         self.packet_sender
@@ -482,9 +482,9 @@ impl AsyncWrite for IpStackTcpStream {
         } else if let Some(_i) = self.tcb.retransmission {
             {
                 warn!("{}", _i);
-                warn!("{}", self.tcb.seq);
-                warn!("{}", self.tcb.last_ack);
-                warn!("{}", self.tcb.ack);
+                warn!("{}", self.tcb.get_seq());
+                warn!("{}", self.tcb.get_last_ack());
+                warn!("{}", self.tcb.get_ack());
                 for p in self.tcb.inflight_packets.iter() {
                     warn!("{}", p.seq);
                     warn!("{}", p.payload.len());
