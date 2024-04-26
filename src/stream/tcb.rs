@@ -62,17 +62,17 @@ impl Tcb {
             unordered_packets: BTreeMap::new(),
         }
     }
-    pub(super) fn add_inflight_packet(&mut self, seq: u32, buf: &[u8]) {
-        self.inflight_packets
-            .push(InflightPacket::new(seq, buf.to_vec()));
-        self.seq = self.seq.wrapping_add(buf.len() as u32);
+    pub(super) fn add_inflight_packet(&mut self, seq: u32, buf: Vec<u8>) {
+        let buf_len = buf.len() as u32;
+        self.inflight_packets.push(InflightPacket::new(seq, buf));
+        self.seq = self.seq.wrapping_add(buf_len);
     }
-    pub(super) fn add_unordered_packet(&mut self, seq: u32, buf: &[u8]) {
+    pub(super) fn add_unordered_packet(&mut self, seq: u32, buf: Vec<u8>) {
         if seq < self.ack {
             return;
         }
         self.unordered_packets
-            .insert(seq, UnorderedPacket::new(buf.to_vec()));
+            .insert(seq, UnorderedPacket::new(buf));
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
         READ_BUFFER_SIZE.saturating_sub(

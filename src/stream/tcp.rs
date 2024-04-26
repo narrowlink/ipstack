@@ -325,10 +325,8 @@ impl AsyncRead for IpStackTcpStream {
                                     // }
 
                                     self.tcb.change_last_ack(t.inner().acknowledgment_number);
-                                    self.tcb.add_unordered_packet(
-                                        t.inner().sequence_number,
-                                        &p.payload,
-                                    );
+                                    self.tcb
+                                        .add_unordered_packet(t.inner().sequence_number, p.payload);
                                     // buf.put_slice(&p.payload);
                                     // self.tcb.add_ack(p.payload.len() as u32);
                                     // self.packet_to_send = Some(self.create_rev_packet(
@@ -389,7 +387,7 @@ impl AsyncRead for IpStackTcpStream {
                             // )?);
                             // return Poll::Ready(Ok(()));
                             self.tcb
-                                .add_unordered_packet(t.inner().sequence_number, &p.payload);
+                                .add_unordered_packet(t.inner().sequence_number, p.payload);
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait1(false) {
@@ -455,7 +453,7 @@ impl AsyncWrite for IpStackTcpStream {
         self.packet_sender
             .send(packet)
             .or(Err(ErrorKind::UnexpectedEof))?;
-        self.tcb.add_inflight_packet(seq, &payload);
+        self.tcb.add_inflight_packet(seq, payload);
 
         Poll::Ready(Ok(payload_len))
     }
