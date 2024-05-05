@@ -16,7 +16,7 @@ pub struct IpStackUdpStream {
     dst_addr: SocketAddr,
     stream_sender: PacketSender,
     stream_receiver: PacketReceiver,
-    packet_sender: PacketSender,
+    pkt_sender: PacketSender,
     first_payload: Option<Vec<u8>>,
     timeout: Pin<Box<Sleep>>,
     udp_timeout: Duration,
@@ -28,7 +28,7 @@ impl IpStackUdpStream {
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         payload: Vec<u8>,
-        packet_sender: PacketSender,
+        pkt_sender: PacketSender,
         mtu: u16,
         udp_timeout: Duration,
     ) -> Self {
@@ -39,7 +39,7 @@ impl IpStackUdpStream {
             dst_addr,
             stream_sender,
             stream_receiver,
-            packet_sender,
+            pkt_sender,
             first_payload: Some(payload),
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             udp_timeout,
@@ -156,7 +156,7 @@ impl AsyncWrite for IpStackUdpStream {
         self.reset_timeout();
         let packet = self.create_rev_packet(TTL, buf.to_vec())?;
         let payload_len = packet.payload.len();
-        self.packet_sender
+        self.pkt_sender
             .send(packet)
             .or(Err(std::io::ErrorKind::UnexpectedEof))?;
         std::task::Poll::Ready(Ok(payload_len))

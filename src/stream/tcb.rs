@@ -5,7 +5,7 @@ use tokio::time::Sleep;
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum TcpState {
     SynReceived(bool), // bool means if syn/ack is sent
     Established,
@@ -14,7 +14,7 @@ pub enum TcpState {
     Closed,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(super) enum PacketStatus {
     WindowUpdate,
     Invalid,
@@ -106,8 +106,8 @@ impl Tcb {
     pub(super) fn change_state(&mut self, state: TcpState) {
         self.state = state;
     }
-    pub(super) fn get_state(&self) -> TcpState {
-        self.state.clone()
+    pub(super) fn get_state(&self) -> &TcpState {
+        &self.state
     }
     pub(super) fn change_send_window(&mut self, window: u16) {
         let avg_send_window = ((self.avg_send_window.0 * self.avg_send_window.1) + window as u64)
@@ -202,7 +202,7 @@ impl Tcb {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InflightPacket {
     pub seq: u32,
     pub payload: Vec<u8>,
@@ -222,7 +222,7 @@ impl InflightPacket {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct UnorderedPacket {
     payload: Vec<u8>,
     // pub recv_time: SystemTime, // todo

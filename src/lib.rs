@@ -132,7 +132,7 @@ where
                     if let Some(stream) = process_device_read(
                         &buffer[offset..n],
                         &mut sessions,
-                        &pkt_sender,
+                        pkt_sender.clone(),
                         &config,
                     ) {
                         accept_sender.send(stream)?;
@@ -156,7 +156,7 @@ where
 fn process_device_read(
     data: &[u8],
     sessions: &mut SessionCollection,
-    pkt_sender: &PacketSender,
+    pkt_sender: PacketSender,
     config: &IpStackConfig,
 ) -> Option<IpStackStream> {
     let Ok(packet) = NetworkPacket::parse(data) else {
@@ -171,7 +171,7 @@ fn process_device_read(
                 packet.payload,
                 &packet.ip,
                 config.mtu,
-                pkt_sender.clone(),
+                pkt_sender,
             ),
         ));
     }
@@ -198,7 +198,7 @@ fn process_device_read(
 fn create_stream(
     packet: NetworkPacket,
     config: &IpStackConfig,
-    pkt_sender: &PacketSender,
+    pkt_sender: PacketSender,
 ) -> Option<(PacketSender, IpStackStream)> {
     match packet.transport_protocol() {
         IpStackPacketProtocol::Tcp(h) => {
@@ -206,7 +206,7 @@ fn create_stream(
                 packet.src_addr(),
                 packet.dst_addr(),
                 h,
-                pkt_sender.clone(),
+                pkt_sender,
                 config.mtu,
                 config.tcp_timeout,
             ) {
@@ -226,7 +226,7 @@ fn create_stream(
                 packet.src_addr(),
                 packet.dst_addr(),
                 packet.payload,
-                pkt_sender.clone(),
+                pkt_sender,
                 config.mtu,
                 config.udp_timeout,
             );
