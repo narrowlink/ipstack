@@ -2,12 +2,13 @@ use crate::{
     error::IpStackError,
     packet::{
         tcp_flags::{ACK, FIN, NON, PSH, RST, SYN},
-        IpStackPacketProtocol, TcpHeaderWrapper, TransportHeader,
+        IpHeader, IpStackPacketProtocol, NetworkPacket, TcpHeaderWrapper, TransportHeader,
     },
-    stream::tcb::{Tcb, TcpState},
+    stream::tcb::{PacketStatus, Tcb, TcpState},
     PacketReceiver, PacketSender, DROP_TTL, TTL,
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel};
+use log::{debug, error, trace, warn};
 use std::{
     cmp,
     future::Future,
@@ -19,12 +20,6 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-
-use log::{trace, warn};
-
-use crate::packet::{IpHeader, NetworkPacket};
-
-use super::tcb::PacketStatus;
 
 #[derive(Debug)]
 enum Shutdown {
@@ -85,7 +80,7 @@ impl IpStackTcpStream {
         if !tcp.inner().rst {
             let pkt = stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
             if let Err(err) = stream.packet_sender.send(pkt) {
-                log::warn!("Error sending RST/ACK packet: {:?}", err);
+                warn!("Error sending RST/ACK packet: {:?}", err);
             }
         }
         Err(IpStackError::InvalidTcpPacket)
@@ -448,30 +443,26 @@ impl AsyncWrite for IpStackTcpStream {
         if *self.tcb.get_state() != TcpState::Established {
             return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
         }
-        if let Some(i) = self
-            .tcb
-            .retransmission
-            .and_then(|s| self.tcb.inflight_packets.iter().position(|p| p.seq == s))
-            .and_then(|p| self.tcb.inflight_packets.get(p))
-        {
-            let packet = self.create_rev_packet(PSH | ACK, TTL, i.seq, i.payload.to_vec())?;
 
-            self.packet_sender
-                .send(packet)
-                .or(Err(ErrorKind::UnexpectedEof))?;
-            self.tcb.retransmission = None;
-        } else if let Some(_i) = self.tcb.retransmission {
-            {
-                warn!("{}", _i);
-                warn!("{}", self.tcb.get_seq());
-                warn!("{}", self.tcb.get_last_ack());
-                warn!("{}", self.tcb.get_ack());
+        if let Some(s) = self.tcb.retransmission.take() {
+            if let Some(packet) = self.tcb.inflight_packets.iter().find(|p| p.seq == s) {
+                let rev_packet =
+                    self.create_rev_packet(PSH | ACK, TTL, packet.seq, packet.payload.clone())?;
+
+                self.packet_sender
+                    .send(rev_packet)
+                    .or(Err(ErrorKind::UnexpectedEof))?;
+            } else {
+                error!("Packet {} not found in inflight_packets", s);
+                debug!("seq: {}", self.tcb.get_seq());
+                debug!("last_ack: {}", self.tcb.get_last_ack());
+                debug!("ack: {}", self.tcb.get_ack());
+                debug!("inflight_packets:");
                 for p in self.tcb.inflight_packets.iter() {
-                    warn!("{}", p.seq);
-                    warn!("{}", p.payload.len());
+                    debug!("seq: {}", p.seq);
+                    debug!("payload len: {}", p.payload.len());
                 }
             }
-            panic!("Please report these values at: https://github.com/narrowlink/ipstack/");
         }
         Poll::Ready(Ok(()))
     }
@@ -496,7 +487,7 @@ impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         if let Ok(p) = self.create_rev_packet(NON, DROP_TTL, None, Vec::new()) {
             if let Err(err) = self.packet_sender.send(p) {
-                log::trace!("Error sending NON packet: {:?}", err);
+                trace!("Error sending NON packet: {:?}", err);
             }
         }
     }
