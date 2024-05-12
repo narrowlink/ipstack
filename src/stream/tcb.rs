@@ -188,7 +188,6 @@ impl Tcb {
             self.inflight_packets.retain(|p| {
                 let last_byte = p.seq.wrapping_add(p.payload.len() as u32);
                 last_byte.saturating_sub(self.last_ack) > 0
-                    && self.seq.saturating_sub(last_byte) > 0
             });
         }
     }
