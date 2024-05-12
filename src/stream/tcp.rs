@@ -454,14 +454,15 @@ impl AsyncWrite for IpStackTcpStream {
                     .or(Err(ErrorKind::UnexpectedEof))?;
             } else {
                 error!("Packet {} not found in inflight_packets", s);
-                debug!("seq: {}", self.tcb.get_seq());
-                debug!("last_ack: {}", self.tcb.get_last_ack());
-                debug!("ack: {}", self.tcb.get_ack());
-                debug!("inflight_packets:");
+                error!("seq: {}", self.tcb.get_seq());
+                error!("last_ack: {}", self.tcb.get_last_ack());
+                error!("ack: {}", self.tcb.get_ack());
+                error!("inflight_packets:");
                 for p in self.tcb.inflight_packets.iter() {
-                    debug!("seq: {}", p.seq);
-                    debug!("payload len: {}", p.payload.len());
+                    error!("seq: {}", p.seq);
+                    error!("payload len: {}", p.payload.len());
                 }
+                panic!("Please report these values at: https://github.com/narrowlink/ipstack/");
             }
         }
         Poll::Ready(Ok(()))
