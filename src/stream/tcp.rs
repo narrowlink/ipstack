@@ -8,7 +8,7 @@ use crate::{
     PacketReceiver, PacketSender, DROP_TTL, TTL,
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel};
-use log::{debug, error, trace, warn};
+use log::{error, trace, warn};
 use std::{
     cmp,
     future::Future,
