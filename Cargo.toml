@@ -18,7 +18,7 @@ tokio = { version = "1.37", features = [
     "io-util",
     "macros",
 ], default-features = false }
-etherparse = { version = "0.14", default-features = false, features = ["std"] }
+etherparse = { version = "0.15", default-features = false, features = ["std"] }
 thiserror = { version = "1.0", default-features = false }
 log = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", default-features = false, features = [
