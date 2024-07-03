@@ -108,21 +108,12 @@ impl IpStackTcpStream {
         );
 
         tcp_header.acknowledgment_number = self.tcb.get_ack();
-        if flags & SYN != 0 {
-            tcp_header.syn = true;
-        }
-        if flags & ACK != 0 {
-            tcp_header.ack = true;
-        }
-        if flags & RST != 0 {
-            tcp_header.rst = true;
-        }
-        if flags & FIN != 0 {
-            tcp_header.fin = true;
-        }
-        if flags & PSH != 0 {
-            tcp_header.psh = true;
-        }
+        tcp_header.syn = flags & SYN != 0;
+        tcp_header.ack = flags & ACK != 0;
+        tcp_header.rst = flags & RST != 0;
+        tcp_header.fin = flags & FIN != 0;
+        tcp_header.psh = flags & PSH != 0;
+    
 
         let ip_header = match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
