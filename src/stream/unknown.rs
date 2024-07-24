@@ -45,8 +45,8 @@ impl IpStackUnknownTransport {
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
-    pub fn ip_protocol(&self) -> IpNumber {
-        self.protocol
+    pub fn ip_protocol(&self) -> u8 {
+        self.protocol.0
     }
     pub fn send(&self, mut payload: Vec<u8>) -> Result<(), Error> {
         loop {
