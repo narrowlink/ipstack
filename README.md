@@ -77,11 +77,9 @@ async fn main() {
                     continue;
                 }
                 println!("unknown transport - Ip Protocol {}", u.ip_protocol().0);
-                continue;
             }
             IpStackStream::UnknownNetwork(pkt) => {
                 println!("unknown transport - {} bytes", pkt.len());
-                continue;
             }
         }
     }

@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = 'https://github.com/narrowlink/ipstack'
-# homepage = 'https://github.com/narrowlink/ipstack'
+homepage = 'https://narrowlink.com'
 readme = "README.md"
 
 [dependencies]
