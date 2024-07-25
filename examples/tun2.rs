@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "windows")]
     tun_config.platform_config(|p_cfg| {
-        p_cfg.device_guid(Some(12324323423423434234_u128));
+        p_cfg.device_guid(12324323423423434234_u128);
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
