@@ -2,7 +2,7 @@
 authors = ['Narrowlink <opensource@narrowlink.com>']
 description = 'Asynchronous lightweight userspace implementation of TCP/IP stack for Tun device'
 name = "ipstack"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = 'https://github.com/narrowlink/ipstack'
@@ -18,7 +18,7 @@ tokio = { version = "1.39", features = [
     "io-util",
     "macros",
 ], default-features = false }
-etherparse = { version = "0.15", default-features = false, features = ["std"] }
+etherparse = { version = "0.16", default-features = false, features = ["std"] }
 thiserror = { version = "1.0", default-features = false }
 log = { version = "0.4", default-features = false }
 rand = { version = "0.8.5", default-features = false, features = [
@@ -32,13 +32,13 @@ tokio = { version = "1.39", features = [
 ], default-features = false }
 clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11"
-udp-stream = { version = "0.0", default-features = false }
+udp-stream = { version = "0.0.12", default-features = false }
 
 # Benchmarks
 criterion = { version = "0.5" }
 
 #tun2.rs example
-tun2 = { version = "2.0", features = ["async"] }
+tun2 = { version = "3", features = ["async"] }
 
 #tun_wintun.rs example
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
@@ -64,7 +64,6 @@ strip = true             # Automatically strip symbols from the binary.
 opt-level = 3
 lto = false
 codegen-units = 16
-debug = true # Enable debug info for `perf(1)`
+debug = true       # Enable debug info for `perf(1)`
 incremental = true
 strip = "none"
-

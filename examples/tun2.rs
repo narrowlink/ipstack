@@ -152,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             IpStackStream::UnknownTransport(u) => {
                 let n = number;
-                if u.src_addr().is_ipv4() && IpNumber::from(u.ip_protocol()) == IpNumber::ICMP {
+                if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
                     if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
                         log::info!("#{n} ICMPv4 echo");
