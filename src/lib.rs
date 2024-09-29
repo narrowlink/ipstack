@@ -25,6 +25,7 @@ mod packet;
 pub mod stream;
 
 pub use self::error::{IpStackError, Result};
+pub use etherparse::IpNumber;
 
 const DROP_TTL: u8 = 0;
 
