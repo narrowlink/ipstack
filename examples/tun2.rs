@@ -5,7 +5,7 @@
 //!
 //! This example must be run as root or administrator privileges.
 //! ```
-//! sudo target/debug/examples/tun2 --server-addr 127.0.0.1:8080 # Linux or macOS
+//! sudo target/debug/examples/tun --server-addr 127.0.0.1:8080 # Linux or macOS
 //! ```
 //! Then please run the `echo` example server, which listens on TCP & UDP ports 127.0.0.1:8080.
 //! ```
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "windows"))]
     let gateway = Ipv4Addr::new(10, 0, 0, 1);
 
-    let mut tun_config = tun2::Configuration::default();
+    let mut tun_config = tun::Configuration::default();
     tun_config.address(ipv4).netmask(netmask).mtu(MTU).up();
     #[cfg(not(target_os = "windows"))]
     tun_config.destination(gateway); // avoid routing all traffic to tun on Windows platform
@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ipstack_config.tcp_timeout(std::time::Duration::from_secs(args.tcp_timeout));
     ipstack_config.udp_timeout(std::time::Duration::from_secs(args.udp_timeout));
 
-    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&tun_config)?);
+    let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun::create_as_async(&tun_config)?);
 
     let server_addr = args.server_addr;
 
