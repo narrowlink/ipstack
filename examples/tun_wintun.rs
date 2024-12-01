@@ -33,10 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "windows"))]
     config.destination(_gateway);
 
-    #[cfg(target_os = "linux")]
-    config.platform_config(|config| {
-        config.packet_information(true);
-    });
+    // #[cfg(target_os = "linux")]
+    // config.platform_config(|config| {
+    //     config.ensure_root_privileges(true);
+    // });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
     ipstack_config.mtu(MTU);
