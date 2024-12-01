@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.destination(_gateway);
 
     #[cfg(target_os = "linux")]
-    config.platform(|config| {
+    config.platform_config(|config| {
         config.packet_information(true);
     });
 
