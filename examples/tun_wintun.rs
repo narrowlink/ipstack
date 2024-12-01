@@ -7,7 +7,7 @@ use tokio::net::TcpStream;
 use udp_stream::UdpStream;
 
 // const MTU: u16 = 1500;
-const MTU: i32 = u16::MAX as i32;
+const MTU: u16 = u16::MAX;
 
 #[derive(Parser)]
 #[command(author, version, about = "Testing app for tun.", long_about = None)]
@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
-    ipstack_config.mtu(MTU as u16);
+    ipstack_config.mtu(MTU);
     ipstack_config.packet_information(cfg!(target_family = "unix"));
 
     #[cfg(not(target_os = "windows"))]
