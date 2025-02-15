@@ -26,3 +26,20 @@ jobs:
       run: cargo build --verbose --examples --tests --all-features
     - name: Test
       run: cargo test --all-features --examples
+
+  semver:
+    name: Check semver
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest] # macos-latest, windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check semver
+        if: ${{ !cancelled() }}
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+      - name: Abort on error
+        if: ${{ failure() }}
+        run: echo "Semver check failed" && false
