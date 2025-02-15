@@ -5,7 +5,7 @@
 //!
 //! This example must be run as root or administrator privileges.
 //! ```
-//! sudo target/debug/examples/tun --server-addr 127.0.0.1:8080 # Linux or macOS
+//! sudo target/debug/examples/tun2 --server-addr 127.0.0.1:8080 # Linux or macOS
 //! ```
 //! Then please run the `echo` example server, which listens on TCP & UDP ports 127.0.0.1:8080.
 //! ```

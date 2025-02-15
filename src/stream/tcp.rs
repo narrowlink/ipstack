@@ -178,6 +178,13 @@ impl AsyncRead for IpStackTcpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         loop {
+            if self.tcb.retransmission.is_some() {
+                self.write_notify = Some(cx.waker().clone());
+                if matches!(self.as_mut().poll_flush(cx), Poll::Pending) {
+                    return Poll::Pending;
+                }
+            }
+
             if let Some(packet) = self.packet_to_send.take() {
                 self.packet_sender
                     .send(packet)
