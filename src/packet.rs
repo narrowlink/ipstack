@@ -61,6 +61,7 @@ impl NetworkPacket {
                 IpHeader::Ipv6(ip.header().to_header()),
                 ip.payload().payload,
             ),
+            NetSlice::Arp(_) => return Err(IpStackError::UnsupportedTransportProtocol),
         };
         let (transport, payload) = match p.transport {
             Some(etherparse::TransportSlice::Tcp(h)) => {
