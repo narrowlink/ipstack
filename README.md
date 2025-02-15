@@ -12,9 +12,9 @@ Unstable, under development.
 
 ### Usage
 
-```rust
-use etherparse::{IcmpEchoHeader, Icmpv4Header, IpNumber};
-use ipstack::stream::IpStackStream;
+```rust, no_run
+use etherparse::{IcmpEchoHeader, Icmpv4Header};
+use ipstack::{stream::IpStackStream, IpNumber};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::TcpStream;
 use udp_stream::UdpStream;
@@ -24,7 +24,7 @@ async fn main() {
     const MTU: u16 = 1500;
     let ipv4 = Ipv4Addr::new(10, 0, 0, 1);
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
-    let mut config = tun2::Configuration::default();
+    let mut config = tun::Configuration::default();
     config.address(ipv4).netmask(netmask).mtu(MTU).up();
 
     #[cfg(target_os = "linux")]
@@ -40,7 +40,7 @@ async fn main() {
     let mut ipstack_config = ipstack::IpStackConfig::default();
     ipstack_config.mtu(MTU);
     let mut ip_stack =
-        ipstack::IpStack::new(ipstack_config, tun2::create_as_async(&config).unwrap());
+        ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config).unwrap());
 
     while let Ok(stream) = ip_stack.accept().await {
         match stream {
@@ -58,7 +58,7 @@ async fn main() {
                 });
             }
             IpStackStream::UnknownTransport(u) => {
-                if u.src_addr().is_ipv4() && IpNumber::from(u.ip_protocol()) == IpNumber::ICMP {
+                if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload()).unwrap();
                     if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
                         println!("ICMPv4 echo");
@@ -76,7 +76,7 @@ async fn main() {
                     }
                     continue;
                 }
-                println!("unknown transport - Ip Protocol {}", u.ip_protocol().0);
+                println!("unknown transport - Ip Protocol {:?}", u.ip_protocol());
             }
             IpStackStream::UnknownNetwork(pkt) => {
                 println!("unknown transport - {} bytes", pkt.len());

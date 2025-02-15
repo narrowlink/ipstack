@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use crate::{
     packet::IpStackPacketProtocol,
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
@@ -25,6 +27,7 @@ mod packet;
 pub mod stream;
 
 pub use self::error::{IpStackError, Result};
+pub use etherparse::IpNumber;
 
 const DROP_TTL: u8 = 0;
 
