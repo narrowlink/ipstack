@@ -93,16 +93,14 @@ pub struct IpStack {
 }
 
 impl IpStack {
-    pub fn new<D>(config: IpStackConfig, device: D) -> IpStack
+    pub fn new<Device>(config: IpStackConfig, device: Device) -> IpStack
     where
-        D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        Device: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
-        let handle = run(config, device, accept_sender);
-
         IpStack {
             accept_receiver,
-            handle,
+            handle: run(config, device, accept_sender),
         }
     }
 
@@ -114,14 +112,11 @@ impl IpStack {
     }
 }
 
-fn run<D>(
+fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     config: IpStackConfig,
-    mut device: D,
+    mut device: Device,
     accept_sender: UnboundedSender<IpStackStream>,
-) -> JoinHandle<Result<()>>
-where
-    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) -> JoinHandle<Result<()>> {
     let mut sessions: SessionCollection = AHashMap::new();
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
@@ -182,7 +177,7 @@ fn process_device_read(
     match sessions.entry(packet.network_tuple()) {
         Occupied(mut entry) => {
             if let Err(e) = entry.get().send(packet) {
-                trace!("New stream because: {}", e);
+                trace!("New stream \"{}\" because: \"{}\"", e.0.network_tuple(), e);
                 create_stream(e.0, config, pkt_sender).map(|s| {
                     entry.insert(s.0);
                     s.1

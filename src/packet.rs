@@ -8,6 +8,14 @@ pub struct NetworkTuple {
     pub dst: SocketAddr,
     pub tcp: bool,
 }
+
+impl std::fmt::Display for NetworkTuple {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tcp = if self.tcp { "TCP" } else { "UDP" };
+        write!(f, "{}: {} <> {}", tcp, self.src, self.dst)
+    }
+}
+
 pub mod tcp_flags {
     pub const CWR: u8 = 0b10000000;
     pub const ECE: u8 = 0b01000000;
