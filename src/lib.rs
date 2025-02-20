@@ -27,7 +27,8 @@ mod packet;
 pub mod stream;
 
 pub use self::error::{IpStackError, Result};
-pub use etherparse::IpNumber;
+pub use self::packet::TcpHeaderWrapper;
+pub use ::etherparse::IpNumber;
 
 const DROP_TTL: u8 = 0;
 
@@ -177,7 +178,7 @@ fn process_device_read(
     match sessions.entry(packet.network_tuple()) {
         Occupied(mut entry) => {
             if let Err(e) = entry.get().send(packet) {
-                trace!("New stream \"{}\" because: \"{}\"", e.0.network_tuple(), e);
+                log::debug!("New stream \"{}\" because: \"{}\"", e.0.network_tuple(), e);
                 create_stream(e.0, config, pkt_sender).map(|s| {
                     entry.insert(s.0);
                     s.1
@@ -210,8 +211,8 @@ fn create_stream(
             ) {
                 Ok(stream) => Some((stream.stream_sender(), IpStackStream::Tcp(stream))),
                 Err(e) => {
-                    if matches!(e, IpStackError::InvalidTcpPacket) {
-                        trace!("Invalid TCP packet");
+                    if matches!(e, IpStackError::InvalidTcpPacket(_)) {
+                        log::debug!("{e}");
                     } else {
                         error!("IpStackTcpStream::new failed \"{}\"", e);
                     }
@@ -246,7 +247,9 @@ where
     D: AsyncWrite + Unpin + 'static,
 {
     if packet.ttl() == 0 {
-        sessions.remove(&packet.reverse_network_tuple());
+        let network_tuple = packet.reverse_network_tuple();
+        sessions.remove(&network_tuple);
+        log::trace!("session removed: {}", network_tuple);
         return Ok(());
     }
     #[allow(unused_mut)]

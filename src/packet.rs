@@ -154,8 +154,47 @@ impl NetworkPacket {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct TcpHeaderWrapper {
+pub struct TcpHeaderWrapper {
     header: TcpHeader,
+}
+
+impl std::fmt::Display for TcpHeaderWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut flags = String::new();
+        if self.header.cwr {
+            flags.push_str("CWR ");
+        }
+        if self.header.ece {
+            flags.push_str("ECE ");
+        }
+        if self.header.urg {
+            flags.push_str("URG ");
+        }
+        if self.header.ack {
+            flags.push_str("ACK ");
+        }
+        if self.header.psh {
+            flags.push_str("PSH ");
+        }
+        if self.header.rst {
+            flags.push_str("RST ");
+        }
+        if self.header.syn {
+            flags.push_str("SYN ");
+        }
+        if self.header.fin {
+            flags.push_str("FIN ");
+        }
+        write!(
+            f,
+            "TcpHeader {{ src_port: {}, dst_port: {}, seq: {}, ack: {}, flags: {} }}",
+            self.header.source_port,
+            self.header.destination_port,
+            self.header.sequence_number,
+            self.header.acknowledgment_number,
+            flags.trim()
+        )
+    }
 }
 
 impl TcpHeaderWrapper {

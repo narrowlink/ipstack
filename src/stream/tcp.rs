@@ -83,7 +83,7 @@ impl IpStackTcpStream {
                 warn!("Error sending RST/ACK packet: {:?}", err);
             }
         }
-        Err(IpStackError::InvalidTcpPacket)
+        Err(IpStackError::InvalidTcpPacket(tcp.clone()))
     }
 
     fn calculate_payload_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {

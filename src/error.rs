@@ -13,8 +13,8 @@ pub enum IpStackError {
     #[error("ValueTooBigError<usize> {0}")]
     ValueTooBigErrorUsize(#[from] etherparse::err::ValueTooBigError<usize>),
 
-    #[error("Invalid Tcp packet")]
-    InvalidTcpPacket,
+    #[error("Invalid Tcp packet {0}")]
+    InvalidTcpPacket(crate::packet::TcpHeaderWrapper),
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
