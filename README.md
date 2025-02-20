@@ -5,7 +5,7 @@ An asynchronous lightweight userspace implementation of TCP/IP stack for Tun dev
 Unstable, under development.
 
 [![Crates.io](https://img.shields.io/crates/v/ipstack.svg)](https://crates.io/crates/ipstack)
-![ipstack](https://docs.rs/ipstack/badge.svg)
+[![ipstack](https://docs.rs/ipstack/badge.svg)](https://docs.rs/ipstack)
 [![Documentation](https://img.shields.io/badge/docs-release-brightgreen.svg?style=flat)](https://docs.rs/ipstack)
 [![Download](https://img.shields.io/crates/d/ipstack.svg)](https://crates.io/crates/ipstack)
 [![License](https://img.shields.io/crates/l/ipstack.svg?style=flat)](https://github.com/narrowlink/ipstack/blob/main/LICENSE)
@@ -86,4 +86,4 @@ async fn main() {
 }
 ```
 
-We also suggest that you take a look at the complete [examples](examples).
+We also suggest that you take a look at the complete [examples](./examples).

@@ -179,18 +179,20 @@ fn process_device_read(
         Occupied(mut entry) => {
             if let Err(e) = entry.get().send(packet) {
                 log::debug!("New stream \"{}\" because: \"{}\"", e.0.network_tuple(), e);
-                create_stream(e.0, config, pkt_sender).map(|s| {
-                    entry.insert(s.0);
-                    s.1
+                create_stream(e.0, config, pkt_sender).map(|(packet_sender, ip_stack_stream)| {
+                    entry.insert(packet_sender);
+                    ip_stack_stream
                 })
             } else {
                 None
             }
         }
-        Vacant(entry) => create_stream(packet, config, pkt_sender).map(|s| {
-            entry.insert(s.0);
-            s.1
-        }),
+        Vacant(entry) => {
+            create_stream(packet, config, pkt_sender).map(|(packet_sender, ip_stack_stream)| {
+                entry.insert(packet_sender);
+                ip_stack_stream
+            })
+        }
     }
 }
 

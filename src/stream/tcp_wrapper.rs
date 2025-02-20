@@ -105,10 +105,13 @@ impl tokio::io::AsyncWrite for IpStackTcpStream {
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         if let Some(mut inner) = self.inner.take() {
+            let local_addr = self.local_addr();
+            let peer_addr = self.peer_addr();
             tokio::spawn(async move {
                 if let Err(err) = timeout(Duration::from_secs(2), inner.shutdown()).await {
                     log::warn!("Error while dropping IpStackTcpStream: {:?}", err);
                 }
+                log::trace!("TCP Stream closed: {} -> {}", local_addr, peer_addr);
             });
         }
     }

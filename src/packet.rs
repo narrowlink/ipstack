@@ -12,7 +12,7 @@ pub struct NetworkTuple {
 impl std::fmt::Display for NetworkTuple {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tcp = if self.tcp { "TCP" } else { "UDP" };
-        write!(f, "{}: {} <> {}", tcp, self.src, self.dst)
+        write!(f, "{} {} -> {}", tcp, self.src, self.dst)
     }
 }
 
