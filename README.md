@@ -34,7 +34,7 @@ async fn main() {
 
     #[cfg(target_os = "windows")]
     config.platform_config(|config| {
-        config.device_guid(Some(12324323423423434234_u128));
+        config.device_guid(12324323423423434234_u128);
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
@@ -51,7 +51,7 @@ async fn main() {
                 });
             }
             IpStackStream::Udp(mut udp) => {
-                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+                let addr: SocketAddr = "1.1.1.1:53".parse().unwrap();
                 let mut rhs = UdpStream::connect(addr).await.unwrap();
                 tokio::spawn(async move {
                     let _ = tokio::io::copy_bidirectional(&mut udp, &mut rhs).await;
@@ -60,12 +60,8 @@ async fn main() {
             IpStackStream::UnknownTransport(u) => {
                 if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload()).unwrap();
-                    if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
+                    if let etherparse::Icmpv4Type::EchoRequest(echo) = icmp_header.icmp_type {
                         println!("ICMPv4 echo");
-                        let echo = IcmpEchoHeader {
-                            id: req.id,
-                            seq: req.seq,
-                        };
                         let mut resp = Icmpv4Header::new(etherparse::Icmpv4Type::EchoReply(echo));
                         resp.update_checksum(req_payload);
                         let mut payload = resp.to_bytes().to_vec();

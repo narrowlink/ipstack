@@ -45,7 +45,7 @@ pub(crate) struct IpStackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     stream_receiver: PacketReceiver,
-    packet_sender: PacketSender,
+    up_packet_sender: PacketSender,
     packet_to_send: Option<NetworkPacket>,
     tcb: Tcb,
     mtu: u16,
@@ -58,7 +58,7 @@ impl IpStackTcpStream {
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         tcp: TcpHeaderWrapper,
-        packet_sender: PacketSender,
+        up_packet_sender: PacketSender,
         stream_receiver: PacketReceiver,
         mtu: u16,
         tcp_timeout: Duration,
@@ -67,7 +67,7 @@ impl IpStackTcpStream {
             src_addr,
             dst_addr,
             stream_receiver,
-            packet_sender,
+            up_packet_sender,
             packet_to_send: None,
             tcb: Tcb::new(tcp.inner().sequence_number + 1, tcp_timeout),
             mtu,
@@ -79,7 +79,7 @@ impl IpStackTcpStream {
         }
         if !tcp.inner().rst {
             let pkt = stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
-            if let Err(err) = stream.packet_sender.send(pkt) {
+            if let Err(err) = stream.up_packet_sender.send(pkt) {
                 warn!("Error sending RST/ACK packet: {:?}", err);
             }
         }
@@ -169,7 +169,7 @@ impl AsyncRead for IpStackTcpStream {
             }
 
             if let Some(packet) = self.packet_to_send.take() {
-                self.packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
             }
             if self.tcb.get_state() == TcpState::Closed {
                 self.shutdown.ready();
@@ -188,7 +188,7 @@ impl AsyncRead for IpStackTcpStream {
 
             if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
                 trace!("timeout reached for {:?}", self.dst_addr);
-                self.packet_sender
+                self.up_packet_sender
                     .send(self.create_rev_packet(RST | ACK, TTL, None, Vec::new())?)
                     .or(Err(ErrorKind::UnexpectedEof))?;
                 self.tcb.change_state(TcpState::Closed);
@@ -207,7 +207,7 @@ impl AsyncRead for IpStackTcpStream {
             if let Some(b) = self.tcb.get_unordered_packets().filter(|_| matches!(self.shutdown, Shutdown::None)) {
                 self.tcb.add_ack(b.len() as u32);
                 buf.put_slice(&b);
-                self.packet_sender
+                self.up_packet_sender
                     .send(self.create_rev_packet(ACK, TTL, None, Vec::new())?)
                     .or(Err(ErrorKind::UnexpectedEof))?;
                 return Poll::Ready(Ok(()));
@@ -380,7 +380,7 @@ impl AsyncWrite for IpStackTcpStream {
         let seq = self.tcb.get_seq();
         let payload_len = packet.payload.len();
         let payload = packet.payload.clone();
-        self.packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+        self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
         self.tcb.add_inflight_packet(seq, payload);
 
         Poll::Ready(Ok(payload_len))
@@ -395,7 +395,7 @@ impl AsyncWrite for IpStackTcpStream {
             if let Some(packet) = self.tcb.inflight_packets.iter().find(|p| p.seq == s) {
                 let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq, packet.payload.clone())?;
 
-                self.packet_sender.send(rev_packet).or(Err(ErrorKind::UnexpectedEof))?;
+                self.up_packet_sender.send(rev_packet).or(Err(ErrorKind::UnexpectedEof))?;
             } else {
                 error!("Packet {} not found in inflight_packets", s);
                 error!("seq: {}", self.tcb.get_seq());
@@ -425,7 +425,7 @@ impl AsyncWrite for IpStackTcpStream {
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         if let Ok(p) = self.create_rev_packet(NON, DROP_TTL, None, Vec::new()) {
-            if let Err(err) = self.packet_sender.send(p) {
+            if let Err(err) = self.up_packet_sender.send(p) {
                 trace!("Error sending NON packet: {:?}", err);
             }
         }

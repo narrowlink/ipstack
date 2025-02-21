@@ -170,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             IpStackStream::UnknownNetwork(pkt) => {
-                log::info!("#{number} unknown transport - {} bytes", pkt.len());
+                log::info!("#{number} unknown network - {} bytes", pkt.len());
                 continue;
             }
         };

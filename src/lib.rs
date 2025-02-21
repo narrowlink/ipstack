@@ -5,7 +5,6 @@ use crate::{
     stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
 };
 use ahash::AHashMap;
-use log::{error, trace};
 use packet::{NetworkPacket, NetworkTuple};
 use std::{
     collections::hash_map::Entry::{Occupied, Vacant},
@@ -119,22 +118,23 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
     let mut buffer = [0_u8; u16::MAX as usize + 4];
-    let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
+    let (up_pkt_sender, mut up_pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
     tokio::spawn(async move {
         loop {
             select! {
                 Ok(n) = device.read(&mut buffer) => {
-                    if let Some(stream) = process_device_read(
+                    if let Err(e) = process_device_read(
                         &buffer[offset..n],
                         &mut sessions,
-                        pkt_sender.clone(),
+                        up_pkt_sender.clone(),
                         &config,
-                    ) {
-                        accept_sender.send(stream)?;
+                        &accept_sender,
+                    )  {
+                        log::debug!("process_device_read error: {}", e);
                     }
                 }
-                Some(packet) = pkt_receiver.recv() => {
+                Some(packet) = up_pkt_receiver.recv() => {
                     process_upstream_recv(
                         packet,
                         &mut sessions,
@@ -152,68 +152,61 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 fn process_device_read(
     data: &[u8],
     sessions: &mut SessionCollection,
-    pkt_sender: PacketSender,
+    up_pkt_sender: PacketSender,
     config: &IpStackConfig,
-) -> Option<IpStackStream> {
+    accept_sender: &UnboundedSender<IpStackStream>,
+) -> Result<()> {
     let Ok(packet) = NetworkPacket::parse(data) else {
-        return Some(IpStackStream::UnknownNetwork(data.to_owned()));
+        let stream = IpStackStream::UnknownNetwork(data.to_owned());
+        accept_sender.send(stream)?;
+        return Ok(());
     };
 
     if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
-        return Some(IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
+        let stream = IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
             packet.src_addr().ip(),
             packet.dst_addr().ip(),
             packet.payload,
             &packet.ip,
             config.mtu,
-            pkt_sender,
-        )));
+            up_pkt_sender,
+        ));
+        accept_sender.send(stream)?;
+        return Ok(());
     }
 
-    match sessions.entry(packet.network_tuple()) {
+    let network_tuple = packet.network_tuple();
+    match sessions.entry(network_tuple) {
         Occupied(mut entry) => {
             if let Err(e) = entry.get().send(packet) {
-                log::debug!("New stream \"{}\" because: \"{}\"", e.0.network_tuple(), e);
-                create_stream(e.0, config, pkt_sender).map(|(packet_sender, ip_stack_stream)| {
-                    entry.insert(packet_sender);
-                    ip_stack_stream
-                })
+                log::debug!("New stream \"{}\" because: \"{}\"", network_tuple, e);
+                let (packet_sender, ip_stack_stream) = create_stream(e.0, config, up_pkt_sender)?;
+                entry.insert(packet_sender);
+                accept_sender.send(ip_stack_stream)?;
             } else {
-                None
+                log::trace!("packet sent to stream: {}", network_tuple);
             }
         }
-        Vacant(entry) => create_stream(packet, config, pkt_sender).map(|(packet_sender, ip_stack_stream)| {
+        Vacant(entry) => {
+            let (packet_sender, ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
             entry.insert(packet_sender);
-            ip_stack_stream
-        }),
+            accept_sender.send(ip_stack_stream)?;
+        }
     }
+    Ok(())
 }
 
-fn create_stream(packet: NetworkPacket, config: &IpStackConfig, pkt_sender: PacketSender) -> Option<(PacketSender, IpStackStream)> {
+fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: PacketSender) -> Result<(PacketSender, IpStackStream)> {
+    let src_addr = packet.src_addr();
+    let dst_addr = packet.dst_addr();
     match packet.transport_protocol() {
         IpStackPacketProtocol::Tcp(h) => {
-            match IpStackTcpStream::new(packet.src_addr(), packet.dst_addr(), h, pkt_sender, config.mtu, config.tcp_timeout) {
-                Ok(stream) => Some((stream.stream_sender(), IpStackStream::Tcp(stream))),
-                Err(e) => {
-                    if matches!(e, IpStackError::InvalidTcpPacket(_)) {
-                        log::debug!("{e}");
-                    } else {
-                        error!("IpStackTcpStream::new failed \"{}\"", e);
-                    }
-                    None
-                }
-            }
+            let stream = IpStackTcpStream::new(src_addr, dst_addr, h, up_pkt_sender, cfg.mtu, cfg.tcp_timeout)?;
+            Ok((stream.stream_sender(), IpStackStream::Tcp(stream)))
         }
         IpStackPacketProtocol::Udp => {
-            let stream = IpStackUdpStream::new(
-                packet.src_addr(),
-                packet.dst_addr(),
-                packet.payload,
-                pkt_sender,
-                config.mtu,
-                config.udp_timeout,
-            );
-            Some((stream.stream_sender(), IpStackStream::Udp(stream)))
+            let stream = IpStackUdpStream::new(src_addr, dst_addr, packet.payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout);
+            Ok((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
         IpStackPacketProtocol::Unknown => {
             unreachable!()
@@ -221,36 +214,33 @@ fn create_stream(packet: NetworkPacket, config: &IpStackConfig, pkt_sender: Pack
     }
 }
 
-async fn process_upstream_recv<D>(
-    packet: NetworkPacket,
+async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
+    up_packet: NetworkPacket,
     sessions: &mut SessionCollection,
-    device: &mut D,
+    device: &mut Device,
     #[cfg(unix)] packet_information: bool,
-) -> Result<()>
-where
-    D: AsyncWrite + Unpin + 'static,
-{
-    if packet.ttl() == 0 {
-        let network_tuple = packet.reverse_network_tuple();
+) -> Result<()> {
+    if up_packet.ttl() == DROP_TTL {
+        let network_tuple = up_packet.reverse_network_tuple();
         sessions.remove(&network_tuple);
         log::trace!("session removed: {}", network_tuple);
         return Ok(());
     }
     #[allow(unused_mut)]
-    let Ok(mut packet_bytes) = packet.to_bytes() else {
-        trace!("to_bytes error");
+    let Ok(mut packet_bytes) = up_packet.to_bytes() else {
+        log::trace!("to_bytes error");
         return Ok(());
     };
     #[cfg(unix)]
     if packet_information {
-        if packet.src_addr().is_ipv4() {
+        if up_packet.src_addr().is_ipv4() {
             packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
         } else {
             packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
         }
     }
     device.write_all(&packet_bytes).await?;
-    // device.flush().await.unwrap();
+    // device.flush().await?;
 
     Ok(())
 }
