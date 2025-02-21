@@ -71,15 +71,10 @@ impl Tcb {
         if seq < self.ack {
             return;
         }
-        self.unordered_packets
-            .insert(seq, UnorderedPacket::new(buf));
+        self.unordered_packets.insert(seq, UnorderedPacket::new(buf));
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        READ_BUFFER_SIZE.saturating_sub(
-            self.unordered_packets
-                .iter()
-                .fold(0, |acc, (_, p)| acc + p.payload.len()),
-        )
+        READ_BUFFER_SIZE.saturating_sub(self.unordered_packets.iter().fold(0, |acc, (_, p)| acc + p.payload.len()))
     }
     pub(super) fn get_unordered_packets(&mut self) -> Option<Vec<u8>> {
         // dbg!(self.ack);
@@ -110,8 +105,7 @@ impl Tcb {
         self.state
     }
     pub(super) fn change_send_window(&mut self, window: u16) {
-        let avg_send_window = ((self.avg_send_window.0 * self.avg_send_window.1) + window as u64)
-            / (self.avg_send_window.1 + 1);
+        let avg_send_window = ((self.avg_send_window.0 * self.avg_send_window.1) + window as u64) / (self.avg_send_window.1 + 1);
         self.avg_send_window.0 = avg_send_window;
         self.avg_send_window.1 += 1;
         self.send_window = window;
@@ -147,8 +141,7 @@ impl Tcb {
 
         let current_ack_distance = self.seq.wrapping_sub(self.last_ack);
         if received_ack_distance > current_ack_distance
-            || (tcp_header.acknowledgment_number != self.seq
-                && self.seq.saturating_sub(tcp_header.acknowledgment_number) == 0)
+            || (tcp_header.acknowledgment_number != self.seq && self.seq.saturating_sub(tcp_header.acknowledgment_number) == 0)
         {
             PacketStatus::Invalid
         } else if self.last_ack == tcp_header.acknowledgment_number {

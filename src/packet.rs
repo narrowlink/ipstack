@@ -61,32 +61,18 @@ impl NetworkPacket {
         let ip = p.net.ok_or(IpStackError::InvalidPacket)?;
 
         let (ip, ip_payload) = match ip {
-            NetSlice::Ipv4(ip) => (
-                IpHeader::Ipv4(ip.header().to_header()),
-                ip.payload().payload,
-            ),
-            NetSlice::Ipv6(ip) => (
-                IpHeader::Ipv6(ip.header().to_header()),
-                ip.payload().payload,
-            ),
+            NetSlice::Ipv4(ip) => (IpHeader::Ipv4(ip.header().to_header()), ip.payload().payload),
+            NetSlice::Ipv6(ip) => (IpHeader::Ipv6(ip.header().to_header()), ip.payload().payload),
             NetSlice::Arp(_) => return Err(IpStackError::UnsupportedTransportProtocol),
         };
         let (transport, payload) = match p.transport {
-            Some(etherparse::TransportSlice::Tcp(h)) => {
-                (TransportHeader::Tcp(h.to_header()), h.payload())
-            }
-            Some(etherparse::TransportSlice::Udp(u)) => {
-                (TransportHeader::Udp(u.to_header()), u.payload())
-            }
+            Some(etherparse::TransportSlice::Tcp(h)) => (TransportHeader::Tcp(h.to_header()), h.payload()),
+            Some(etherparse::TransportSlice::Udp(u)) => (TransportHeader::Udp(u.to_header()), u.payload()),
             _ => (TransportHeader::Unknown, ip_payload),
         };
         let payload = payload.to_vec();
 
-        Ok(NetworkPacket {
-            ip,
-            transport,
-            payload,
-        })
+        Ok(NetworkPacket { ip, transport, payload })
     }
     pub(crate) fn transport_protocol(&self) -> IpStackPacketProtocol {
         match self.transport {
@@ -235,9 +221,7 @@ impl TcpHeaderWrapper {
 
 impl From<&TcpHeader> for TcpHeaderWrapper {
     fn from(header: &TcpHeader) -> Self {
-        TcpHeaderWrapper {
-            header: header.clone(),
-        }
+        TcpHeaderWrapper { header: header.clone() }
     }
 }
 

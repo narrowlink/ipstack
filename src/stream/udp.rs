@@ -55,19 +55,12 @@ impl IpStackUdpStream {
         const UHS: usize = 8; // udp header size is 8
         match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, dst.octets(), src.octets())
-                    .map_err(IpStackError::from)?;
+                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, dst.octets(), src.octets()).map_err(IpStackError::from)?;
                 let line_buffer = self.mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
                 payload.truncate(line_buffer as usize);
-                ip_h.set_payload_len(payload.len() + UHS)
+                ip_h.set_payload_len(payload.len() + UHS).map_err(IpStackError::from)?;
+                let udp_header = UdpHeader::with_ipv4_checksum(self.dst_addr.port(), self.src_addr.port(), &ip_h, &payload)
                     .map_err(IpStackError::from)?;
-                let udp_header = UdpHeader::with_ipv4_checksum(
-                    self.dst_addr.port(),
-                    self.src_addr.port(),
-                    &ip_h,
-                    &payload,
-                )
-                .map_err(IpStackError::from)?;
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Udp(udp_header),
@@ -89,13 +82,8 @@ impl IpStackUdpStream {
                 payload.truncate(line_buffer as usize);
 
                 ip_h.payload_length = (payload.len() + UHS) as u16;
-                let udp_header = UdpHeader::with_ipv6_checksum(
-                    self.dst_addr.port(),
-                    self.src_addr.port(),
-                    &ip_h,
-                    &payload,
-                )
-                .map_err(IpStackError::from)?;
+                let udp_header = UdpHeader::with_ipv6_checksum(self.dst_addr.port(), self.src_addr.port(), &ip_h, &payload)
+                    .map_err(IpStackError::from)?;
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Udp(udp_header),
@@ -148,31 +136,19 @@ impl AsyncRead for IpStackUdpStream {
 }
 
 impl AsyncWrite for IpStackUdpStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
         self.reset_timeout();
         let packet = self.create_rev_packet(TTL, buf.to_vec())?;
         let payload_len = packet.payload.len();
-        self.pkt_sender
-            .send(packet)
-            .or(Err(std::io::ErrorKind::UnexpectedEof))?;
+        self.pkt_sender.send(packet).or(Err(std::io::ErrorKind::UnexpectedEof))?;
         std::task::Poll::Ready(Ok(payload_len))
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
     }
 }

@@ -106,10 +106,7 @@ impl IpStack {
     }
 
     pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
-        self.accept_receiver
-            .recv()
-            .await
-            .ok_or(IpStackError::AcceptError)
+        self.accept_receiver.recv().await.ok_or(IpStackError::AcceptError)
     }
 }
 
@@ -163,16 +160,14 @@ fn process_device_read(
     };
 
     if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
-        return Some(IpStackStream::UnknownTransport(
-            IpStackUnknownTransport::new(
-                packet.src_addr().ip(),
-                packet.dst_addr().ip(),
-                packet.payload,
-                &packet.ip,
-                config.mtu,
-                pkt_sender,
-            ),
-        ));
+        return Some(IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
+            packet.src_addr().ip(),
+            packet.dst_addr().ip(),
+            packet.payload,
+            &packet.ip,
+            config.mtu,
+            pkt_sender,
+        )));
     }
 
     match sessions.entry(packet.network_tuple()) {
@@ -187,30 +182,17 @@ fn process_device_read(
                 None
             }
         }
-        Vacant(entry) => {
-            create_stream(packet, config, pkt_sender).map(|(packet_sender, ip_stack_stream)| {
-                entry.insert(packet_sender);
-                ip_stack_stream
-            })
-        }
+        Vacant(entry) => create_stream(packet, config, pkt_sender).map(|(packet_sender, ip_stack_stream)| {
+            entry.insert(packet_sender);
+            ip_stack_stream
+        }),
     }
 }
 
-fn create_stream(
-    packet: NetworkPacket,
-    config: &IpStackConfig,
-    pkt_sender: PacketSender,
-) -> Option<(PacketSender, IpStackStream)> {
+fn create_stream(packet: NetworkPacket, config: &IpStackConfig, pkt_sender: PacketSender) -> Option<(PacketSender, IpStackStream)> {
     match packet.transport_protocol() {
         IpStackPacketProtocol::Tcp(h) => {
-            match IpStackTcpStream::new(
-                packet.src_addr(),
-                packet.dst_addr(),
-                h,
-                pkt_sender,
-                config.mtu,
-                config.tcp_timeout,
-            ) {
+            match IpStackTcpStream::new(packet.src_addr(), packet.dst_addr(), h, pkt_sender, config.mtu, config.tcp_timeout) {
                 Ok(stream) => Some((stream.stream_sender(), IpStackStream::Tcp(stream))),
                 Err(e) => {
                     if matches!(e, IpStackError::InvalidTcpPacket(_)) {
