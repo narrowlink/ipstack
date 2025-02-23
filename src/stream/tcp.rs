@@ -2,7 +2,7 @@ use crate::{
     error::IpStackError,
     packet::{
         tcp_flags::{ACK, FIN, NON, PSH, RST, SYN},
-        IpHeader, IpStackPacketProtocol, NetworkPacket, TcpHeaderWrapper, TransportHeader,
+        IpHeader, NetworkPacket, TcpHeaderWrapper, TransportHeader,
     },
     stream::tcb::{PacketStatus, Tcb, TcpState},
     PacketReceiver, PacketSender, DROP_TTL, TTL,
@@ -229,9 +229,10 @@ impl AsyncRead for IpStackTcpStream {
             }
             match self.stream_receiver.poll_recv(cx) {
                 Poll::Ready(Some(p)) => {
-                    let IpStackPacketProtocol::Tcp(t) = p.transport_protocol() else {
+                    let TransportHeader::Tcp(tcp_header) = p.transport_header() else {
                         unreachable!()
                     };
+                    let t: TcpHeaderWrapper = tcp_header.into();
                     if t.flags() & RST != 0 {
                         self.packet_to_send = Some(self.create_rev_packet(NON, DROP_TTL, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);

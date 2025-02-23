@@ -1,11 +1,8 @@
 #![doc = include_str!("../README.md")]
 
-use crate::{
-    packet::IpStackPacketProtocol,
-    stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
-};
+use crate::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 use ahash::AHashMap;
-use packet::{NetworkPacket, NetworkTuple};
+use packet::{NetworkPacket, NetworkTuple, TransportHeader};
 use std::{
     collections::hash_map::Entry::{Occupied, Vacant},
     time::Duration,
@@ -162,7 +159,7 @@ fn process_device_read(
         return Ok(());
     };
 
-    if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
+    if let TransportHeader::Unknown = packet.transport_header() {
         let stream = IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
             packet.src_addr().ip(),
             packet.dst_addr().ip(),
@@ -199,16 +196,17 @@ fn process_device_read(
 fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: PacketSender) -> Result<(PacketSender, IpStackStream)> {
     let src_addr = packet.src_addr();
     let dst_addr = packet.dst_addr();
-    match packet.transport_protocol() {
-        IpStackPacketProtocol::Tcp(h) => {
+    match packet.transport_header() {
+        TransportHeader::Tcp(h) => {
+            let h: TcpHeaderWrapper = h.into();
             let stream = IpStackTcpStream::new(src_addr, dst_addr, h, up_pkt_sender, cfg.mtu, cfg.tcp_timeout)?;
             Ok((stream.stream_sender(), IpStackStream::Tcp(stream)))
         }
-        IpStackPacketProtocol::Udp => {
+        TransportHeader::Udp(_) => {
             let stream = IpStackUdpStream::new(src_addr, dst_addr, packet.payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout);
             Ok((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
-        IpStackPacketProtocol::Unknown => {
+        TransportHeader::Unknown => {
             unreachable!()
         }
     }

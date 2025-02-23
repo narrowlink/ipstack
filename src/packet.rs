@@ -29,13 +29,6 @@ pub mod tcp_flags {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum IpStackPacketProtocol {
-    Tcp(TcpHeaderWrapper),
-    Unknown,
-    Udp,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) enum IpHeader {
     Ipv4(Ipv4Header),
     Ipv6(Ipv6Header),
@@ -74,12 +67,8 @@ impl NetworkPacket {
 
         Ok(NetworkPacket { ip, transport, payload })
     }
-    pub(crate) fn transport_protocol(&self) -> IpStackPacketProtocol {
-        match self.transport {
-            TransportHeader::Udp(_) => IpStackPacketProtocol::Udp,
-            TransportHeader::Tcp(ref h) => IpStackPacketProtocol::Tcp(h.into()),
-            _ => IpStackPacketProtocol::Unknown,
-        }
+    pub(crate) fn transport_header(&self) -> &TransportHeader {
+        &self.transport
     }
     pub fn src_addr(&self) -> SocketAddr {
         let port = match &self.transport {
