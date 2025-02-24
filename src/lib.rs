@@ -16,7 +16,7 @@ use tokio::{
 
 pub(crate) type PacketSender = UnboundedSender<NetworkPacket>;
 pub(crate) type PacketReceiver = UnboundedReceiver<NetworkPacket>;
-pub(crate) type SessionCollection = AHashMap<NetworkTuple, PacketSender>;
+pub(crate) type SessionCollection = std::sync::Arc<tokio::sync::Mutex<AHashMap<NetworkTuple, PacketSender>>>;
 
 mod error;
 mod packet;
@@ -111,7 +111,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut device: Device,
     accept_sender: UnboundedSender<IpStackStream>,
 ) -> JoinHandle<Result<()>> {
-    let mut sessions: SessionCollection = AHashMap::new();
+    let sessions: SessionCollection = std::sync::Arc::new(tokio::sync::Mutex::new(AHashMap::new()));
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
     let mut buffer = [0_u8; u16::MAX as usize + 4];
@@ -123,18 +123,18 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 Ok(n) = device.read(&mut buffer) => {
                     if let Err(e) = process_device_read(
                         &buffer[offset..n],
-                        &mut sessions,
+                        sessions.clone(),
                         up_pkt_sender.clone(),
                         &config,
                         &accept_sender,
-                    )  {
+                    ).await  {
                         log::debug!("process_device_read error: {}", e);
                     }
                 }
                 Some(packet) = up_pkt_receiver.recv() => {
                     process_upstream_recv(
                         packet,
-                        &mut sessions,
+                        sessions.clone(),
                         &mut device,
                         #[cfg(unix)]
                         pi,
@@ -146,9 +146,9 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     })
 }
 
-fn process_device_read(
+async fn process_device_read(
     data: &[u8],
-    sessions: &mut SessionCollection,
+    sessions: SessionCollection,
     up_pkt_sender: PacketSender,
     config: &IpStackConfig,
     accept_sender: &UnboundedSender<IpStackStream>,
@@ -172,20 +172,25 @@ fn process_device_read(
         return Ok(());
     }
 
+    let sessions_clone = sessions.clone();
     let network_tuple = packet.network_tuple();
-    match sessions.entry(network_tuple) {
-        Occupied(mut entry) => {
-            if let Err(e) = entry.get().send(packet) {
-                log::debug!("New stream \"{}\" because: \"{}\"", network_tuple, e);
-                let (packet_sender, ip_stack_stream) = create_stream(e.0, config, up_pkt_sender)?;
-                entry.insert(packet_sender);
-                accept_sender.send(ip_stack_stream)?;
-            } else {
-                log::trace!("packet sent to stream: {}", network_tuple);
-            }
+    match sessions.lock().await.entry(network_tuple) {
+        Occupied(entry) => {
+            use std::io::{Error, ErrorKind::Other};
+            entry.get().send(packet).map_err(|e| Error::new(Other, e))?;
+            log::trace!("packet sent to stream: {}", network_tuple);
         }
         Vacant(entry) => {
-            let (packet_sender, ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
+            let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
+            if let IpStackStream::Udp(ref mut stream) = ip_stack_stream {
+                let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                stream.set_destroy_messenger(tx);
+                tokio::spawn(async move {
+                    rx.await.ok();
+                    sessions_clone.lock().await.remove(&network_tuple);
+                    log::trace!("session removed: {}", network_tuple);
+                });
+            }
             entry.insert(packet_sender);
             accept_sender.send(ip_stack_stream)?;
         }
@@ -214,13 +219,13 @@ fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: Pack
 
 async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
     up_packet: NetworkPacket,
-    sessions: &mut SessionCollection,
+    sessions: SessionCollection,
     device: &mut Device,
     #[cfg(unix)] packet_information: bool,
 ) -> Result<()> {
     if up_packet.ttl() == DROP_TTL {
         let network_tuple = up_packet.reverse_network_tuple();
-        sessions.remove(&network_tuple);
+        sessions.lock().await.remove(&network_tuple);
         log::trace!("session removed: {}", network_tuple);
         return Ok(());
     }

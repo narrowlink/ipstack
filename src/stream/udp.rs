@@ -6,11 +6,10 @@ use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
 use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::Sleep,
 };
 
-#[derive(Debug)]
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
@@ -21,6 +20,7 @@ pub struct IpStackUdpStream {
     timeout: Pin<Box<Sleep>>,
     udp_timeout: Duration,
     mtu: u16,
+    destroy_messenger: Option<oneshot::Sender<()>>,
 }
 
 impl IpStackUdpStream {
@@ -44,7 +44,12 @@ impl IpStackUdpStream {
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             udp_timeout,
             mtu,
+            destroy_messenger: None,
         }
+    }
+
+    pub(crate) fn set_destroy_messenger(&mut self, messenger: oneshot::Sender<()>) {
+        self.destroy_messenger = Some(messenger);
     }
 
     pub(crate) fn stream_sender(&self) -> PacketSender {
@@ -150,5 +155,13 @@ impl AsyncWrite for IpStackUdpStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for IpStackUdpStream {
+    fn drop(&mut self) {
+        if let Some(messenger) = self.destroy_messenger.take() {
+            let _ = messenger.send(());
+        }
     }
 }
