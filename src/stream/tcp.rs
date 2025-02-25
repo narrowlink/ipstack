@@ -62,7 +62,7 @@ impl IpStackTcpStream {
         up_packet_sender: PacketSender,
         stream_receiver: PacketReceiver,
         mtu: u16,
-        tcp_timeout: Duration,
+        timeout_interval: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
         let stream = IpStackTcpStream {
             src_addr,
@@ -70,7 +70,7 @@ impl IpStackTcpStream {
             stream_receiver,
             up_packet_sender,
             packet_to_send: None,
-            tcb: Tcb::new(SeqNum(tcp.inner().sequence_number) + 1, tcp_timeout),
+            tcb: Tcb::new(SeqNum(tcp.inner().sequence_number) + 1, timeout_interval),
             mtu,
             shutdown: Shutdown::None,
             write_notify: None,

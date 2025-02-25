@@ -18,7 +18,7 @@ pub struct IpStackUdpStream {
     up_pkt_sender: PacketSender,
     first_payload: Option<Vec<u8>>,
     timeout: Pin<Box<Sleep>>,
-    udp_timeout: Duration,
+    timeout_interval: Duration,
     mtu: u16,
     destroy_messenger: Option<oneshot::Sender<()>>,
 }
@@ -30,10 +30,10 @@ impl IpStackUdpStream {
         payload: Vec<u8>,
         up_pkt_sender: PacketSender,
         mtu: u16,
-        udp_timeout: Duration,
+        timeout_interval: Duration,
     ) -> Self {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
-        let deadline = tokio::time::Instant::now() + udp_timeout;
+        let deadline = tokio::time::Instant::now() + timeout_interval;
         IpStackUdpStream {
             src_addr,
             dst_addr,
@@ -42,7 +42,7 @@ impl IpStackUdpStream {
             up_pkt_sender,
             first_payload: Some(payload),
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
-            udp_timeout,
+            timeout_interval,
             mtu,
             destroy_messenger: None,
         }
@@ -108,7 +108,7 @@ impl IpStackUdpStream {
     }
 
     fn reset_timeout(&mut self) {
-        let deadline = tokio::time::Instant::now() + self.udp_timeout;
+        let deadline = tokio::time::Instant::now() + self.timeout_interval;
         self.timeout.as_mut().reset(deadline);
     }
 }

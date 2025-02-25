@@ -20,10 +20,10 @@ impl IpStackTcpStream {
         tcp: TcpHeaderWrapper,
         pkt_sender: PacketSender,
         mtu: u16,
-        tcp_timeout: Duration,
+        timeout_interval: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
-        IpStackTcpStreamInner::new(local_addr, peer_addr, tcp, pkt_sender, stream_receiver, mtu, tcp_timeout).map(|inner| {
+        IpStackTcpStreamInner::new(local_addr, peer_addr, tcp, pkt_sender, stream_receiver, mtu, timeout_interval).map(|inner| {
             IpStackTcpStream {
                 inner: Some(Box::new(inner)),
                 peer_addr,
