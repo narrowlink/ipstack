@@ -4,6 +4,7 @@ pub use self::tcp_wrapper::IpStackTcpStream;
 pub use self::udp::IpStackUdpStream;
 pub use self::unknown::IpStackUnknownTransport;
 
+mod seqnum;
 mod tcb;
 mod tcp;
 mod tcp_wrapper;

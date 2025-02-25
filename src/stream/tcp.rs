@@ -1,3 +1,4 @@
+use super::seqnum::SeqNum;
 use crate::{
     error::IpStackError,
     packet::{
@@ -69,7 +70,7 @@ impl IpStackTcpStream {
             stream_receiver,
             up_packet_sender,
             packet_to_send: None,
-            tcb: Tcb::new(tcp.inner().sequence_number + 1, tcp_timeout),
+            tcb: Tcb::new(SeqNum(tcp.inner().sequence_number) + 1, tcp_timeout),
             mtu,
             shutdown: Shutdown::None,
             write_notify: None,
@@ -97,11 +98,11 @@ impl IpStackTcpStream {
         let mut tcp_header = etherparse::TcpHeader::new(
             self.dst_addr.port(),
             self.src_addr.port(),
-            seq.into().unwrap_or(self.tcb.get_seq()),
+            seq.into().unwrap_or(self.tcb.get_seq().0),
             self.tcb.get_recv_window(),
         );
 
-        tcp_header.acknowledgment_number = self.tcb.get_ack();
+        tcp_header.acknowledgment_number = self.tcb.get_ack().0;
         tcp_header.syn = flags & SYN != 0;
         tcp_header.ack = flags & ACK != 0;
         tcp_header.rst = flags & RST != 0;
@@ -205,7 +206,8 @@ impl AsyncRead for IpStackTcpStream {
             }
 
             if let Some(b) = self.tcb.get_unordered_packets().filter(|_| matches!(self.shutdown, Shutdown::None)) {
-                self.tcb.add_ack(b.len() as u32);
+                use std::io::{Error, ErrorKind::Other};
+                self.tcb.add_ack(b.len().try_into().map_err(|e| Error::new(Other, e))?);
                 buf.put_slice(&b);
                 self.up_packet_sender
                     .send(self.create_rev_packet(ACK, TTL, None, Vec::new())?)
@@ -215,7 +217,7 @@ impl AsyncRead for IpStackTcpStream {
             if self.tcb.get_state() == TcpState::FinWait1(true) {
                 self.packet_to_send = Some(self.create_rev_packet(FIN | ACK, TTL, None, Vec::new())?);
                 self.tcb.add_seq_one();
-                self.tcb.add_ack(1);
+                self.tcb.add_ack(1.into());
                 self.tcb.change_state(TcpState::FinWait2(true));
                 continue;
             } else if matches!(self.shutdown, Shutdown::Pending(_))
@@ -245,7 +247,7 @@ impl AsyncRead for IpStackTcpStream {
 
                     if self.tcb.get_state() == TcpState::SynReceived(true) {
                         if t.flags() == ACK {
-                            self.tcb.change_last_ack(t.inner().acknowledgment_number);
+                            self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
                             self.tcb.change_send_window(t.inner().window_size);
                             self.tcb.change_state(TcpState::Established);
                         }
@@ -262,14 +264,14 @@ impl AsyncRead for IpStackTcpStream {
                                 }
                                 PacketStatus::Invalid => continue,
                                 PacketStatus::KeepAlive => {
-                                    self.tcb.change_last_ack(t.inner().acknowledgment_number);
+                                    self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
                                     self.tcb.change_send_window(t.inner().window_size);
                                     self.packet_to_send = Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
                                     continue;
                                 }
                                 PacketStatus::RetransmissionRequest => {
                                     self.tcb.change_send_window(t.inner().window_size);
-                                    self.tcb.retransmission = Some(t.inner().acknowledgment_number);
+                                    self.tcb.retransmission = Some(t.inner().acknowledgment_number.into());
                                     if matches!(self.as_mut().poll_flush(cx), Poll::Pending) {
                                         return Poll::Pending;
                                     }
@@ -287,8 +289,8 @@ impl AsyncRead for IpStackTcpStream {
                                     //     continue;
                                     // }
 
-                                    self.tcb.change_last_ack(t.inner().acknowledgment_number);
-                                    self.tcb.add_unordered_packet(t.inner().sequence_number, p.payload);
+                                    self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
+                                    self.tcb.add_unordered_packet(t.inner().sequence_number.into(), p.payload);
 
                                     self.tcb.change_send_window(t.inner().window_size);
                                     if let Some(ref n) = self.write_notify {
@@ -298,7 +300,7 @@ impl AsyncRead for IpStackTcpStream {
                                     continue;
                                 }
                                 PacketStatus::Ack => {
-                                    self.tcb.change_last_ack(t.inner().acknowledgment_number);
+                                    self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
                                     self.tcb.change_send_window(t.inner().window_size);
                                     if let Some(ref n) = self.write_notify {
                                         n.wake_by_ref();
@@ -309,7 +311,7 @@ impl AsyncRead for IpStackTcpStream {
                             };
                         }
                         if t.flags() == (FIN | ACK) {
-                            self.tcb.add_ack(1);
+                            self.tcb.add_ack(1.into());
                             self.packet_to_send = Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
                             self.tcb.change_state(TcpState::FinWait1(true));
                             continue;
@@ -318,7 +320,7 @@ impl AsyncRead for IpStackTcpStream {
                             if !matches!(self.tcb.check_pkt_type(&t, &p.payload), PacketStatus::NewPacket) {
                                 continue;
                             }
-                            self.tcb.change_last_ack(t.inner().acknowledgment_number);
+                            self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
 
                             if p.payload.is_empty() || self.tcb.get_ack() != t.inner().sequence_number {
                                 continue;
@@ -326,17 +328,17 @@ impl AsyncRead for IpStackTcpStream {
 
                             self.tcb.change_send_window(t.inner().window_size);
 
-                            self.tcb.add_unordered_packet(t.inner().sequence_number, p.payload);
+                            self.tcb.add_unordered_packet(t.inner().sequence_number.into(), p.payload);
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait1(false) {
                         if t.flags() == ACK {
-                            self.tcb.change_last_ack(t.inner().acknowledgment_number);
-                            self.tcb.add_ack(1);
+                            self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
+                            self.tcb.add_ack(1.into());
                             self.tcb.change_state(TcpState::FinWait2(true));
                             continue;
                         } else if t.flags() == (FIN | ACK) {
-                            self.tcb.add_ack(1);
+                            self.tcb.add_ack(1.into());
                             self.packet_to_send = Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
                             self.tcb.change_send_window(t.inner().window_size);
                             self.tcb.change_state(TcpState::FinWait2(true));
@@ -394,7 +396,7 @@ impl AsyncWrite for IpStackTcpStream {
 
         if let Some(s) = self.tcb.retransmission.take() {
             if let Some(packet) = self.tcb.inflight_packets.iter().find(|p| p.seq == s) {
-                let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq, packet.payload.clone())?;
+                let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq.0, packet.payload.clone())?;
 
                 self.up_packet_sender.send(rev_packet).or(Err(ErrorKind::UnexpectedEof))?;
             } else {

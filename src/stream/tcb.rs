@@ -1,3 +1,4 @@
+use super::seqnum::SeqNum;
 use crate::packet::TcpHeaderWrapper;
 use std::{collections::BTreeMap, pin::Pin, time::Duration};
 use tokio::time::Sleep;
@@ -26,10 +27,10 @@ pub(super) enum PacketStatus {
 
 #[derive(Debug)]
 pub(super) struct Tcb {
-    seq: u32,
-    pub(super) retransmission: Option<u32>,
-    ack: u32,
-    last_ack: u32,
+    seq: SeqNum,
+    pub(super) retransmission: Option<SeqNum>,
+    ack: SeqNum,
+    last_ack: SeqNum,
     pub(super) timeout: Pin<Box<Sleep>>,
     timeout_interval: Duration,
     recv_window: u16,
@@ -37,21 +38,21 @@ pub(super) struct Tcb {
     state: TcpState,
     avg_send_window: (u64, u64), // (avg, count)
     pub(super) inflight_packets: Vec<InflightPacket>,
-    unordered_packets: BTreeMap<u32, UnorderedPacket>,
+    unordered_packets: BTreeMap<SeqNum, UnorderedPacket>,
 }
 
 impl Tcb {
-    pub(super) fn new(ack: u32, timeout_interval: Duration) -> Tcb {
+    pub(super) fn new(ack: SeqNum, timeout_interval: Duration) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::random::<u32>();
         let deadline = tokio::time::Instant::now() + timeout_interval;
         Tcb {
-            seq,
+            seq: seq.into(),
             retransmission: None,
             ack,
-            last_ack: seq,
+            last_ack: seq.into(),
             timeout_interval,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             send_window: u16::MAX,
@@ -62,12 +63,12 @@ impl Tcb {
             unordered_packets: BTreeMap::new(),
         }
     }
-    pub(super) fn add_inflight_packet(&mut self, seq: u32, buf: Vec<u8>) {
+    pub(super) fn add_inflight_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         let buf_len = buf.len() as u32;
         self.inflight_packets.push(InflightPacket::new(seq, buf));
-        self.seq = self.seq.wrapping_add(buf_len);
+        self.seq += buf_len;
     }
-    pub(super) fn add_unordered_packet(&mut self, seq: u32, buf: Vec<u8>) {
+    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
             return;
         }
@@ -84,18 +85,18 @@ impl Tcb {
         self.unordered_packets.remove(&self.ack).map(|p| p.payload)
     }
     pub(super) fn add_seq_one(&mut self) {
-        self.seq = self.seq.wrapping_add(1);
+        self.seq += 1;
     }
-    pub(super) fn get_seq(&self) -> u32 {
+    pub(super) fn get_seq(&self) -> SeqNum {
         self.seq
     }
-    pub(super) fn add_ack(&mut self, add: u32) {
-        self.ack = self.ack.wrapping_add(add);
+    pub(super) fn add_ack(&mut self, add: SeqNum) {
+        self.ack += add;
     }
-    pub(super) fn get_ack(&self) -> u32 {
+    pub(super) fn get_ack(&self) -> SeqNum {
         self.ack
     }
-    pub(super) fn get_last_ack(&self) -> u32 {
+    pub(super) fn get_last_ack(&self) -> SeqNum {
         self.last_ack
     }
     pub(super) fn change_state(&mut self, state: TcpState) {
@@ -137,24 +138,23 @@ impl Tcb {
 
     pub(super) fn check_pkt_type(&self, header: &TcpHeaderWrapper, p: &[u8]) -> PacketStatus {
         let tcp_header = header.inner();
-        let received_ack_distance = self.seq.wrapping_sub(tcp_header.acknowledgment_number);
+        let received_ack = SeqNum(tcp_header.acknowledgment_number);
+        let received_ack_distance = self.seq - received_ack;
 
-        let current_ack_distance = self.seq.wrapping_sub(self.last_ack);
-        if received_ack_distance > current_ack_distance
-            || (tcp_header.acknowledgment_number != self.seq && self.seq.saturating_sub(tcp_header.acknowledgment_number) == 0)
-        {
+        let current_ack_distance = self.seq - self.last_ack;
+        if received_ack_distance > current_ack_distance || (self.seq != received_ack && self.seq.0.saturating_sub(received_ack.0) == 0) {
             PacketStatus::Invalid
-        } else if self.last_ack == tcp_header.acknowledgment_number {
+        } else if self.last_ack == received_ack {
             if !p.is_empty() {
                 PacketStatus::NewPacket
             } else if self.send_window == tcp_header.window_size && self.seq != self.last_ack {
                 PacketStatus::RetransmissionRequest
-            } else if self.ack.wrapping_sub(1) == tcp_header.sequence_number {
+            } else if self.ack - 1 == tcp_header.sequence_number {
                 PacketStatus::KeepAlive
             } else {
                 PacketStatus::WindowUpdate
             }
-        } else if self.last_ack < tcp_header.acknowledgment_number {
+        } else if self.last_ack < received_ack {
             if !p.is_empty() {
                 PacketStatus::NewPacket
             } else {
@@ -164,14 +164,14 @@ impl Tcb {
             PacketStatus::Invalid
         }
     }
-    pub(super) fn change_last_ack(&mut self, ack: u32) {
-        let distance = ack.wrapping_sub(self.last_ack);
-        self.last_ack = self.last_ack.wrapping_add(distance);
+
+    pub(super) fn change_last_ack(&mut self, ack: SeqNum) {
+        self.last_ack = ack;
 
         if self.state == TcpState::Established {
-            if let Some(i) = self.inflight_packets.iter().position(|p| p.contains(ack)) {
+            if let Some(i) = self.inflight_packets.iter().position(|p| p.contains_seq_num(ack - 1)) {
                 let mut inflight_packet = self.inflight_packets.remove(i);
-                let distance = ack.wrapping_sub(inflight_packet.seq) as usize;
+                let distance = (ack - inflight_packet.seq).0 as usize;
                 if distance < inflight_packet.payload.len() {
                     inflight_packet.payload.drain(0..distance);
                     inflight_packet.seq = ack;
@@ -179,13 +179,13 @@ impl Tcb {
                 }
             }
             self.inflight_packets.retain(|p| {
-                let last_byte = p.seq.wrapping_add(p.payload.len() as u32);
-                last_byte.saturating_sub(self.last_ack) > 0
+                let last_byte = p.seq + (p.payload.len() as u32);
+                last_byte > self.last_ack
             });
         }
     }
     pub fn is_send_buffer_full(&self) -> bool {
-        self.seq.wrapping_sub(self.last_ack) >= MAX_UNACK
+        (self.seq - self.last_ack).0 >= MAX_UNACK
     }
 
     pub(crate) fn reset_timeout(&mut self) {
@@ -196,22 +196,35 @@ impl Tcb {
 
 #[derive(Debug)]
 pub struct InflightPacket {
-    pub seq: u32,
+    pub seq: SeqNum,
     pub payload: Vec<u8>,
     // pub send_time: SystemTime, // todo
 }
 
 impl InflightPacket {
-    fn new(seq: u32, payload: Vec<u8>) -> Self {
+    fn new(seq: SeqNum, payload: Vec<u8>) -> Self {
         Self {
             seq,
             payload,
             // send_time: SystemTime::now(), // todo
         }
     }
-    pub(crate) fn contains(&self, seq: u32) -> bool {
-        self.seq < seq && seq <= self.seq + self.payload.len() as u32
+    pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
+        self.seq <= seq && seq < self.seq + self.payload.len() as u32
     }
+}
+
+#[test]
+fn test_in_flight_packet() {
+    let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50]);
+
+    assert!(p.contains_seq_num((u32::MAX - 1).into()));
+    assert!(p.contains_seq_num(u32::MAX.into()));
+    assert!(p.contains_seq_num(0.into()));
+    assert!(p.contains_seq_num(1.into()));
+    assert!(p.contains_seq_num(2.into()));
+
+    assert!(!p.contains_seq_num(3.into()));
 }
 
 #[derive(Debug)]
