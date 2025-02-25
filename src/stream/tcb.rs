@@ -31,7 +31,7 @@ pub(super) struct Tcb {
     ack: u32,
     last_ack: u32,
     pub(super) timeout: Pin<Box<Sleep>>,
-    tcp_timeout: Duration,
+    timeout_interval: Duration,
     recv_window: u16,
     send_window: u16,
     state: TcpState,
@@ -41,18 +41,18 @@ pub(super) struct Tcb {
 }
 
 impl Tcb {
-    pub(super) fn new(ack: u32, tcp_timeout: Duration) -> Tcb {
+    pub(super) fn new(ack: u32, timeout_interval: Duration) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::random::<u32>();
-        let deadline = tokio::time::Instant::now() + tcp_timeout;
+        let deadline = tokio::time::Instant::now() + timeout_interval;
         Tcb {
             seq,
             retransmission: None,
             ack,
             last_ack: seq,
-            tcp_timeout,
+            timeout_interval,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             send_window: u16::MAX,
             recv_window: 0,
@@ -189,7 +189,7 @@ impl Tcb {
     }
 
     pub(crate) fn reset_timeout(&mut self) {
-        let deadline = tokio::time::Instant::now() + self.tcp_timeout;
+        let deadline = tokio::time::Instant::now() + self.timeout_interval;
         self.timeout.as_mut().reset(deadline);
     }
 }
