@@ -87,7 +87,7 @@ impl IpStackTcpStream {
         Err(IpStackError::InvalidTcpPacket(tcp.clone()))
     }
 
-    fn calculate_payload_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
+    fn calculate_payload_max_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
         cmp::min(
             self.tcb.get_send_window(),
             self.mtu.saturating_sub(ip_header_size + tcp_header_size),
@@ -111,11 +111,12 @@ impl IpStackTcpStream {
 
         let ip_header = match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::TCP, dst.octets(), src.octets()).map_err(IpStackError::from)?;
-                let payload_len = self.calculate_payload_len(ip_h.header_len() as u16, tcp_header.header_len() as u16);
+                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::TCP, dst.octets(), src.octets())
+                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+                let payload_len = self.calculate_payload_max_len(ip_h.header_len() as u16, tcp_header.header_len() as u16);
                 payload.truncate(payload_len as usize);
                 ip_h.set_payload_len(payload.len() + tcp_header.header_len())
-                    .map_err(IpStackError::from)?;
+                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
                 ip_h.dont_fragment = true;
                 IpHeader::Ipv4(ip_h)
             }
@@ -129,10 +130,10 @@ impl IpStackTcpStream {
                     source: dst.octets(),
                     destination: src.octets(),
                 };
-                let payload_len = self.calculate_payload_len(ip_h.header_len() as u16, tcp_header.header_len() as u16);
+                let payload_len = self.calculate_payload_max_len(ip_h.header_len() as u16, tcp_header.header_len() as u16);
                 payload.truncate(payload_len as usize);
                 let len = payload.len() + tcp_header.header_len();
-                ip_h.set_payload_length(len).map_err(IpStackError::from)?;
+                ip_h.set_payload_length(len).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
 
                 IpHeader::Ipv6(ip_h)
             }
@@ -143,12 +144,12 @@ impl IpStackTcpStream {
             IpHeader::Ipv4(ref ip_header) => {
                 tcp_header.checksum = tcp_header
                     .calc_checksum_ipv4(ip_header, &payload)
-                    .or(Err(ErrorKind::InvalidInput))?;
+                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
             }
             IpHeader::Ipv6(ref ip_header) => {
                 tcp_header.checksum = tcp_header
                     .calc_checksum_ipv6(ip_header, &payload)
-                    .or(Err(ErrorKind::InvalidInput))?;
+                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
             }
         }
         Ok(NetworkPacket {
