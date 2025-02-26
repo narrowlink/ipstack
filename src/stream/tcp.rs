@@ -94,11 +94,11 @@ impl IpStackTcpStream {
         )
     }
 
-    fn create_rev_packet(&self, flags: u8, ttl: u8, seq: impl Into<Option<u32>>, mut payload: Vec<u8>) -> Result<NetworkPacket, Error> {
+    fn create_rev_packet(&self, flags: u8, ttl: u8, seq: impl Into<Option<SeqNum>>, mut payload: Vec<u8>) -> Result<NetworkPacket, Error> {
         let mut tcp_header = etherparse::TcpHeader::new(
             self.dst_addr.port(),
             self.src_addr.port(),
-            seq.into().unwrap_or(self.tcb.get_seq().0),
+            seq.into().unwrap_or(self.tcb.get_seq()).0,
             self.tcb.get_recv_window(),
         );
 
@@ -396,7 +396,7 @@ impl AsyncWrite for IpStackTcpStream {
 
         if let Some(s) = self.tcb.retransmission.take() {
             if let Some(packet) = self.tcb.inflight_packets.iter().find(|p| p.seq == s) {
-                let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq.0, packet.payload.clone())?;
+                let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq, packet.payload.clone())?;
 
                 self.up_packet_sender.send(rev_packet).or(Err(ErrorKind::UnexpectedEof))?;
             } else {
