@@ -8,7 +8,7 @@ use crate::{
     stream::tcb::{PacketStatus, Tcb, TcpState},
     PacketReceiver, PacketSender, DROP_TTL, TTL,
 };
-use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel};
+use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader};
 use log::{error, trace, warn};
 use std::{
     cmp,
@@ -58,7 +58,7 @@ impl IpStackTcpStream {
     pub(crate) fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
-        tcp: TcpHeaderWrapper,
+        tcp: TcpHeader,
         up_packet_sender: PacketSender,
         stream_receiver: PacketReceiver,
         mtu: u16,
@@ -70,21 +70,22 @@ impl IpStackTcpStream {
             stream_receiver,
             up_packet_sender,
             packet_to_send: None,
-            tcb: Tcb::new(SeqNum(tcp.inner().sequence_number) + 1, timeout_interval),
+            tcb: Tcb::new(SeqNum(tcp.sequence_number) + 1, timeout_interval),
             mtu,
             shutdown: Shutdown::None,
             write_notify: None,
         };
-        if tcp.inner().syn {
+        if tcp.syn {
             return Ok(stream);
         }
-        if !tcp.inner().rst {
+        if !tcp.rst {
             let pkt = stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
             if let Err(err) = stream.up_packet_sender.send(pkt) {
                 warn!("Error sending RST/ACK packet: {:?}", err);
             }
         }
-        Err(IpStackError::InvalidTcpPacket(tcp.clone()))
+        let info = format!("Invalid TCP packet: {:?}", TcpHeaderWrapper::from(tcp));
+        Err(IpStackError::IoError(Error::new(ErrorKind::ConnectionRefused, info)))
     }
 
     fn calculate_payload_max_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
@@ -199,10 +200,10 @@ impl AsyncRead for IpStackTcpStream {
             }
             self.tcb.reset_timeout();
 
-            if self.tcb.get_state() == TcpState::SynReceived(false) {
+            if self.tcb.get_state() == TcpState::Listen {
                 self.packet_to_send = Some(self.create_rev_packet(SYN | ACK, TTL, None, Vec::new())?);
                 self.tcb.add_seq_one();
-                self.tcb.change_state(TcpState::SynReceived(true));
+                self.tcb.change_state(TcpState::SynReceived);
                 continue;
             }
 
@@ -236,51 +237,52 @@ impl AsyncRead for IpStackTcpStream {
                         unreachable!()
                     };
                     let t: TcpHeaderWrapper = tcp_header.into();
+                    let tcp_header = t.inner();
+                    let incoming_ack: SeqNum = tcp_header.acknowledgment_number.into();
                     if t.flags() & RST != 0 {
                         self.packet_to_send = Some(self.create_rev_packet(NON, DROP_TTL, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
                         self.shutdown.ready();
                         return Poll::Ready(Err(Error::from(ErrorKind::ConnectionReset)));
                     }
-                    if self.tcb.check_pkt_type(&t, &p.payload) == PacketStatus::Invalid {
+                    if self.tcb.check_pkt_type(tcp_header, &p.payload) == PacketStatus::Invalid {
                         continue;
                     }
 
-                    if self.tcb.get_state() == TcpState::SynReceived(true) {
+                    if self.tcb.get_state() == TcpState::SynReceived {
                         if t.flags() == ACK {
-                            self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
-                            self.tcb.change_send_window(t.inner().window_size);
+                            self.tcb.change_last_ack(incoming_ack);
+                            self.tcb.change_send_window(tcp_header.window_size);
                             self.tcb.change_state(TcpState::Established);
                         }
                     } else if self.tcb.get_state() == TcpState::Established {
                         if t.flags() == ACK {
-                            match self.tcb.check_pkt_type(&t, &p.payload) {
+                            match self.tcb.check_pkt_type(tcp_header, &p.payload) {
                                 PacketStatus::WindowUpdate => {
-                                    self.tcb.change_send_window(t.inner().window_size);
-                                    if let Some(ref n) = self.write_notify {
-                                        n.wake_by_ref();
-                                        self.write_notify = None;
-                                    };
+                                    self.tcb.change_send_window(tcp_header.window_size);
+                                    if let Some(waker) = self.write_notify.take() {
+                                        waker.wake_by_ref();
+                                    }
                                     continue;
                                 }
                                 PacketStatus::Invalid => continue,
                                 PacketStatus::KeepAlive => {
-                                    self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
-                                    self.tcb.change_send_window(t.inner().window_size);
+                                    self.tcb.change_last_ack(incoming_ack);
+                                    self.tcb.change_send_window(tcp_header.window_size);
                                     self.packet_to_send = Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
                                     continue;
                                 }
                                 PacketStatus::RetransmissionRequest => {
-                                    self.tcb.change_send_window(t.inner().window_size);
-                                    self.tcb.retransmission = Some(t.inner().acknowledgment_number.into());
+                                    self.tcb.change_send_window(tcp_header.window_size);
+                                    self.tcb.retransmission = Some(incoming_ack);
                                     if matches!(self.as_mut().poll_flush(cx), Poll::Pending) {
                                         return Poll::Pending;
                                     }
                                     continue;
                                 }
                                 PacketStatus::NewPacket => {
-                                    // if t.inner().sequence_number != self.tcb.get_ack() {
-                                    //     dbg!(t.inner().sequence_number);
+                                    // if tcp_header.sequence_number != self.tcb.get_ack() {
+                                    //     dbg!(tcp_header.sequence_number);
                                     //     self.packet_to_send = Some(self.create_rev_packet(
                                     //         ACK,
                                     //         TTL,
@@ -290,23 +292,21 @@ impl AsyncRead for IpStackTcpStream {
                                     //     continue;
                                     // }
 
-                                    self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
-                                    self.tcb.add_unordered_packet(t.inner().sequence_number.into(), p.payload);
+                                    self.tcb.change_last_ack(incoming_ack);
+                                    self.tcb.add_unordered_packet(tcp_header.sequence_number.into(), p.payload);
 
-                                    self.tcb.change_send_window(t.inner().window_size);
-                                    if let Some(ref n) = self.write_notify {
-                                        n.wake_by_ref();
-                                        self.write_notify = None;
-                                    };
+                                    self.tcb.change_send_window(tcp_header.window_size);
+                                    if let Some(waker) = self.write_notify.take() {
+                                        waker.wake_by_ref();
+                                    }
                                     continue;
                                 }
                                 PacketStatus::Ack => {
-                                    self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
-                                    self.tcb.change_send_window(t.inner().window_size);
-                                    if let Some(ref n) = self.write_notify {
-                                        n.wake_by_ref();
-                                        self.write_notify = None;
-                                    };
+                                    self.tcb.change_last_ack(incoming_ack);
+                                    self.tcb.change_send_window(tcp_header.window_size);
+                                    if let Some(waker) = self.write_notify.take() {
+                                        waker.wake_by_ref();
+                                    }
                                     continue;
                                 }
                             };
@@ -318,30 +318,30 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         }
                         if t.flags() == (PSH | ACK) {
-                            if !matches!(self.tcb.check_pkt_type(&t, &p.payload), PacketStatus::NewPacket) {
+                            if !matches!(self.tcb.check_pkt_type(tcp_header, &p.payload), PacketStatus::NewPacket) {
                                 continue;
                             }
-                            self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
+                            self.tcb.change_last_ack(incoming_ack);
 
-                            if p.payload.is_empty() || self.tcb.get_ack() != t.inner().sequence_number {
+                            if p.payload.is_empty() || self.tcb.get_ack() != tcp_header.sequence_number {
                                 continue;
                             }
 
-                            self.tcb.change_send_window(t.inner().window_size);
+                            self.tcb.change_send_window(tcp_header.window_size);
 
-                            self.tcb.add_unordered_packet(t.inner().sequence_number.into(), p.payload);
+                            self.tcb.add_unordered_packet(tcp_header.sequence_number.into(), p.payload);
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait1(false) {
                         if t.flags() == ACK {
-                            self.tcb.change_last_ack(t.inner().acknowledgment_number.into());
+                            self.tcb.change_last_ack(incoming_ack);
                             self.tcb.add_ack(1.into());
                             self.tcb.change_state(TcpState::FinWait2(true));
                             continue;
                         } else if t.flags() == (FIN | ACK) {
                             self.tcb.add_ack(1.into());
                             self.packet_to_send = Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
-                            self.tcb.change_send_window(t.inner().window_size);
+                            self.tcb.change_send_window(tcp_header.window_size);
                             self.tcb.change_state(TcpState::FinWait2(true));
                             continue;
                         }
@@ -398,7 +398,6 @@ impl AsyncWrite for IpStackTcpStream {
         if let Some(s) = self.tcb.retransmission.take() {
             if let Some(packet) = self.tcb.inflight_packets.iter().find(|p| p.seq == s) {
                 let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq, packet.payload.clone())?;
-
                 self.up_packet_sender.send(rev_packet).or(Err(ErrorKind::UnexpectedEof))?;
             } else {
                 error!("Packet {} not found in inflight_packets", s);

@@ -10,6 +10,7 @@ use tokio::{
     time::Sleep,
 };
 
+#[derive(Debug)]
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,

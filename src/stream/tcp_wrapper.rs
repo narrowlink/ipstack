@@ -1,8 +1,6 @@
 use super::tcp::IpStackTcpStream as IpStackTcpStreamInner;
-use crate::{
-    packet::{NetworkPacket, TcpHeaderWrapper},
-    IpStackError, PacketSender,
-};
+use crate::{packet::NetworkPacket, IpStackError, PacketSender};
+use etherparse::TcpHeader;
 use std::{net::SocketAddr, pin::Pin, time::Duration};
 use tokio::{io::AsyncWriteExt, sync::mpsc, time::timeout};
 
@@ -17,7 +15,7 @@ impl IpStackTcpStream {
     pub(crate) fn new(
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
-        tcp: TcpHeaderWrapper,
+        tcp: TcpHeader,
         pkt_sender: PacketSender,
         mtu: u16,
         timeout_interval: Duration,

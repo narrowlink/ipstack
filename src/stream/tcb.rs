@@ -1,17 +1,24 @@
 use super::seqnum::SeqNum;
-use crate::packet::TcpHeaderWrapper;
+use etherparse::TcpHeader;
 use std::{collections::BTreeMap, pin::Pin, time::Duration};
 use tokio::time::Sleep;
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub enum TcpState {
-    SynReceived(bool), // bool means if syn/ack is sent
+pub(crate) enum TcpState {
+    Init, /* since we always act as a server beginning from Listen, so we needn't the state Init & SynSent */
+    SynSent,
+    Listen,
+    SynReceived,
     Established,
-    FinWait1(bool),
+    FinWait1(bool), // act as a client, followed with FinWait2, TimeWait, Closed
     FinWait2(bool), // bool means waiting for ack
+    TimeWait,
+    CloseWait, // act as a server, followed with LastAck, Closed
+    LastAck,
     Closed,
 }
 
@@ -57,7 +64,7 @@ impl Tcb {
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             send_window: u16::MAX,
             recv_window: 0,
-            state: TcpState::SynReceived(false),
+            state: TcpState::Listen,
             avg_send_window: (1, 1),
             inflight_packets: Vec::new(),
             unordered_packets: BTreeMap::new(),
@@ -136,8 +143,7 @@ impl Tcb {
     //     }
     // }
 
-    pub(super) fn check_pkt_type(&self, header: &TcpHeaderWrapper, p: &[u8]) -> PacketStatus {
-        let tcp_header = header.inner();
+    pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, p: &[u8]) -> PacketStatus {
         let received_ack = SeqNum(tcp_header.acknowledgment_number);
         let received_ack_distance = self.seq - received_ack;
 

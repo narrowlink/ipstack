@@ -208,6 +208,12 @@ impl TcpHeaderWrapper {
     }
 }
 
+impl From<TcpHeader> for TcpHeaderWrapper {
+    fn from(header: TcpHeader) -> Self {
+        TcpHeaderWrapper { header }
+    }
+}
+
 impl From<&TcpHeader> for TcpHeaderWrapper {
     fn from(header: &TcpHeader) -> Self {
         TcpHeaderWrapper { header: header.clone() }

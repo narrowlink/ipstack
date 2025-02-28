@@ -23,7 +23,6 @@ mod packet;
 pub mod stream;
 
 pub use self::error::{IpStackError, Result};
-pub use self::packet::TcpHeaderWrapper;
 pub use ::etherparse::IpNumber;
 
 const DROP_TTL: u8 = 0;
@@ -203,8 +202,7 @@ fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: Pack
     let dst_addr = packet.dst_addr();
     match packet.transport_header() {
         TransportHeader::Tcp(h) => {
-            let h: TcpHeaderWrapper = h.into();
-            let stream = IpStackTcpStream::new(src_addr, dst_addr, h, up_pkt_sender, cfg.mtu, cfg.tcp_timeout)?;
+            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, cfg.tcp_timeout)?;
             Ok((stream.stream_sender(), IpStackStream::Tcp(stream)))
         }
         TransportHeader::Udp(_) => {
