@@ -411,7 +411,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         if let Some(s) = self.tcb.retransmission.take() {
-            if let Some(packet) = self.tcb.inflight_packets.iter().find(|p| p.seq == s) {
+            if let Some(packet) = self.tcb.find_inflight_packet(s) {
                 let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq, packet.payload.clone())?;
                 self.up_packet_sender.send(rev_packet).or(Err(ErrorKind::UnexpectedEof))?;
             } else {
@@ -420,7 +420,7 @@ impl AsyncWrite for IpStackTcpStream {
                 error!("last_ack: {}", self.tcb.get_last_ack());
                 error!("ack: {}", self.tcb.get_ack());
                 error!("inflight_packets:");
-                for p in self.tcb.inflight_packets.iter() {
+                for p in self.tcb.get_all_inflight_packets().iter() {
                     error!("seq: {}", p.seq);
                     error!("payload len: {}", p.payload.len());
                 }

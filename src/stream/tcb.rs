@@ -44,7 +44,7 @@ pub(super) struct Tcb {
     send_window: u16,
     state: TcpState,
     avg_send_window: (u64, u64), // (avg, count)
-    pub(super) inflight_packets: Vec<InflightPacket>,
+    inflight_packets: Vec<InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, UnorderedPacket>,
 }
 
@@ -190,6 +190,15 @@ impl Tcb {
             });
         }
     }
+
+    pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
+        self.inflight_packets.iter().find(|p| p.seq == seq)
+    }
+
+    pub(crate) fn get_all_inflight_packets(&self) -> &Vec<InflightPacket> {
+        &self.inflight_packets
+    }
+
     pub fn is_send_buffer_full(&self) -> bool {
         (self.seq - self.last_ack).0 >= MAX_UNACK
     }
