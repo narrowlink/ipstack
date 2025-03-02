@@ -42,9 +42,10 @@ impl Shutdown {
 }
 
 #[derive(Debug)]
-pub(crate) struct IpStackTcpStream {
+pub struct IpStackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
+    stream_sender: PacketSender,
     stream_receiver: PacketReceiver,
     up_packet_sender: PacketSender,
     packet_to_send: Option<NetworkPacket>,
@@ -61,13 +62,14 @@ impl IpStackTcpStream {
         dst_addr: SocketAddr,
         tcp: TcpHeader,
         up_packet_sender: PacketSender,
-        stream_receiver: PacketReceiver,
         mtu: u16,
         timeout_interval: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
+        let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let stream = IpStackTcpStream {
             src_addr,
             dst_addr,
+            stream_sender,
             stream_receiver,
             up_packet_sender,
             packet_to_send: None,
@@ -86,8 +88,18 @@ impl IpStackTcpStream {
                 warn!("Error sending RST/ACK packet: {:?}", err);
             }
         }
-        let info = format!("Invalid TCP packet: {:?}", TcpHeaderWrapper::from(tcp));
+        let info = format!("Invalid TCP packet: {}", TcpHeaderWrapper::from(tcp));
         Err(IpStackError::IoError(Error::new(ErrorKind::ConnectionRefused, info)))
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.src_addr
+    }
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.dst_addr
+    }
+    pub fn stream_sender(&self) -> PacketSender {
+        self.stream_sender.clone()
     }
 
     pub(crate) fn set_destroy_messenger(&mut self, messenger: tokio::sync::oneshot::Sender<()>) {
