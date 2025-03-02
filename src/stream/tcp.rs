@@ -228,9 +228,8 @@ impl AsyncRead for IpStackTcpStream {
                 use std::io::{Error, ErrorKind::Other};
                 self.tcb.add_ack(b.len().try_into().map_err(|e| Error::new(Other, e))?);
                 buf.put_slice(&b);
-                self.up_packet_sender
-                    .send(self.create_rev_packet(ACK, TTL, None, Vec::new())?)
-                    .or(Err(ErrorKind::UnexpectedEof))?;
+                let packet = self.create_rev_packet(ACK, TTL, None, Vec::new())?;
+                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                 return Poll::Ready(Ok(()));
             }
             if self.tcb.get_state() == TcpState::FinWait1(true) {
@@ -255,6 +254,7 @@ impl AsyncRead for IpStackTcpStream {
                     };
                     let flags = tcp_header_flags(tcp_header);
                     let incoming_ack: SeqNum = tcp_header.acknowledgment_number.into();
+                    let incoming_seq: SeqNum = tcp_header.sequence_number.into();
                     if flags & RST != 0 {
                         self.tcb.change_state(TcpState::Closed);
                         self.shutdown.ready();
@@ -296,8 +296,8 @@ impl AsyncRead for IpStackTcpStream {
                                     continue;
                                 }
                                 PacketStatus::NewPacket => {
-                                    // if tcp_header.sequence_number != self.tcb.get_ack() {
-                                    //     dbg!(tcp_header.sequence_number);
+                                    // if incoming_seq != self.tcb.get_ack() {
+                                    //     dbg!(incoming_seq);
                                     //     self.packet_to_send = Some(self.create_rev_packet(
                                     //         ACK,
                                     //         TTL,
@@ -308,7 +308,7 @@ impl AsyncRead for IpStackTcpStream {
                                     // }
 
                                     self.tcb.change_last_ack(incoming_ack);
-                                    self.tcb.add_unordered_packet(tcp_header.sequence_number.into(), p.payload.clone());
+                                    self.tcb.add_unordered_packet(incoming_seq, p.payload.clone());
 
                                     self.tcb.change_send_window(tcp_header.window_size);
                                     if let Some(waker) = self.write_notify.take() {
@@ -338,13 +338,13 @@ impl AsyncRead for IpStackTcpStream {
                             }
                             self.tcb.change_last_ack(incoming_ack);
 
-                            if p.payload.is_empty() || self.tcb.get_ack() != tcp_header.sequence_number {
+                            if p.payload.is_empty() || self.tcb.get_ack() != incoming_seq {
                                 continue;
                             }
 
                             self.tcb.change_send_window(tcp_header.window_size);
 
-                            self.tcb.add_unordered_packet(tcp_header.sequence_number.into(), p.payload);
+                            self.tcb.add_unordered_packet(incoming_seq, p.payload);
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait1(false) {

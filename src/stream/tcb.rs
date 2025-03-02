@@ -9,7 +9,7 @@ const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
-    Init, /* since we always act as a server beginning from Listen, so we needn't the state Init & SynSent */
+    Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
     SynSent,
     Listen,
     SynReceived,
