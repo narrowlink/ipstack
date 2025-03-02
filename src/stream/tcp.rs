@@ -2,11 +2,11 @@ use super::seqnum::SeqNum;
 use crate::{
     error::IpStackError,
     packet::{
-        tcp_flags::{ACK, FIN, NON, PSH, RST, SYN},
+        tcp_flags::{ACK, FIN, PSH, RST, SYN},
         IpHeader, NetworkPacket, TcpHeaderWrapper, TransportHeader,
     },
     stream::tcb::{PacketStatus, Tcb, TcpState},
-    PacketReceiver, PacketSender, DROP_TTL, TTL,
+    PacketReceiver, PacketSender, TTL,
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader};
 use log::{error, trace, warn};
@@ -52,6 +52,7 @@ pub(crate) struct IpStackTcpStream {
     mtu: u16,
     shutdown: Shutdown,
     write_notify: Option<Waker>,
+    destroy_messenger: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl IpStackTcpStream {
@@ -74,6 +75,7 @@ impl IpStackTcpStream {
             mtu,
             shutdown: Shutdown::None,
             write_notify: None,
+            destroy_messenger: None,
         };
         if tcp.syn {
             return Ok(stream);
@@ -86,6 +88,10 @@ impl IpStackTcpStream {
         }
         let info = format!("Invalid TCP packet: {:?}", TcpHeaderWrapper::from(tcp));
         Err(IpStackError::IoError(Error::new(ErrorKind::ConnectionRefused, info)))
+    }
+
+    pub(crate) fn set_destroy_messenger(&mut self, messenger: tokio::sync::oneshot::Sender<()>) {
+        self.destroy_messenger = Some(messenger);
     }
 
     fn calculate_payload_max_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
@@ -180,7 +186,6 @@ impl AsyncRead for IpStackTcpStream {
             }
 
             if self.tcb.get_state() == TcpState::FinWait2(false) {
-                self.packet_to_send = Some(self.create_rev_packet(NON, DROP_TTL, None, Vec::new())?);
                 self.tcb.change_state(TcpState::Closed);
                 self.shutdown.ready();
                 return Poll::Ready(Err(Error::from(ErrorKind::ConnectionAborted)));
@@ -240,7 +245,6 @@ impl AsyncRead for IpStackTcpStream {
                     let tcp_header = t.inner();
                     let incoming_ack: SeqNum = tcp_header.acknowledgment_number.into();
                     if t.flags() & RST != 0 {
-                        self.packet_to_send = Some(self.create_rev_packet(NON, DROP_TTL, None, Vec::new())?);
                         self.tcb.change_state(TcpState::Closed);
                         self.shutdown.ready();
                         return Poll::Ready(Err(Error::from(ErrorKind::ConnectionReset)));
@@ -427,10 +431,8 @@ impl AsyncWrite for IpStackTcpStream {
 
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
-        if let Ok(p) = self.create_rev_packet(NON, DROP_TTL, None, Vec::new()) {
-            if let Err(err) = self.up_packet_sender.send(p) {
-                trace!("Error sending NON packet: {:?}", err);
-            }
+        if let Some(messenger) = self.destroy_messenger.take() {
+            let _ = messenger.send(());
         }
     }
 }

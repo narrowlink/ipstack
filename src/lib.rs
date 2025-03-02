@@ -25,8 +25,6 @@ pub mod stream;
 pub use self::error::{IpStackError, Result};
 pub use ::etherparse::IpNumber;
 
-const DROP_TTL: u8 = 0;
-
 #[cfg(unix)]
 const TTL: u8 = 64;
 
@@ -133,7 +131,6 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 Some(packet) = up_pkt_receiver.recv() => {
                     process_upstream_recv(
                         packet,
-                        sessions.clone(),
                         &mut device,
                         #[cfg(unix)]
                         pi,
@@ -181,6 +178,16 @@ async fn process_device_read(
         }
         Vacant(entry) => {
             let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
+            if let IpStackStream::Tcp(ref mut stream) = ip_stack_stream {
+                let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                stream.set_destroy_messenger(tx);
+                let sessions_clone = sessions_clone.clone();
+                tokio::spawn(async move {
+                    rx.await.ok();
+                    sessions_clone.lock().await.remove(&network_tuple);
+                    log::trace!("session removed: {}", network_tuple);
+                });
+            }
             if let IpStackStream::Udp(ref mut stream) = ip_stack_stream {
                 let (tx, rx) = tokio::sync::oneshot::channel::<()>();
                 stream.set_destroy_messenger(tx);
@@ -217,16 +224,9 @@ fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: Pack
 
 async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
     up_packet: NetworkPacket,
-    sessions: SessionCollection,
     device: &mut Device,
     #[cfg(unix)] packet_information: bool,
 ) -> Result<()> {
-    if up_packet.ttl() == DROP_TTL {
-        let network_tuple = up_packet.reverse_network_tuple();
-        sessions.lock().await.remove(&network_tuple);
-        log::trace!("session removed: {}", network_tuple);
-        return Ok(());
-    }
     #[allow(unused_mut)]
     let Ok(mut packet_bytes) = up_packet.to_bytes() else {
         log::trace!("to_bytes error");

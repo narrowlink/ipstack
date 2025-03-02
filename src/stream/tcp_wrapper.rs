@@ -30,6 +30,13 @@ impl IpStackTcpStream {
             }
         })
     }
+
+    pub(crate) fn set_destroy_messenger(&mut self, messenger: tokio::sync::oneshot::Sender<()>) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_destroy_messenger(messenger);
+        }
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }

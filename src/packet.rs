@@ -25,7 +25,6 @@ pub mod tcp_flags {
     pub const RST: u8 = 0b00000100;
     pub const SYN: u8 = 0b00000010;
     pub const FIN: u8 = 0b00000001;
-    pub const NON: u8 = 0b00000000;
 }
 
 #[derive(Debug, Clone)]
