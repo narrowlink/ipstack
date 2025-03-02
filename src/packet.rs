@@ -127,96 +127,70 @@ impl NetworkPacket {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TcpHeaderWrapper {
-    header: TcpHeader,
+pub fn tcp_header_fmt(header: &TcpHeader) -> String {
+    let mut flags = String::new();
+    if header.cwr {
+        flags.push_str("CWR ");
+    }
+    if header.ece {
+        flags.push_str("ECE ");
+    }
+    if header.urg {
+        flags.push_str("URG ");
+    }
+    if header.ack {
+        flags.push_str("ACK ");
+    }
+    if header.psh {
+        flags.push_str("PSH ");
+    }
+    if header.rst {
+        flags.push_str("RST ");
+    }
+    if header.syn {
+        flags.push_str("SYN ");
+    }
+    if header.fin {
+        flags.push_str("FIN ");
+    }
+    format!(
+        "TcpHeader {{ src_port: {}, dst_port: {}, seq: {}, ack: {}, flags: {} }}",
+        header.source_port,
+        header.destination_port,
+        header.sequence_number,
+        header.acknowledgment_number,
+        flags.trim()
+    )
 }
 
-impl std::fmt::Display for TcpHeaderWrapper {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut flags = String::new();
-        if self.header.cwr {
-            flags.push_str("CWR ");
-        }
-        if self.header.ece {
-            flags.push_str("ECE ");
-        }
-        if self.header.urg {
-            flags.push_str("URG ");
-        }
-        if self.header.ack {
-            flags.push_str("ACK ");
-        }
-        if self.header.psh {
-            flags.push_str("PSH ");
-        }
-        if self.header.rst {
-            flags.push_str("RST ");
-        }
-        if self.header.syn {
-            flags.push_str("SYN ");
-        }
-        if self.header.fin {
-            flags.push_str("FIN ");
-        }
-        write!(
-            f,
-            "TcpHeader {{ src_port: {}, dst_port: {}, seq: {}, ack: {}, flags: {} }}",
-            self.header.source_port,
-            self.header.destination_port,
-            self.header.sequence_number,
-            self.header.acknowledgment_number,
-            flags.trim()
-        )
+pub fn tcp_header_flags(inner: &TcpHeader) -> u8 {
+    let mut flags = 0;
+    if inner.cwr {
+        flags |= tcp_flags::CWR;
     }
-}
+    if inner.ece {
+        flags |= tcp_flags::ECE;
+    }
+    if inner.urg {
+        flags |= tcp_flags::URG;
+    }
+    if inner.ack {
+        flags |= tcp_flags::ACK;
+    }
+    if inner.psh {
+        flags |= tcp_flags::PSH;
+    }
+    if inner.rst {
+        flags |= tcp_flags::RST;
+    }
+    if inner.syn {
+        flags |= tcp_flags::SYN;
+    }
+    if inner.fin {
+        flags |= tcp_flags::FIN;
+    }
 
-impl TcpHeaderWrapper {
-    pub fn inner(&self) -> &TcpHeader {
-        &self.header
-    }
-    pub fn flags(&self) -> u8 {
-        let inner = self.inner();
-        let mut flags = 0;
-        if inner.cwr {
-            flags |= tcp_flags::CWR;
-        }
-        if inner.ece {
-            flags |= tcp_flags::ECE;
-        }
-        if inner.urg {
-            flags |= tcp_flags::URG;
-        }
-        if inner.ack {
-            flags |= tcp_flags::ACK;
-        }
-        if inner.psh {
-            flags |= tcp_flags::PSH;
-        }
-        if inner.rst {
-            flags |= tcp_flags::RST;
-        }
-        if inner.syn {
-            flags |= tcp_flags::SYN;
-        }
-        if inner.fin {
-            flags |= tcp_flags::FIN;
-        }
-
-        flags
-    }
-}
-
-impl From<TcpHeader> for TcpHeaderWrapper {
-    fn from(header: TcpHeader) -> Self {
-        TcpHeaderWrapper { header }
-    }
-}
-
-impl From<&TcpHeader> for TcpHeaderWrapper {
-    fn from(header: &TcpHeader) -> Self {
-        TcpHeaderWrapper { header: header.clone() }
-    }
+    flags
 }
 
 // pub struct UdpPacket {
