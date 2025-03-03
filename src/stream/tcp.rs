@@ -47,7 +47,6 @@ pub struct IpStackTcpStream {
     stream_sender: PacketSender,
     stream_receiver: PacketReceiver,
     up_packet_sender: PacketSender,
-    packet_to_send: Option<NetworkPacket>,
     tcb: Tcb,
     mtu: u16,
     shutdown: Shutdown,
@@ -71,7 +70,6 @@ impl IpStackTcpStream {
             stream_sender,
             stream_receiver,
             up_packet_sender,
-            packet_to_send: None,
             tcb: Tcb::new(SeqNum(tcp.sequence_number) + 1, timeout_interval),
             mtu,
             shutdown: Shutdown::None,
@@ -181,9 +179,6 @@ impl IpStackTcpStream {
 impl AsyncRead for IpStackTcpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         loop {
-            if let Some(packet) = self.packet_to_send.take() {
-                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
-            }
             if self.tcb.get_state() == TcpState::Closed {
                 self.shutdown.ready();
                 return Poll::Ready(Ok(()));
@@ -200,9 +195,8 @@ impl AsyncRead for IpStackTcpStream {
 
             if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
                 log::trace!("timeout reached for {:?}", self.dst_addr);
-                self.up_packet_sender
-                    .send(self.create_rev_packet(RST | ACK, TTL, None, Vec::new())?)
-                    .or(Err(ErrorKind::UnexpectedEof))?;
+                let packet = self.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
+                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                 self.tcb.change_state(TcpState::Closed);
                 self.shutdown.ready();
                 return Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
@@ -210,9 +204,10 @@ impl AsyncRead for IpStackTcpStream {
             self.tcb.reset_timeout();
 
             if self.tcb.get_state() == TcpState::Listen {
-                self.packet_to_send = Some(self.create_rev_packet(SYN | ACK, TTL, None, Vec::new())?);
+                let packet = self.create_rev_packet(SYN | ACK, TTL, None, Vec::new())?;
                 self.tcb.add_seq_one();
                 self.tcb.change_state(TcpState::SynReceived);
+                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                 continue;
             }
 
@@ -225,21 +220,25 @@ impl AsyncRead for IpStackTcpStream {
                 return Poll::Ready(Ok(()));
             }
             if self.tcb.get_state() == TcpState::FinWait1(true) {
-                self.packet_to_send = Some(self.create_rev_packet(FIN | ACK, TTL, None, Vec::new())?);
+                let packet = self.create_rev_packet(FIN | ACK, TTL, None, Vec::new())?;
                 self.tcb.add_seq_one();
                 self.tcb.add_ack(1.into());
                 self.tcb.change_state(TcpState::FinWait2(true));
+                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                 continue;
             } else if matches!(self.shutdown, Shutdown::Pending(_))
                 && self.tcb.get_state() == TcpState::Established
                 && self.tcb.get_last_ack() == self.tcb.get_seq()
             {
-                self.packet_to_send = Some(self.create_rev_packet(FIN | ACK, TTL, None, Vec::new())?);
+                let packet = self.create_rev_packet(FIN | ACK, TTL, None, Vec::new())?;
                 self.tcb.add_seq_one();
                 self.tcb.change_state(TcpState::FinWait1(false));
+                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                 continue;
             }
             match self.stream_receiver.poll_recv(cx) {
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(p)) => {
                     let TransportHeader::Tcp(tcp_header) = p.transport_header() else {
                         unreachable!()
@@ -276,7 +275,8 @@ impl AsyncRead for IpStackTcpStream {
                                 PacketStatus::KeepAlive => {
                                     self.tcb.change_last_ack(incoming_ack);
                                     self.tcb.change_send_window(tcp_header.window_size);
-                                    self.packet_to_send = Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
+                                    let packet = self.create_rev_packet(ACK, TTL, None, Vec::new())?;
+                                    self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                                     continue;
                                 }
                                 PacketStatus::RetransmissionRequest => {
@@ -332,8 +332,9 @@ impl AsyncRead for IpStackTcpStream {
                         }
                         if flags == (FIN | ACK) {
                             self.tcb.add_ack(1.into());
-                            self.packet_to_send = Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
+                            let packet = self.create_rev_packet(ACK, TTL, None, Vec::new())?;
                             self.tcb.change_state(TcpState::FinWait1(true));
+                            self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                             continue;
                         }
                         if flags == (PSH | ACK) {
@@ -359,22 +360,22 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         } else if flags == (FIN | ACK) {
                             self.tcb.add_ack(1.into());
-                            self.packet_to_send = Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
+                            let packet = self.create_rev_packet(ACK, TTL, None, Vec::new())?;
                             self.tcb.change_send_window(tcp_header.window_size);
                             self.tcb.change_state(TcpState::FinWait2(true));
+                            self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait2(true) {
                         if flags == ACK {
                             self.tcb.change_state(TcpState::FinWait2(false));
                         } else if flags == (FIN | ACK) {
-                            self.packet_to_send = Some(self.create_rev_packet(ACK, TTL, None, Vec::new())?);
+                            let packet = self.create_rev_packet(ACK, TTL, None, Vec::new())?;
                             self.tcb.change_state(TcpState::FinWait2(false));
+                            self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                         }
                     }
                 }
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
             }
         }
     }
