@@ -9,6 +9,12 @@ pub struct NetworkTuple {
     pub tcp: bool,
 }
 
+impl NetworkTuple {
+    pub fn new(src: SocketAddr, dst: SocketAddr, tcp: bool) -> Self {
+        NetworkTuple { src, dst, tcp }
+    }
+}
+
 impl std::fmt::Display for NetworkTuple {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tcp = if self.tcp { "TCP" } else { "UDP" };

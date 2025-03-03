@@ -6,16 +6,15 @@ use tokio::time::Sleep;
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
-    Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
-    SynSent,
+    // Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
+    // SynSent,
     Listen,
     SynReceived,
     Established,
-    FinWait1(bool), // act as a client, followed with FinWait2, TimeWait, Closed
-    FinWait2(bool), // bool means waiting for ack
+    FinWait1, // act as a client, actively send a farewell packet to the other side, followed with FinWait2, TimeWait, Closed
+    FinWait2,
     TimeWait,
     CloseWait, // act as a server, followed with LastAck, Closed
     LastAck,
@@ -202,8 +201,9 @@ impl Tcb {
         (self.seq - self.last_ack).0 >= MAX_UNACK
     }
 
-    pub(crate) fn reset_timeout(&mut self) {
-        let deadline = tokio::time::Instant::now() + self.timeout_interval;
+    pub(crate) fn reset_timeout(&mut self, final_reset: bool) {
+        let two_msl = Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + if final_reset { two_msl } else { self.timeout_interval };
         self.timeout.as_mut().reset(deadline);
     }
 }
