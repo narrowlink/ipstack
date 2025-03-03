@@ -238,10 +238,11 @@ impl AsyncRead for IpStackTcpStream {
             match self.stream_receiver.poll_recv(cx) {
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(p)) => {
-                    let TransportHeader::Tcp(tcp_header) = p.transport_header() else {
+                Poll::Ready(Some(network_packet)) => {
+                    let TransportHeader::Tcp(tcp_header) = network_packet.transport_header() else {
                         unreachable!()
                     };
+                    let payload = &network_packet.payload;
                     let flags = tcp_header_flags(tcp_header);
                     let incoming_ack: SeqNum = tcp_header.acknowledgment_number.into();
                     let incoming_seq: SeqNum = tcp_header.sequence_number.into();
@@ -250,7 +251,7 @@ impl AsyncRead for IpStackTcpStream {
                         self.shutdown.ready();
                         return Poll::Ready(Err(Error::from(ErrorKind::ConnectionReset)));
                     }
-                    if self.tcb.check_pkt_type(tcp_header, &p.payload) == PacketStatus::Invalid {
+                    if self.tcb.check_pkt_type(tcp_header, payload) == PacketStatus::Invalid {
                         continue;
                     }
 
@@ -262,7 +263,7 @@ impl AsyncRead for IpStackTcpStream {
                         }
                     } else if self.tcb.get_state() == TcpState::Established {
                         if flags == ACK {
-                            match self.tcb.check_pkt_type(tcp_header, &p.payload) {
+                            match self.tcb.check_pkt_type(tcp_header, payload) {
                                 PacketStatus::WindowUpdate => {
                                     self.tcb.change_send_window(tcp_header.window_size);
                                     if let Some(waker) = self.write_notify.take() {
@@ -311,7 +312,7 @@ impl AsyncRead for IpStackTcpStream {
                                     // }
 
                                     self.tcb.change_last_ack(incoming_ack);
-                                    self.tcb.add_unordered_packet(incoming_seq, p.payload.clone());
+                                    self.tcb.add_unordered_packet(incoming_seq, payload.clone());
 
                                     self.tcb.change_send_window(tcp_header.window_size);
                                     if let Some(waker) = self.write_notify.take() {
@@ -337,18 +338,18 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         }
                         if flags == (PSH | ACK) {
-                            if !matches!(self.tcb.check_pkt_type(tcp_header, &p.payload), PacketStatus::NewPacket) {
+                            if !matches!(self.tcb.check_pkt_type(tcp_header, payload), PacketStatus::NewPacket) {
                                 continue;
                             }
                             self.tcb.change_last_ack(incoming_ack);
 
-                            if p.payload.is_empty() || self.tcb.get_ack() != incoming_seq {
+                            if payload.is_empty() || self.tcb.get_ack() != incoming_seq {
                                 continue;
                             }
 
                             self.tcb.change_send_window(tcp_header.window_size);
 
-                            self.tcb.add_unordered_packet(incoming_seq, p.payload);
+                            self.tcb.add_unordered_packet(incoming_seq, payload.clone());
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait1(false) {
