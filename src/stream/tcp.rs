@@ -85,8 +85,12 @@ impl IpStackTcpStream {
                 log::warn!("Error sending RST/ACK packet: {:?}", err);
             }
         }
-        let info = format!("Invalid TCP packet: {}", tcp_header_fmt(&tcp));
+        let info = format!("Invalid TCP packet: {}", tcp_header_fmt(stream.network_tuple(), &tcp));
         Err(IpStackError::IoError(Error::new(ErrorKind::ConnectionRefused, info)))
+    }
+
+    pub(crate) fn network_tuple(&self) -> NetworkTuple {
+        NetworkTuple::new(self.src_addr, self.dst_addr, true)
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -190,8 +194,7 @@ impl AsyncRead for IpStackTcpStream {
             let final_reset = self.tcb.get_state() == TcpState::TimeWait;
             if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
                 if !final_reset {
-                    let network_tuple = NetworkTuple::new(self.src_addr, self.dst_addr, true);
-                    log::trace!("timeout reached for {}", network_tuple);
+                    log::trace!("timeout reached for {}", self.network_tuple());
                 }
                 let packet = self.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
                 self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
@@ -279,7 +282,7 @@ impl AsyncRead for IpStackTcpStream {
                                     continue;
                                 }
                                 PacketStatus::RetransmissionRequest => {
-                                    log::trace!("Retransmission request {}", tcp_header_fmt(tcp_header));
+                                    log::trace!("Retransmission request {}", tcp_header_fmt(self.network_tuple(), tcp_header));
                                     self.tcb.change_send_window(tcp_header.window_size);
                                     if let Some(packet) = self.tcb.find_inflight_packet(incoming_ack) {
                                         let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq, packet.payload.clone())?;

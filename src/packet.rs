@@ -133,7 +133,7 @@ impl NetworkPacket {
     }
 }
 
-pub fn tcp_header_fmt(header: &TcpHeader) -> String {
+pub fn tcp_header_fmt(network_tuple: NetworkTuple, header: &TcpHeader) -> String {
     let mut flags = String::new();
     if header.cwr {
         flags.push_str("CWR ");
@@ -160,9 +160,8 @@ pub fn tcp_header_fmt(header: &TcpHeader) -> String {
         flags.push_str("FIN ");
     }
     format!(
-        "TcpHeader {{ src_port: {}, dst_port: {}, seq: {}, ack: {}, flags: {} }}",
-        header.source_port,
-        header.destination_port,
+        "{} TcpHeader {{ seq: {}, ack: {}, flags: {} }}",
+        network_tuple,
         header.sequence_number,
         header.acknowledgment_number,
         flags.trim()
