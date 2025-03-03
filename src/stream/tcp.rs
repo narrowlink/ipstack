@@ -9,7 +9,6 @@ use crate::{
     PacketReceiver, PacketSender, TTL,
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader};
-use log::{error, warn};
 use std::{
     cmp,
     future::Future,
@@ -85,7 +84,7 @@ impl IpStackTcpStream {
         if !tcp.rst {
             let pkt = stream.create_rev_packet(RST | ACK, TTL, None, Vec::new())?;
             if let Err(err) = stream.up_packet_sender.send(pkt) {
-                warn!("Error sending RST/ACK packet: {:?}", err);
+                log::warn!("Error sending RST/ACK packet: {:?}", err);
             }
         }
         let info = format!("Invalid TCP packet: {}", tcp_header_fmt(&tcp));
@@ -182,13 +181,6 @@ impl IpStackTcpStream {
 impl AsyncRead for IpStackTcpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         loop {
-            if self.tcb.retransmission.is_some() {
-                self.write_notify = Some(cx.waker().clone());
-                if matches!(self.as_mut().poll_flush(cx), Poll::Pending) {
-                    return Poll::Pending;
-                }
-            }
-
             if let Some(packet) = self.packet_to_send.take() {
                 self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
             }
@@ -288,10 +280,22 @@ impl AsyncRead for IpStackTcpStream {
                                     continue;
                                 }
                                 PacketStatus::RetransmissionRequest => {
+                                    log::trace!("Retransmission request {}", tcp_header_fmt(tcp_header));
                                     self.tcb.change_send_window(tcp_header.window_size);
-                                    self.tcb.retransmission = Some(incoming_ack);
-                                    if matches!(self.as_mut().poll_flush(cx), Poll::Pending) {
-                                        return Poll::Pending;
+                                    if let Some(packet) = self.tcb.find_inflight_packet(incoming_ack) {
+                                        let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq, packet.payload.clone())?;
+                                        self.up_packet_sender.send(rev_packet).or(Err(ErrorKind::UnexpectedEof))?;
+                                    } else {
+                                        log::error!("Packet {} not found in inflight_packets", incoming_ack);
+                                        log::error!("seq: {}", self.tcb.get_seq());
+                                        log::error!("last_ack: {}", self.tcb.get_last_ack());
+                                        log::error!("ack: {}", self.tcb.get_ack());
+                                        log::error!("inflight_packets:");
+                                        for p in self.tcb.get_all_inflight_packets().iter() {
+                                            log::error!("seq: {}", p.seq);
+                                            log::error!("payload len: {}", p.payload.len());
+                                        }
+                                        panic!("Please report these values at: https://github.com/narrowlink/ipstack/");
                                     }
                                     continue;
                                 }
@@ -388,13 +392,6 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Pending;
         }
 
-        if self.tcb.retransmission.is_some() {
-            self.write_notify = Some(cx.waker().clone());
-            if matches!(self.as_mut().poll_flush(cx), Poll::Pending) {
-                return Poll::Pending;
-            }
-        }
-
         let packet = self.create_rev_packet(PSH | ACK, TTL, None, buf.to_vec())?;
         let seq = self.tcb.get_seq();
         let payload_len = packet.payload.len();
@@ -405,27 +402,9 @@ impl AsyncWrite for IpStackTcpStream {
         Poll::Ready(Ok(payload_len))
     }
 
-    fn poll_flush(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if self.tcb.get_state() != TcpState::Established {
             return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
-        }
-
-        if let Some(s) = self.tcb.retransmission.take() {
-            if let Some(packet) = self.tcb.find_inflight_packet(s) {
-                let rev_packet = self.create_rev_packet(PSH | ACK, TTL, packet.seq, packet.payload.clone())?;
-                self.up_packet_sender.send(rev_packet).or(Err(ErrorKind::UnexpectedEof))?;
-            } else {
-                error!("Packet {} not found in inflight_packets", s);
-                error!("seq: {}", self.tcb.get_seq());
-                error!("last_ack: {}", self.tcb.get_last_ack());
-                error!("ack: {}", self.tcb.get_ack());
-                error!("inflight_packets:");
-                for p in self.tcb.get_all_inflight_packets().iter() {
-                    error!("seq: {}", p.seq);
-                    error!("payload len: {}", p.payload.len());
-                }
-                panic!("Please report these values at: https://github.com/narrowlink/ipstack/");
-            }
         }
         Poll::Ready(Ok(()))
     }

@@ -35,7 +35,6 @@ pub(super) enum PacketStatus {
 #[derive(Debug)]
 pub(super) struct Tcb {
     seq: SeqNum,
-    pub(super) retransmission: Option<SeqNum>,
     ack: SeqNum,
     last_ack: SeqNum,
     pub(super) timeout: Pin<Box<Sleep>>,
@@ -57,7 +56,6 @@ impl Tcb {
         let deadline = tokio::time::Instant::now() + timeout_interval;
         Tcb {
             seq: seq.into(),
-            retransmission: None,
             ack,
             last_ack: seq.into(),
             timeout_interval,
@@ -195,6 +193,7 @@ impl Tcb {
         self.inflight_packets.iter().find(|p| p.seq == seq)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_all_inflight_packets(&self) -> &Vec<InflightPacket> {
         &self.inflight_packets
     }
