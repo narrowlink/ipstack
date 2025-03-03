@@ -32,9 +32,15 @@ impl From<SeqNum> for usize {
 }
 
 impl TryFrom<usize> for SeqNum {
-    type Error = std::num::TryFromIntError;
+    type Error = std::io::Error;
     fn try_from(value: usize) -> Result<Self, Self::Error> {
-        Ok(Self(value.try_into()?))
+        if value > u32::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("value 0x{:X} is too large to convert to SeqNum", value),
+            ));
+        }
+        Ok(Self(value as u32))
     }
 }
 

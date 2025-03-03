@@ -212,8 +212,7 @@ impl AsyncRead for IpStackTcpStream {
             }
 
             if let Some(b) = self.tcb.get_unordered_packets().filter(|_| matches!(self.shutdown, Shutdown::None)) {
-                use std::io::{Error, ErrorKind::Other};
-                self.tcb.add_ack(b.len().try_into().map_err(|e| Error::new(Other, e))?);
+                self.tcb.add_ack(b.len().try_into()?);
                 buf.put_slice(&b);
                 let packet = self.create_rev_packet(ACK, TTL, None, Vec::new())?;
                 self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
