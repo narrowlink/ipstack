@@ -71,6 +71,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
     let args = Args::parse();
 
     let default = format!("{:?}", args.verbosity);
