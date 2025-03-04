@@ -52,6 +52,8 @@ pub struct IpStackTcpStream {
     shutdown: Shutdown,
     write_notify: Option<Waker>,
     destroy_messenger: Option<tokio::sync::oneshot::Sender<()>>,
+    timeout: Pin<Box<tokio::time::Sleep>>,
+    timeout_interval: Duration,
 }
 
 impl IpStackTcpStream {
@@ -64,17 +66,20 @@ impl IpStackTcpStream {
         timeout_interval: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let deadline = tokio::time::Instant::now() + timeout_interval;
         let stream = IpStackTcpStream {
             src_addr,
             dst_addr,
             stream_sender,
             stream_receiver,
             up_packet_sender,
-            tcb: Tcb::new(SeqNum(tcp.sequence_number) + 1, timeout_interval),
+            tcb: Tcb::new(SeqNum(tcp.sequence_number) + 1),
             mtu,
             shutdown: Shutdown::None,
             write_notify: None,
             destroy_messenger: None,
+            timeout: Box::pin(tokio::time::sleep_until(deadline)),
+            timeout_interval,
         };
         if tcp.syn {
             return Ok(stream);
@@ -87,6 +92,12 @@ impl IpStackTcpStream {
         }
         let info = format!("Invalid TCP packet: {}", tcp_header_fmt(stream.network_tuple(), &tcp));
         Err(IpStackError::IoError(Error::new(ErrorKind::ConnectionRefused, info)))
+    }
+
+    fn reset_timeout(&mut self, final_reset: bool) {
+        let two_msl = Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + if final_reset { two_msl } else { self.timeout_interval };
+        self.timeout.as_mut().reset(deadline);
     }
 
     pub(crate) fn network_tuple(&self) -> NetworkTuple {
@@ -192,7 +203,7 @@ impl AsyncRead for IpStackTcpStream {
             self.tcb.change_recv_window(min);
 
             let final_reset = self.tcb.get_state() == TcpState::TimeWait;
-            if matches!(Pin::new(&mut self.tcb.timeout).poll(cx), Poll::Ready(_)) {
+            if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {
                 if !final_reset {
                     log::trace!("timeout reached for {}", self.network_tuple());
                 }
@@ -202,7 +213,7 @@ impl AsyncRead for IpStackTcpStream {
                 self.shutdown.ready();
                 return Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
             }
-            self.tcb.reset_timeout(final_reset);
+            self.reset_timeout(final_reset);
 
             if self.tcb.get_state() == TcpState::Listen {
                 let packet = self.create_rev_packet(SYN | ACK, TTL, None, Vec::new())?;
@@ -392,7 +403,7 @@ impl AsyncWrite for IpStackTcpStream {
         if self.tcb.get_state() != TcpState::Established {
             return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
         }
-        self.tcb.reset_timeout(false);
+        self.reset_timeout(false);
 
         if (self.tcb.get_send_window() as u64) < self.tcb.get_avg_send_window() / 2 || self.tcb.is_send_buffer_full() {
             self.write_notify = Some(cx.waker().clone());

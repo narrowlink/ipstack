@@ -1,7 +1,6 @@
 use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
-use std::{collections::BTreeMap, pin::Pin, time::Duration};
-use tokio::time::Sleep;
+use std::collections::BTreeMap;
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
@@ -36,8 +35,6 @@ pub(super) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     last_ack: SeqNum,
-    pub(super) timeout: Pin<Box<Sleep>>,
-    timeout_interval: Duration,
     recv_window: u16,
     send_window: u16,
     state: TcpState,
@@ -47,18 +44,15 @@ pub(super) struct Tcb {
 }
 
 impl Tcb {
-    pub(super) fn new(ack: SeqNum, timeout_interval: Duration) -> Tcb {
+    pub(super) fn new(ack: SeqNum) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::random::<u32>();
-        let deadline = tokio::time::Instant::now() + timeout_interval;
         Tcb {
             seq: seq.into(),
             ack,
             last_ack: seq.into(),
-            timeout_interval,
-            timeout: Box::pin(tokio::time::sleep_until(deadline)),
             send_window: u16::MAX,
             recv_window: 0,
             state: TcpState::Listen,
@@ -201,12 +195,6 @@ impl Tcb {
 
     pub fn is_send_buffer_full(&self) -> bool {
         (self.seq - self.last_ack).0 >= MAX_UNACK
-    }
-
-    pub(crate) fn reset_timeout(&mut self, final_reset: bool) {
-        let two_msl = Duration::from_secs(2);
-        let deadline = tokio::time::Instant::now() + if final_reset { two_msl } else { self.timeout_interval };
-        self.timeout.as_mut().reset(deadline);
     }
 }
 
