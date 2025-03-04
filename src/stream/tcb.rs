@@ -64,6 +64,7 @@ impl Tcb {
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
+            log::debug!("Received packet with seq < ack: seq = {}, ack = {}", seq, self.ack);
             return;
         }
         self.unordered_packets.insert(seq, UnorderedPacket::new(buf));
@@ -170,7 +171,7 @@ impl Tcb {
         if self.state == TcpState::Established {
             if let Some(i) = self.inflight_packets.iter().position(|p| p.contains_seq_num(ack - 1)) {
                 let mut inflight_packet = self.inflight_packets.remove(i);
-                let distance = (ack - inflight_packet.seq).0 as usize;
+                let distance = ack.distance(inflight_packet.seq) as usize;
                 if distance < inflight_packet.payload.len() {
                     inflight_packet.payload.drain(0..distance);
                     inflight_packet.seq = ack;
