@@ -67,11 +67,7 @@ impl Tcb {
             unordered_packets: BTreeMap::new(),
         }
     }
-    pub(super) fn add_inflight_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
-        let buf_len = buf.len() as u32;
-        self.inflight_packets.push(InflightPacket::new(seq, buf));
-        self.seq += buf_len;
-    }
+
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
             return;
@@ -166,6 +162,12 @@ impl Tcb {
         } else {
             PacketStatus::Invalid
         }
+    }
+
+    pub(super) fn add_inflight_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
+        let buf_len = buf.len() as u32;
+        self.inflight_packets.push(InflightPacket::new(seq, buf));
+        self.seq += buf_len;
     }
 
     pub(super) fn change_last_ack(&mut self, ack: SeqNum) {

@@ -111,31 +111,20 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let sessions: SessionCollection = std::sync::Arc::new(tokio::sync::Mutex::new(AHashMap::new()));
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
-    let mut buffer = [0_u8; u16::MAX as usize + 4];
+    let mut buffer = vec![0_u8; u16::MAX as usize + offset];
     let (up_pkt_sender, mut up_pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
     tokio::spawn(async move {
         loop {
             select! {
                 Ok(n) = device.read(&mut buffer) => {
-                    if let Err(e) = process_device_read(
-                        &buffer[offset..n],
-                        sessions.clone(),
-                        up_pkt_sender.clone(),
-                        &config,
-                        &accept_sender,
-                    ).await  {
+                    let u = up_pkt_sender.clone();
+                    if let Err(e) = process_device_read(&buffer[offset..n], sessions.clone(), u, &config, &accept_sender).await {
                         log::debug!("process_device_read error: {}", e);
                     }
                 }
                 Some(packet) = up_pkt_receiver.recv() => {
-                    process_upstream_recv(
-                        packet,
-                        &mut device,
-                        #[cfg(unix)]
-                        pi,
-                    )
-                    .await?;
+                    process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
                 }
             }
         }
@@ -177,6 +166,7 @@ async fn process_device_read(
             // log::trace!("packet sent to stream: {}", network_tuple);
         }
         Vacant(entry) => {
+            // log::trace!("new session: {}", network_tuple);
             let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
             if let IpStackStream::Tcp(ref mut stream) = ip_stack_stream {
                 let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -185,7 +175,7 @@ async fn process_device_read(
                 tokio::spawn(async move {
                     rx.await.ok();
                     sessions_clone.lock().await.remove(&network_tuple);
-                    // log::trace!("session removed: {}", network_tuple);
+                    // log::trace!("session destroyed: {}", network_tuple);
                 });
             }
             if let IpStackStream::Udp(ref mut stream) = ip_stack_stream {
@@ -194,7 +184,7 @@ async fn process_device_read(
                 tokio::spawn(async move {
                     rx.await.ok();
                     sessions_clone.lock().await.remove(&network_tuple);
-                    // log::trace!("session removed: {}", network_tuple);
+                    // log::trace!("session destroyed: {}", network_tuple);
                 });
             }
             entry.insert(packet_sender);
