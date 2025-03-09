@@ -3,10 +3,7 @@
 use crate::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 use ahash::AHashMap;
 use packet::{NetworkPacket, NetworkTuple, TransportHeader};
-use std::{
-    collections::hash_map::Entry::{Occupied, Vacant},
-    time::Duration,
-};
+use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
@@ -160,33 +157,29 @@ async fn process_device_read(
     let sessions_clone = sessions.clone();
     let network_tuple = packet.network_tuple();
     match sessions.lock().await.entry(network_tuple) {
-        Occupied(entry) => {
+        std::collections::hash_map::Entry::Occupied(entry) => {
             use std::io::{Error, ErrorKind::Other};
             entry.get().send(packet).map_err(|e| Error::new(Other, e))?;
             log::trace!("packet sent to stream: {}", network_tuple);
         }
-        Vacant(entry) => {
+        std::collections::hash_map::Entry::Vacant(entry) => {
             log::debug!("session created: {}", network_tuple);
             let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
-            if let IpStackStream::Tcp(ref mut stream) = ip_stack_stream {
-                let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-                stream.set_destroy_messenger(tx);
-                let sessions_clone = sessions_clone.clone();
-                tokio::spawn(async move {
-                    rx.await.ok();
-                    sessions_clone.lock().await.remove(&network_tuple);
-                    log::debug!("session destroyed: {}", network_tuple);
-                });
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            match ip_stack_stream {
+                IpStackStream::Tcp(ref mut stream) => {
+                    stream.set_destroy_messenger(tx);
+                }
+                IpStackStream::Udp(ref mut stream) => {
+                    stream.set_destroy_messenger(tx);
+                }
+                _ => unreachable!(),
             }
-            if let IpStackStream::Udp(ref mut stream) = ip_stack_stream {
-                let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-                stream.set_destroy_messenger(tx);
-                tokio::spawn(async move {
-                    rx.await.ok();
-                    sessions_clone.lock().await.remove(&network_tuple);
-                    log::debug!("session destroyed: {}", network_tuple);
-                });
-            }
+            tokio::spawn(async move {
+                rx.await.ok();
+                sessions_clone.lock().await.remove(&network_tuple);
+                log::debug!("session destroyed: {}", network_tuple);
+            });
             entry.insert(packet_sender);
             accept_sender.send(ip_stack_stream)?;
         }
