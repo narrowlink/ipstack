@@ -120,7 +120,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 Ok(n) = device.read(&mut buffer) => {
                     let u = up_pkt_sender.clone();
                     if let Err(e) = process_device_read(&buffer[offset..n], sessions.clone(), u, &config, &accept_sender).await {
-                        log::debug!("process_device_read error: {}", e);
+                        log::warn!("process_device_read error: {}", e);
                     }
                 }
                 Some(packet) = up_pkt_receiver.recv() => {
@@ -163,10 +163,10 @@ async fn process_device_read(
         Occupied(entry) => {
             use std::io::{Error, ErrorKind::Other};
             entry.get().send(packet).map_err(|e| Error::new(Other, e))?;
-            // log::trace!("packet sent to stream: {}", network_tuple);
+            log::trace!("packet sent to stream: {}", network_tuple);
         }
         Vacant(entry) => {
-            // log::trace!("new session: {}", network_tuple);
+            log::debug!("session created: {}", network_tuple);
             let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
             if let IpStackStream::Tcp(ref mut stream) = ip_stack_stream {
                 let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -175,7 +175,7 @@ async fn process_device_read(
                 tokio::spawn(async move {
                     rx.await.ok();
                     sessions_clone.lock().await.remove(&network_tuple);
-                    // log::trace!("session destroyed: {}", network_tuple);
+                    log::debug!("session destroyed: {}", network_tuple);
                 });
             }
             if let IpStackStream::Udp(ref mut stream) = ip_stack_stream {
@@ -184,7 +184,7 @@ async fn process_device_read(
                 tokio::spawn(async move {
                     rx.await.ok();
                     sessions_clone.lock().await.remove(&network_tuple);
-                    // log::trace!("session destroyed: {}", network_tuple);
+                    log::debug!("session destroyed: {}", network_tuple);
                 });
             }
             entry.insert(packet_sender);
@@ -219,7 +219,7 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
 ) -> Result<()> {
     #[allow(unused_mut)]
     let Ok(mut packet_bytes) = up_packet.to_bytes() else {
-        log::trace!("to_bytes error");
+        log::warn!("to_bytes error");
         return Ok(());
     };
     #[cfg(unix)]
