@@ -8,6 +8,20 @@ pub struct NetworkTuple {
     pub dst: SocketAddr,
     pub tcp: bool,
 }
+
+impl NetworkTuple {
+    pub fn new(src: SocketAddr, dst: SocketAddr, tcp: bool) -> Self {
+        NetworkTuple { src, dst, tcp }
+    }
+}
+
+impl std::fmt::Display for NetworkTuple {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tcp = if self.tcp { "TCP" } else { "UDP" };
+        write!(f, "{} {} -> {}", tcp, self.src, self.dst)
+    }
+}
+
 pub mod tcp_flags {
     pub const CWR: u8 = 0b10000000;
     pub const ECE: u8 = 0b01000000;
@@ -17,14 +31,6 @@ pub mod tcp_flags {
     pub const RST: u8 = 0b00000100;
     pub const SYN: u8 = 0b00000010;
     pub const FIN: u8 = 0b00000001;
-    pub const NON: u8 = 0b00000000;
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum IpStackPacketProtocol {
-    Tcp(TcpHeaderWrapper),
-    Unknown,
-    Udp,
 }
 
 #[derive(Debug, Clone)]
@@ -53,39 +59,21 @@ impl NetworkPacket {
         let ip = p.net.ok_or(IpStackError::InvalidPacket)?;
 
         let (ip, ip_payload) = match ip {
-            NetSlice::Ipv4(ip) => (
-                IpHeader::Ipv4(ip.header().to_header()),
-                ip.payload().payload,
-            ),
-            NetSlice::Ipv6(ip) => (
-                IpHeader::Ipv6(ip.header().to_header()),
-                ip.payload().payload,
-            ),
+            NetSlice::Ipv4(ip) => (IpHeader::Ipv4(ip.header().to_header()), ip.payload().payload),
+            NetSlice::Ipv6(ip) => (IpHeader::Ipv6(ip.header().to_header()), ip.payload().payload),
             NetSlice::Arp(_) => return Err(IpStackError::UnsupportedTransportProtocol),
         };
         let (transport, payload) = match p.transport {
-            Some(etherparse::TransportSlice::Tcp(h)) => {
-                (TransportHeader::Tcp(h.to_header()), h.payload())
-            }
-            Some(etherparse::TransportSlice::Udp(u)) => {
-                (TransportHeader::Udp(u.to_header()), u.payload())
-            }
+            Some(etherparse::TransportSlice::Tcp(h)) => (TransportHeader::Tcp(h.to_header()), h.payload()),
+            Some(etherparse::TransportSlice::Udp(u)) => (TransportHeader::Udp(u.to_header()), u.payload()),
             _ => (TransportHeader::Unknown, ip_payload),
         };
         let payload = payload.to_vec();
 
-        Ok(NetworkPacket {
-            ip,
-            transport,
-            payload,
-        })
+        Ok(NetworkPacket { ip, transport, payload })
     }
-    pub(crate) fn transport_protocol(&self) -> IpStackPacketProtocol {
-        match self.transport {
-            TransportHeader::Udp(_) => IpStackPacketProtocol::Udp,
-            TransportHeader::Tcp(ref h) => IpStackPacketProtocol::Tcp(h.into()),
-            _ => IpStackPacketProtocol::Unknown,
-        }
+    pub(crate) fn transport_header(&self) -> &TransportHeader {
+        &self.transport
     }
     pub fn src_addr(&self) -> SocketAddr {
         let port = match &self.transport {
@@ -145,53 +133,69 @@ impl NetworkPacket {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct TcpHeaderWrapper {
-    header: TcpHeader,
+pub fn tcp_header_fmt(network_tuple: NetworkTuple, header: &TcpHeader) -> String {
+    let mut flags = String::new();
+    if header.cwr {
+        flags.push_str("CWR ");
+    }
+    if header.ece {
+        flags.push_str("ECE ");
+    }
+    if header.urg {
+        flags.push_str("URG ");
+    }
+    if header.ack {
+        flags.push_str("ACK ");
+    }
+    if header.psh {
+        flags.push_str("PSH ");
+    }
+    if header.rst {
+        flags.push_str("RST ");
+    }
+    if header.syn {
+        flags.push_str("SYN ");
+    }
+    if header.fin {
+        flags.push_str("FIN ");
+    }
+    format!(
+        "{} TcpHeader {{ seq: {}, ack: {}, flags: {} }}",
+        network_tuple,
+        header.sequence_number,
+        header.acknowledgment_number,
+        flags.trim()
+    )
 }
 
-impl TcpHeaderWrapper {
-    pub fn inner(&self) -> &TcpHeader {
-        &self.header
+pub fn tcp_header_flags(inner: &TcpHeader) -> u8 {
+    let mut flags = 0;
+    if inner.cwr {
+        flags |= tcp_flags::CWR;
     }
-    pub fn flags(&self) -> u8 {
-        let inner = self.inner();
-        let mut flags = 0;
-        if inner.cwr {
-            flags |= tcp_flags::CWR;
-        }
-        if inner.ece {
-            flags |= tcp_flags::ECE;
-        }
-        if inner.urg {
-            flags |= tcp_flags::URG;
-        }
-        if inner.ack {
-            flags |= tcp_flags::ACK;
-        }
-        if inner.psh {
-            flags |= tcp_flags::PSH;
-        }
-        if inner.rst {
-            flags |= tcp_flags::RST;
-        }
-        if inner.syn {
-            flags |= tcp_flags::SYN;
-        }
-        if inner.fin {
-            flags |= tcp_flags::FIN;
-        }
+    if inner.ece {
+        flags |= tcp_flags::ECE;
+    }
+    if inner.urg {
+        flags |= tcp_flags::URG;
+    }
+    if inner.ack {
+        flags |= tcp_flags::ACK;
+    }
+    if inner.psh {
+        flags |= tcp_flags::PSH;
+    }
+    if inner.rst {
+        flags |= tcp_flags::RST;
+    }
+    if inner.syn {
+        flags |= tcp_flags::SYN;
+    }
+    if inner.fin {
+        flags |= tcp_flags::FIN;
+    }
 
-        flags
-    }
-}
-
-impl From<&TcpHeader> for TcpHeaderWrapper {
-    fn from(header: &TcpHeader) -> Self {
-        TcpHeaderWrapper {
-            header: header.clone(),
-        }
-    }
+    flags
 }
 
 // pub struct UdpPacket {

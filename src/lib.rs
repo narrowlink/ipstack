@@ -1,16 +1,9 @@
 #![doc = include_str!("../README.md")]
 
-use crate::{
-    packet::IpStackPacketProtocol,
-    stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
-};
+use crate::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 use ahash::AHashMap;
-use log::{error, trace};
-use packet::{NetworkPacket, NetworkTuple};
-use std::{
-    collections::hash_map::Entry::{Occupied, Vacant},
-    time::Duration,
-};
+use packet::{NetworkPacket, NetworkTuple, TransportHeader};
+use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
@@ -20,16 +13,14 @@ use tokio::{
 
 pub(crate) type PacketSender = UnboundedSender<NetworkPacket>;
 pub(crate) type PacketReceiver = UnboundedReceiver<NetworkPacket>;
-pub(crate) type SessionCollection = AHashMap<NetworkTuple, PacketSender>;
+pub(crate) type SessionCollection = std::sync::Arc<tokio::sync::Mutex<AHashMap<NetworkTuple, PacketSender>>>;
 
 mod error;
 mod packet;
 pub mod stream;
 
 pub use self::error::{IpStackError, Result};
-pub use etherparse::IpNumber;
-
-const DROP_TTL: u8 = 0;
+pub use ::etherparse::IpNumber;
 
 #[cfg(unix)]
 const TTL: u8 = 64;
@@ -93,182 +84,147 @@ pub struct IpStack {
 }
 
 impl IpStack {
-    pub fn new<D>(config: IpStackConfig, device: D) -> IpStack
+    pub fn new<Device>(config: IpStackConfig, device: Device) -> IpStack
     where
-        D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        Device: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
-        let handle = run(config, device, accept_sender);
-
         IpStack {
             accept_receiver,
-            handle,
+            handle: run(config, device, accept_sender),
         }
     }
 
     pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
-        self.accept_receiver
-            .recv()
-            .await
-            .ok_or(IpStackError::AcceptError)
+        self.accept_receiver.recv().await.ok_or(IpStackError::AcceptError)
     }
 }
 
-fn run<D>(
+fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     config: IpStackConfig,
-    mut device: D,
+    mut device: Device,
     accept_sender: UnboundedSender<IpStackStream>,
-) -> JoinHandle<Result<()>>
-where
-    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let mut sessions: SessionCollection = AHashMap::new();
+) -> JoinHandle<Result<()>> {
+    let sessions: SessionCollection = std::sync::Arc::new(tokio::sync::Mutex::new(AHashMap::new()));
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
-    let mut buffer = [0_u8; u16::MAX as usize + 4];
-    let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
+    let mut buffer = vec![0_u8; u16::MAX as usize + offset];
+    let (up_pkt_sender, mut up_pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
     tokio::spawn(async move {
         loop {
             select! {
                 Ok(n) = device.read(&mut buffer) => {
-                    if let Some(stream) = process_device_read(
-                        &buffer[offset..n],
-                        &mut sessions,
-                        pkt_sender.clone(),
-                        &config,
-                    ) {
-                        accept_sender.send(stream)?;
+                    let u = up_pkt_sender.clone();
+                    if let Err(e) = process_device_read(&buffer[offset..n], sessions.clone(), u, &config, &accept_sender).await {
+                        log::warn!("process_device_read error: {}", e);
                     }
                 }
-                Some(packet) = pkt_receiver.recv() => {
-                    process_upstream_recv(
-                        packet,
-                        &mut sessions,
-                        &mut device,
-                        #[cfg(unix)]
-                        pi,
-                    )
-                    .await?;
+                Some(packet) = up_pkt_receiver.recv() => {
+                    process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
                 }
             }
         }
     })
 }
 
-fn process_device_read(
+async fn process_device_read(
     data: &[u8],
-    sessions: &mut SessionCollection,
-    pkt_sender: PacketSender,
+    sessions: SessionCollection,
+    up_pkt_sender: PacketSender,
     config: &IpStackConfig,
-) -> Option<IpStackStream> {
+    accept_sender: &UnboundedSender<IpStackStream>,
+) -> Result<()> {
     let Ok(packet) = NetworkPacket::parse(data) else {
-        return Some(IpStackStream::UnknownNetwork(data.to_owned()));
+        let stream = IpStackStream::UnknownNetwork(data.to_owned());
+        accept_sender.send(stream)?;
+        return Ok(());
     };
 
-    if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
-        return Some(IpStackStream::UnknownTransport(
-            IpStackUnknownTransport::new(
-                packet.src_addr().ip(),
-                packet.dst_addr().ip(),
-                packet.payload,
-                &packet.ip,
-                config.mtu,
-                pkt_sender,
-            ),
+    if let TransportHeader::Unknown = packet.transport_header() {
+        let stream = IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
+            packet.src_addr().ip(),
+            packet.dst_addr().ip(),
+            packet.payload,
+            &packet.ip,
+            config.mtu,
+            up_pkt_sender,
         ));
+        accept_sender.send(stream)?;
+        return Ok(());
     }
 
-    match sessions.entry(packet.network_tuple()) {
-        Occupied(mut entry) => {
-            if let Err(e) = entry.get().send(packet) {
-                trace!("New stream because: {}", e);
-                create_stream(e.0, config, pkt_sender).map(|s| {
-                    entry.insert(s.0);
-                    s.1
-                })
-            } else {
-                None
-            }
+    let sessions_clone = sessions.clone();
+    let network_tuple = packet.network_tuple();
+    match sessions.lock().await.entry(network_tuple) {
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            log::trace!("packet sent to stream: {} len {}", network_tuple, packet.payload.len());
+            use std::io::{Error, ErrorKind::Other};
+            entry.get().send(packet).map_err(|e| Error::new(Other, e))?;
         }
-        Vacant(entry) => create_stream(packet, config, pkt_sender).map(|s| {
-            entry.insert(s.0);
-            s.1
-        }),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            log::debug!("session created: {}", network_tuple);
+            let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            match ip_stack_stream {
+                IpStackStream::Tcp(ref mut stream) => {
+                    stream.set_destroy_messenger(tx);
+                }
+                IpStackStream::Udp(ref mut stream) => {
+                    stream.set_destroy_messenger(tx);
+                }
+                _ => unreachable!(),
+            }
+            tokio::spawn(async move {
+                rx.await.ok();
+                sessions_clone.lock().await.remove(&network_tuple);
+                log::debug!("session destroyed: {}", network_tuple);
+            });
+            entry.insert(packet_sender);
+            accept_sender.send(ip_stack_stream)?;
+        }
     }
+    Ok(())
 }
 
-fn create_stream(
-    packet: NetworkPacket,
-    config: &IpStackConfig,
-    pkt_sender: PacketSender,
-) -> Option<(PacketSender, IpStackStream)> {
-    match packet.transport_protocol() {
-        IpStackPacketProtocol::Tcp(h) => {
-            match IpStackTcpStream::new(
-                packet.src_addr(),
-                packet.dst_addr(),
-                h,
-                pkt_sender,
-                config.mtu,
-                config.tcp_timeout,
-            ) {
-                Ok(stream) => Some((stream.stream_sender(), IpStackStream::Tcp(stream))),
-                Err(e) => {
-                    if matches!(e, IpStackError::InvalidTcpPacket) {
-                        trace!("Invalid TCP packet");
-                    } else {
-                        error!("IpStackTcpStream::new failed \"{}\"", e);
-                    }
-                    None
-                }
-            }
+fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: PacketSender) -> Result<(PacketSender, IpStackStream)> {
+    let src_addr = packet.src_addr();
+    let dst_addr = packet.dst_addr();
+    match packet.transport_header() {
+        TransportHeader::Tcp(h) => {
+            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, cfg.tcp_timeout)?;
+            Ok((stream.stream_sender(), IpStackStream::Tcp(stream)))
         }
-        IpStackPacketProtocol::Udp => {
-            let stream = IpStackUdpStream::new(
-                packet.src_addr(),
-                packet.dst_addr(),
-                packet.payload,
-                pkt_sender,
-                config.mtu,
-                config.udp_timeout,
-            );
-            Some((stream.stream_sender(), IpStackStream::Udp(stream)))
+        TransportHeader::Udp(_) => {
+            let stream = IpStackUdpStream::new(src_addr, dst_addr, packet.payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout);
+            Ok((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
-        IpStackPacketProtocol::Unknown => {
+        TransportHeader::Unknown => {
             unreachable!()
         }
     }
 }
 
-async fn process_upstream_recv<D>(
-    packet: NetworkPacket,
-    sessions: &mut SessionCollection,
-    device: &mut D,
+async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
+    up_packet: NetworkPacket,
+    device: &mut Device,
     #[cfg(unix)] packet_information: bool,
-) -> Result<()>
-where
-    D: AsyncWrite + Unpin + 'static,
-{
-    if packet.ttl() == 0 {
-        sessions.remove(&packet.reverse_network_tuple());
-        return Ok(());
-    }
+) -> Result<()> {
     #[allow(unused_mut)]
-    let Ok(mut packet_bytes) = packet.to_bytes() else {
-        trace!("to_bytes error");
+    let Ok(mut packet_bytes) = up_packet.to_bytes() else {
+        log::warn!("to_bytes error");
         return Ok(());
     };
     #[cfg(unix)]
     if packet_information {
-        if packet.src_addr().is_ipv4() {
+        if up_packet.src_addr().is_ipv4() {
             packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
         } else {
             packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
         }
     }
     device.write_all(&packet_bytes).await?;
-    // device.flush().await.unwrap();
+    // device.flush().await?;
 
     Ok(())
 }

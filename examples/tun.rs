@@ -5,7 +5,7 @@
 //!
 //! This example must be run as root or administrator privileges.
 //! ```
-//! sudo target/debug/examples/tun2 --server-addr 127.0.0.1:8080 # Linux or macOS
+//! sudo target/debug/examples/tun --server-addr 127.0.0.1:8080 # Linux or macOS
 //! ```
 //! Then please run the `echo` example server, which listens on TCP & UDP ports 127.0.0.1:8080.
 //! ```
@@ -28,7 +28,7 @@
 //!
 
 use clap::Parser;
-use etherparse::{IcmpEchoHeader, Icmpv4Header};
+use etherparse::Icmpv4Header;
 use ipstack::{stream::IpStackStream, IpNumber};
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::net::TcpStream;
@@ -71,6 +71,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
     let args = Args::parse();
 
     let default = format!("{:?}", args.verbosity);
@@ -154,12 +155,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let n = number;
                 if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
-                    if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
+                    if let etherparse::Icmpv4Type::EchoRequest(echo) = icmp_header.icmp_type {
                         log::info!("#{n} ICMPv4 echo");
-                        let echo = IcmpEchoHeader {
-                            id: req.id,
-                            seq: req.seq,
-                        };
                         let mut resp = Icmpv4Header::new(etherparse::Icmpv4Type::EchoReply(echo));
                         resp.update_checksum(req_payload);
                         let mut payload = resp.to_bytes().to_vec();
@@ -174,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             IpStackStream::UnknownNetwork(pkt) => {
-                log::info!("#{number} unknown transport - {} bytes", pkt.len());
+                log::info!("#{number} unknown network - {} bytes", pkt.len());
                 continue;
             }
         };

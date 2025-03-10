@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use clap::Parser;
-use etherparse::{IcmpEchoHeader, Icmpv4Header};
+use etherparse::Icmpv4Header;
 use ipstack::{stream::IpStackStream, IpNumber};
 use tokio::net::TcpStream;
 use udp_stream::UdpStream;
@@ -19,6 +19,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
     let args = Args::parse();
 
     env_logger::init();
@@ -46,10 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config)?);
 
     #[cfg(target_os = "windows")]
-    let mut ip_stack = ipstack::IpStack::new(
-        ipstack_config,
-        wintun::WinTunDevice::new(ipv4, Ipv4Addr::new(255, 255, 255, 0)),
-    );
+    let mut ip_stack = ipstack::IpStack::new(ipstack_config, wintun::WinTunDevice::new(ipv4, Ipv4Addr::new(255, 255, 255, 0)));
 
     let server_addr = args.server_addr;
 
@@ -86,12 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             IpStackStream::UnknownTransport(u) => {
                 if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
-                    if let etherparse::Icmpv4Type::EchoRequest(req) = icmp_header.icmp_type {
+                    if let etherparse::Icmpv4Type::EchoRequest(echo) = icmp_header.icmp_type {
                         println!("ICMPv4 echo");
-                        let echo = IcmpEchoHeader {
-                            id: req.id,
-                            seq: req.seq,
-                        };
                         let mut resp = Icmpv4Header::new(etherparse::Icmpv4Type::EchoReply(echo));
                         resp.update_checksum(req_payload);
                         let mut payload = resp.to_bytes().to_vec();
@@ -178,17 +172,11 @@ mod wintun {
             std::task::Poll::Ready(Ok(buf.len()))
         }
 
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), std::io::Error>> {
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
             std::task::Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), std::io::Error>> {
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
             std::task::Poll::Ready(Ok(()))
         }
     }
