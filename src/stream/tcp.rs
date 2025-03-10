@@ -412,11 +412,10 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         let packet = self.create_rev_packet(PSH | ACK, TTL, None, buf.to_vec())?;
-        let seq = self.tcb.get_seq();
         let payload_len = packet.payload.len();
         let payload = packet.payload.clone();
         self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
-        self.tcb.add_inflight_packet(seq, payload);
+        self.tcb.add_inflight_packet(payload);
 
         Poll::Ready(Ok(payload_len))
     }

@@ -159,9 +159,9 @@ impl Tcb {
         }
     }
 
-    pub(super) fn add_inflight_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
+    pub(super) fn add_inflight_packet(&mut self, buf: Vec<u8>) {
         let buf_len = buf.len() as u32;
-        self.inflight_packets.push(InflightPacket::new(seq, buf));
+        self.inflight_packets.push(InflightPacket::new(self.seq, buf));
         self.seq += buf_len;
     }
 
