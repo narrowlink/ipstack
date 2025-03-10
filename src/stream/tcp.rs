@@ -316,12 +316,8 @@ impl AsyncRead for IpStackTcpStream {
                                 PacketStatus::NewPacket => {
                                     // if incoming_seq != self.tcb.get_ack() {
                                     //     dbg!(incoming_seq);
-                                    //     self.packet_to_send = Some(self.create_rev_packet(
-                                    //         ACK,
-                                    //         TTL,
-                                    //         None,
-                                    //         Vec::new(),
-                                    //     )?);
+                                    //     let packet = self.create_rev_packet(ACK, TTL, None, Vec::new())?;
+                                    //     self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                                     //     continue;
                                     // }
 

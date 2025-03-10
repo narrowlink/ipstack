@@ -158,9 +158,9 @@ async fn process_device_read(
     let network_tuple = packet.network_tuple();
     match sessions.lock().await.entry(network_tuple) {
         std::collections::hash_map::Entry::Occupied(entry) => {
+            log::trace!("packet sent to stream: {} len {}", network_tuple, packet.payload.len());
             use std::io::{Error, ErrorKind::Other};
             entry.get().send(packet).map_err(|e| Error::new(Other, e))?;
-            log::trace!("packet sent to stream: {}", network_tuple);
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
             log::debug!("session created: {}", network_tuple);
