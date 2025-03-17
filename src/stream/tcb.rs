@@ -1,6 +1,6 @@
 use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
@@ -38,8 +38,8 @@ pub(super) struct Tcb {
     recv_window: u16,
     send_window: u16,
     state: TcpState,
-    avg_send_window: (u64, u64), // (avg, count)
-    inflight_packets: Vec<InflightPacket>,
+    avg_send_window: Average,
+    inflight_packets: VecDeque<InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, UnorderedPacket>,
 }
 
@@ -48,7 +48,7 @@ impl Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
-        let seq = rand::random::<u32>();
+        let seq = rand::Rng::random::<u32>(&mut rand::rng());
         Tcb {
             seq: seq.into(),
             ack,
@@ -56,37 +56,42 @@ impl Tcb {
             send_window: u16::MAX,
             recv_window: 0,
             state: TcpState::Listen,
-            avg_send_window: (1, 1),
-            inflight_packets: Vec::new(),
+            avg_send_window: Average::default(),
+            inflight_packets: VecDeque::new(),
             unordered_packets: BTreeMap::new(),
         }
     }
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
-            log::debug!("Received packet with seq < ack: seq = {}, ack = {}", seq, self.ack);
+            log::warn!("Received packet seq < ack: seq = {}, ack = {}, len = {}", seq, self.ack, buf.len());
             return;
         }
         self.unordered_packets.insert(seq, UnorderedPacket::new(buf));
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        READ_BUFFER_SIZE.saturating_sub(self.unordered_packets.iter().fold(0, |acc, (_, p)| acc + p.payload.len()))
+        READ_BUFFER_SIZE.saturating_sub(self.unordered_packets.values().map(|p| p.payload.len()).sum())
     }
+
     pub(super) fn get_unordered_packets(&mut self) -> Option<Vec<u8>> {
         // dbg!(self.ack);
         // for (seq,_) in self.unordered_packets.iter() {
         //     dbg!(seq);
         // }
-        self.unordered_packets.remove(&self.ack).map(|p| p.payload)
+        self.unordered_packets.remove(&self.ack).map(|p| {
+            self.ack += p.payload.len() as u32;
+            p.payload
+        })
     }
-    pub(super) fn add_seq_one(&mut self) {
+
+    pub(super) fn increase_seq(&mut self) {
         self.seq += 1;
     }
     pub(super) fn get_seq(&self) -> SeqNum {
         self.seq
     }
-    pub(super) fn add_ack(&mut self, add: SeqNum) {
-        self.ack += add;
+    pub(super) fn increase_ack(&mut self) {
+        self.ack += 1;
     }
     pub(super) fn get_ack(&self) -> SeqNum {
         self.ack
@@ -101,16 +106,14 @@ impl Tcb {
         self.state
     }
     pub(super) fn change_send_window(&mut self, window: u16) {
-        let avg_send_window = ((self.avg_send_window.0 * self.avg_send_window.1) + window as u64) / (self.avg_send_window.1 + 1);
-        self.avg_send_window.0 = avg_send_window;
-        self.avg_send_window.1 += 1;
+        self.avg_send_window.update(window as u64);
         self.send_window = window;
     }
     pub(super) fn get_send_window(&self) -> u16 {
         self.send_window
     }
     pub(super) fn get_avg_send_window(&self) -> u64 {
-        self.avg_send_window.0
+        self.avg_send_window.get()
     }
     pub(super) fn change_recv_window(&mut self, window: u16) {
         self.recv_window = window;
@@ -159,23 +162,27 @@ impl Tcb {
         }
     }
 
-    pub(super) fn add_inflight_packet(&mut self, buf: Vec<u8>) {
+    pub(super) fn add_inflight_packet(&mut self, buf: Vec<u8>) -> std::io::Result<()> {
         let buf_len = buf.len() as u32;
-        self.inflight_packets.push(InflightPacket::new(self.seq, buf));
+        self.inflight_packets.push_back(InflightPacket::new(self.seq, buf));
         self.seq += buf_len;
+        Ok(())
     }
 
     pub(super) fn change_last_ack(&mut self, ack: SeqNum) {
         self.last_ack = ack;
 
         if self.state == TcpState::Established {
-            if let Some(i) = self.inflight_packets.iter().position(|p| p.contains_seq_num(ack - 1)) {
-                let mut inflight_packet = self.inflight_packets.remove(i);
+            if let Some(index) = self.inflight_packets.iter().position(|p| p.contains_seq_num(ack - 1)) {
+                let Some(mut inflight_packet) = self.inflight_packets.remove(index) else {
+                    log::warn!("Failed to find inflight packet with seq = {}", ack - 1);
+                    return;
+                };
                 let distance = ack.distance(inflight_packet.seq) as usize;
                 if distance < inflight_packet.payload.len() {
                     inflight_packet.payload.drain(0..distance);
                     inflight_packet.seq = ack;
-                    self.inflight_packets.push(inflight_packet);
+                    self.inflight_packets.push_back(inflight_packet);
                 }
             }
             self.inflight_packets.retain(|p| {
@@ -190,12 +197,27 @@ impl Tcb {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn get_all_inflight_packets(&self) -> &Vec<InflightPacket> {
+    pub(crate) fn get_all_inflight_packets(&self) -> &VecDeque<InflightPacket> {
         &self.inflight_packets
     }
 
     pub fn is_send_buffer_full(&self) -> bool {
         (self.seq - self.last_ack).0 >= MAX_UNACK
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Average {
+    pub(crate) avg: u64,
+    pub(crate) count: u64,
+}
+impl Average {
+    fn update(&mut self, value: u64) {
+        self.avg = ((self.avg * self.count) + value) / (self.count + 1);
+        self.count += 1;
+    }
+    fn get(&self) -> u64 {
+        self.avg
     }
 }
 
