@@ -34,7 +34,7 @@ pub(super) enum PacketStatus {
 pub(super) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
-    last_ack: SeqNum,
+    last_received_ack: SeqNum,
     recv_window: u16,
     send_window: u16,
     state: TcpState,
@@ -52,7 +52,7 @@ impl Tcb {
         Tcb {
             seq: seq.into(),
             ack,
-            last_ack: seq.into(),
+            last_received_ack: seq.into(),
             send_window: u16::MAX,
             recv_window: 0,
             state: TcpState::Listen,
@@ -96,8 +96,8 @@ impl Tcb {
     pub(super) fn get_ack(&self) -> SeqNum {
         self.ack
     }
-    pub(super) fn get_last_ack(&self) -> SeqNum {
-        self.last_ack
+    pub(super) fn get_last_received_ack(&self) -> SeqNum {
+        self.last_received_ack
     }
     pub(super) fn change_state(&mut self, state: TcpState) {
         self.state = state;
@@ -135,23 +135,23 @@ impl Tcb {
     // }
 
     pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, p: &[u8]) -> PacketStatus {
-        let received_ack = SeqNum(tcp_header.acknowledgment_number);
-        let received_ack_distance = self.seq - received_ack;
+        let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
+        let received_ack_distance = self.seq - rcvd_ack;
 
-        let current_ack_distance = self.seq - self.last_ack;
-        if received_ack_distance > current_ack_distance || (self.seq != received_ack && self.seq.0.saturating_sub(received_ack.0) == 0) {
+        let current_ack_distance = self.seq - self.last_received_ack;
+        let res = if received_ack_distance > current_ack_distance || (self.seq != rcvd_ack && self.seq.0.saturating_sub(rcvd_ack.0) == 0) {
             PacketStatus::Invalid
-        } else if self.last_ack == received_ack {
+        } else if self.last_received_ack == rcvd_ack {
             if !p.is_empty() {
                 PacketStatus::NewPacket
-            } else if self.send_window == tcp_header.window_size && self.seq != self.last_ack {
+            } else if self.send_window == tcp_header.window_size && self.seq != self.last_received_ack {
                 PacketStatus::RetransmissionRequest
             } else if self.ack - 1 == tcp_header.sequence_number {
                 PacketStatus::KeepAlive
             } else {
                 PacketStatus::WindowUpdate
             }
-        } else if self.last_ack < received_ack {
+        } else if self.last_received_ack < rcvd_ack {
             if !p.is_empty() {
                 PacketStatus::NewPacket
             } else {
@@ -159,7 +159,9 @@ impl Tcb {
             }
         } else {
             PacketStatus::Invalid
-        }
+        };
+        log::trace!("check_pkt_type: {:?}", res);
+        res
     }
 
     pub(super) fn add_inflight_packet(&mut self, buf: Vec<u8>) -> std::io::Result<()> {
@@ -169,8 +171,8 @@ impl Tcb {
         Ok(())
     }
 
-    pub(super) fn change_last_ack(&mut self, ack: SeqNum) {
-        self.last_ack = ack;
+    pub(super) fn update_last_received_ack(&mut self, ack: SeqNum) {
+        self.last_received_ack = ack;
 
         if self.state == TcpState::Established {
             if let Some(index) = self.inflight_packets.iter().position(|p| p.contains_seq_num(ack - 1)) {
@@ -187,7 +189,7 @@ impl Tcb {
             }
             self.inflight_packets.retain(|p| {
                 let last_byte = p.seq + (p.payload.len() as u32);
-                last_byte > self.last_ack
+                last_byte > self.last_received_ack
             });
         }
     }
@@ -202,7 +204,7 @@ impl Tcb {
     }
 
     pub fn is_send_buffer_full(&self) -> bool {
-        (self.seq - self.last_ack).0 >= MAX_UNACK
+        (self.seq - self.last_received_ack).0 >= MAX_UNACK
     }
 }
 
