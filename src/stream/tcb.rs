@@ -134,33 +134,37 @@ impl Tcb {
     //     }
     // }
 
-    pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, p: &[u8]) -> PacketStatus {
+    pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketStatus {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
-        let received_ack_distance = self.seq - rcvd_ack;
-
-        let current_ack_distance = self.seq - self.last_received_ack;
-        let res = if received_ack_distance > current_ack_distance || (self.seq != rcvd_ack && self.seq.0.saturating_sub(rcvd_ack.0) == 0) {
+        let rcvd_seq = SeqNum(tcp_header.sequence_number);
+        let rcvd_window = tcp_header.window_size;
+        let res = if rcvd_ack > self.seq {
             PacketStatus::Invalid
-        } else if self.last_received_ack == rcvd_ack {
-            if !p.is_empty() {
-                PacketStatus::NewPacket
-            } else if self.send_window == tcp_header.window_size && self.seq != self.last_received_ack {
-                PacketStatus::RetransmissionRequest
-            } else if self.ack - 1 == tcp_header.sequence_number {
-                PacketStatus::KeepAlive
-            } else {
-                PacketStatus::WindowUpdate
-            }
-        } else if self.last_received_ack < rcvd_ack {
-            if !p.is_empty() {
-                PacketStatus::NewPacket
-            } else {
-                PacketStatus::Ack
-            }
         } else {
-            PacketStatus::Invalid
+            match rcvd_ack.cmp(&self.last_received_ack) {
+                std::cmp::Ordering::Less => PacketStatus::Invalid,
+                std::cmp::Ordering::Equal => {
+                    if !payload.is_empty() {
+                        PacketStatus::NewPacket
+                    } else if self.send_window == rcvd_window && self.seq != self.last_received_ack {
+                        PacketStatus::RetransmissionRequest
+                    } else if self.ack - 1 == rcvd_seq {
+                        PacketStatus::KeepAlive
+                    } else {
+                        PacketStatus::WindowUpdate
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    if !payload.is_empty() {
+                        PacketStatus::NewPacket
+                    } else {
+                        PacketStatus::Ack
+                    }
+                }
+            }
         };
-        log::trace!("check_pkt_type: {:?}", res);
+        #[rustfmt::skip]
+        log::trace!("recieved {{ ack = {rcvd_ack}, seq = {rcvd_seq}, window = {rcvd_window} }}, self {{ ack = {}, seq = {}, send_window = {} }}, {res:?}", self.ack, self.seq, self.send_window);
         res
     }
 
