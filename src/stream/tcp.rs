@@ -11,8 +11,7 @@ use crate::{
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader};
 use std::{
     future::Future,
-    io::{Error, ErrorKind},
-    mem::MaybeUninit,
+    io::ErrorKind::{ConnectionRefused, InvalidData, InvalidInput, UnexpectedEof},
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll, Waker},
@@ -22,9 +21,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Debug)]
 enum Shutdown {
-    Ready,
-    Pending(Waker),
     None,
+    Pending(Waker),
+    Ready,
 }
 
 impl Shutdown {
@@ -91,7 +90,7 @@ impl IpStackTcpStream {
             }
         }
         let info = format!("Invalid TCP packet: {}", tcp_header_fmt(stream.network_tuple(), &tcp));
-        Err(IpStackError::IoError(Error::new(ErrorKind::ConnectionRefused, info)))
+        Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)))
     }
 
     fn reset_timeout(&mut self, final_reset: bool) {
@@ -136,12 +135,12 @@ impl IpStackTcpStream {
 
         let ip_header = match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::TCP, dst.octets(), src.octets())
-                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+                let mut ip_h =
+                    Ipv4Header::new(0, ttl, IpNumber::TCP, dst.octets(), src.octets()).map_err(|e| std::io::Error::new(InvalidInput, e))?;
                 let payload_len = self.calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
                 payload.truncate(payload_len);
                 ip_h.set_payload_len(payload.len() + tcp_header.header_len())
-                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+                    .map_err(|e| std::io::Error::new(InvalidInput, e))?;
                 ip_h.dont_fragment = true;
                 IpHeader::Ipv4(ip_h)
             }
@@ -158,23 +157,23 @@ impl IpStackTcpStream {
                 let payload_len = self.calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
                 payload.truncate(payload_len);
                 let len = payload.len() + tcp_header.header_len();
-                ip_h.set_payload_length(len).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+                ip_h.set_payload_length(len).map_err(|e| std::io::Error::new(InvalidInput, e))?;
 
                 IpHeader::Ipv6(ip_h)
             }
-            _ => return Err(Error::new(ErrorKind::InvalidInput, "IP version mismatch")),
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "IP version mismatch")),
         };
 
         match ip_header {
             IpHeader::Ipv4(ref ip_header) => {
                 tcp_header.checksum = tcp_header
                     .calc_checksum_ipv4(ip_header, &payload)
-                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+                    .map_err(|e| std::io::Error::new(InvalidInput, e))?;
             }
             IpHeader::Ipv6(ref ip_header) => {
                 tcp_header.checksum = tcp_header
                     .calc_checksum_ipv6(ip_header, &payload)
-                    .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+                    .map_err(|e| std::io::Error::new(InvalidInput, e))?;
             }
         }
         Ok(NetworkPacket {
@@ -196,6 +195,7 @@ impl AsyncRead for IpStackTcpStream {
             let min = self.tcb.get_available_read_buffer_size() as u16;
             self.tcb.change_recv_window(min);
 
+            use std::io::Error;
             let final_reset = self.tcb.get_state() == TcpState::TimeWait;
             if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {
                 if !final_reset {
@@ -203,19 +203,19 @@ impl AsyncRead for IpStackTcpStream {
                 }
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                 let packet = self.create_rev_packet(RST | ACK, TTL, seq, ack, window_size, Vec::new())?;
-                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+                self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 self.tcb.change_state(TcpState::Closed);
                 self.shutdown.ready();
-                return Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
+                return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
             }
             self.reset_timeout(final_reset);
 
             if self.tcb.get_state() == TcpState::Listen {
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                 let packet = self.create_rev_packet(SYN | ACK, TTL, seq, ack, window_size, Vec::new())?;
+                self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 self.tcb.increase_seq();
                 self.tcb.change_state(TcpState::SynReceived);
-                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
                 continue;
             }
 
@@ -223,7 +223,7 @@ impl AsyncRead for IpStackTcpStream {
                 buf.put_slice(&data);
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                 let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
-                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+                self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 return Poll::Ready(Ok(()));
             }
             if self.tcb.get_state() == TcpState::CloseWait {
@@ -232,9 +232,10 @@ impl AsyncRead for IpStackTcpStream {
                 self.tcb.increase_seq();
                 self.tcb.increase_ack();
                 self.tcb.change_state(TcpState::LastAck);
-                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+                self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 continue;
-            } else if matches!(self.shutdown, Shutdown::Pending(_))
+            }
+            if matches!(self.shutdown, Shutdown::Pending(_))
                 && self.tcb.get_state() == TcpState::Established
                 && self.tcb.get_last_received_ack() == self.tcb.get_seq()
             {
@@ -243,7 +244,7 @@ impl AsyncRead for IpStackTcpStream {
                 let packet = self.create_rev_packet(FIN | ACK, TTL, seq, ack, window_size, Vec::new())?;
                 self.tcb.increase_seq();
                 self.tcb.change_state(TcpState::FinWait1);
-                self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+                self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 continue;
             }
             match self.stream_receiver.poll_recv(cx) {
@@ -251,7 +252,7 @@ impl AsyncRead for IpStackTcpStream {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(network_packet)) => {
                     let TransportHeader::Tcp(tcp_header) = network_packet.transport_header() else {
-                        return Poll::Ready(Err(Error::new(ErrorKind::InvalidData, "Invalid TCP packet")));
+                        return Poll::Ready(Err(std::io::Error::new(InvalidData, "Invalid TCP packet")));
                     };
                     let payload = &network_packet.payload;
                     let flags = tcp_header_flags(tcp_header);
@@ -261,9 +262,10 @@ impl AsyncRead for IpStackTcpStream {
                     if flags & RST != 0 {
                         self.tcb.change_state(TcpState::Closed);
                         self.shutdown.ready();
-                        return Poll::Ready(Err(Error::from(ErrorKind::ConnectionReset)));
+                        return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
                     }
-                    if self.tcb.check_pkt_type(tcp_header, payload) == PacketStatus::Invalid {
+                    let pkt_type = self.tcb.check_pkt_type(tcp_header, payload);
+                    if pkt_type == PacketStatus::Invalid {
                         continue;
                     }
 
@@ -277,7 +279,7 @@ impl AsyncRead for IpStackTcpStream {
                         }
                     } else if self.tcb.get_state() == TcpState::Established {
                         if flags == ACK {
-                            match self.tcb.check_pkt_type(tcp_header, payload) {
+                            match pkt_type {
                                 PacketStatus::WindowUpdate => {
                                     self.tcb.change_send_window(window_size);
                                     if let Some(waker) = self.write_notify.take() {
@@ -285,13 +287,12 @@ impl AsyncRead for IpStackTcpStream {
                                     }
                                     continue;
                                 }
-                                PacketStatus::Invalid => continue,
                                 PacketStatus::KeepAlive => {
                                     self.tcb.update_last_received_ack(incoming_ack);
                                     self.tcb.change_send_window(window_size);
                                     let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                                     let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
-                                    self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+                                    self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                                     continue;
                                 }
                                 PacketStatus::RetransmissionRequest => {
@@ -300,7 +301,7 @@ impl AsyncRead for IpStackTcpStream {
                                     if let Some(packet) = self.tcb.find_inflight_packet(incoming_ack) {
                                         let (s, a, w) = (packet.seq.0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                                         let rev_packet = self.create_rev_packet(PSH | ACK, TTL, s, a, w, packet.payload.clone())?;
-                                        self.up_packet_sender.send(rev_packet).or(Err(ErrorKind::UnexpectedEof))?;
+                                        self.up_packet_sender.send(rev_packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                                     } else {
                                         log::error!("Packet {} not found in inflight_packets", incoming_ack);
                                         log::error!("seq: {}", self.tcb.get_seq());
@@ -340,6 +341,7 @@ impl AsyncRead for IpStackTcpStream {
                                     }
                                     continue;
                                 }
+                                PacketStatus::Invalid => continue,
                             };
                         }
                         if flags == (FIN | ACK) {
@@ -347,11 +349,11 @@ impl AsyncRead for IpStackTcpStream {
                             let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                             let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
                             self.tcb.change_state(TcpState::CloseWait);
-                            self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+                            self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                             continue;
                         }
                         if flags == (PSH | ACK) {
-                            if !matches!(self.tcb.check_pkt_type(tcp_header, payload), PacketStatus::NewPacket) {
+                            if pkt_type != PacketStatus::NewPacket {
                                 continue;
                             }
                             self.tcb.update_last_received_ack(incoming_ack);
@@ -379,7 +381,7 @@ impl AsyncRead for IpStackTcpStream {
                             let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
                             self.tcb.change_send_window(window_size);
                             self.tcb.change_state(TcpState::TimeWait);
-                            self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+                            self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::LastAck {
@@ -391,7 +393,7 @@ impl AsyncRead for IpStackTcpStream {
                         let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
                         // wait to timeout, can't change state here
                         // self.tcb.change_state(TcpState::Closed);
-                        self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
+                        self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                         // now we need to wait for the timeout to reach...
                     }
                 }
@@ -403,7 +405,7 @@ impl AsyncRead for IpStackTcpStream {
 impl AsyncWrite for IpStackTcpStream {
     fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         if self.tcb.get_state() != TcpState::Established {
-            return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
+            return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::NotConnected)));
         }
         self.reset_timeout(false);
 
@@ -413,28 +415,34 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
-        let packet = self.create_rev_packet(PSH | ACK, TTL, seq, ack, window_size, buf.to_vec())?;
-        let payload_len = packet.payload.len();
-        self.up_packet_sender.send(packet.clone()).or(Err(ErrorKind::UnexpectedEof))?;
-        self.tcb.add_inflight_packet(packet.payload)?;
+        let pkt = self.create_rev_packet(PSH | ACK, TTL, seq, ack, window_size, buf.to_vec())?;
+        let payload_len = pkt.payload.len();
+        use std::io::{Error, ErrorKind::UnexpectedEof};
+        self.up_packet_sender.send(pkt.clone()).map_err(|e| Error::new(UnexpectedEof, e))?;
+        self.tcb.add_inflight_packet(pkt.payload)?;
 
         Poll::Ready(Ok(payload_len))
     }
 
     fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if self.tcb.get_state() != TcpState::Established {
-            return Poll::Ready(Err(Error::from(ErrorKind::NotConnected)));
+            return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::NotConnected)));
         }
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if matches!(self.shutdown, Shutdown::Ready) {
-            return Poll::Ready(Ok(()));
-        } else if matches!(self.shutdown, Shutdown::None) {
-            self.shutdown.pending(cx.waker().clone());
+        log::trace!("shutting down {}, status {:?}", self.network_tuple(), self.shutdown);
+        match self.shutdown {
+            Shutdown::None => {
+                self.shutdown.pending(cx.waker().clone());
+            }
+            Shutdown::Pending(_) => {}
+            Shutdown::Ready => {
+                return Poll::Ready(Ok(()));
+            }
         }
-        self.poll_read(cx, &mut tokio::io::ReadBuf::uninit(&mut [MaybeUninit::<u8>::uninit()]))
+        self.poll_read(cx, &mut tokio::io::ReadBuf::uninit(&mut [std::mem::MaybeUninit::<u8>::uninit()]))
     }
 }
 
