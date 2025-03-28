@@ -38,6 +38,16 @@ impl Shutdown {
     }
 }
 
+impl std::fmt::Display for Shutdown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Shutdown::None => write!(f, "None"),
+            Shutdown::Pending(_) => write!(f, "Pending"),
+            Shutdown::Ready => write!(f, "Ready"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct IpStackTcpStream {
     src_addr: SocketAddr,
@@ -48,6 +58,7 @@ pub struct IpStackTcpStream {
     tcb: Tcb,
     mtu: u16,
     shutdown: Shutdown,
+    read_notify_for_shutdown: Option<Waker>,
     write_notify: Option<Waker>,
     destroy_messenger: Option<tokio::sync::oneshot::Sender<()>>,
     timeout: Pin<Box<tokio::time::Sleep>>,
@@ -74,6 +85,7 @@ impl IpStackTcpStream {
             tcb: Tcb::new(SeqNum(tcp.sequence_number) + 1),
             mtu,
             shutdown: Shutdown::None,
+            read_notify_for_shutdown: None,
             write_notify: None,
             destroy_messenger: None,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
@@ -186,6 +198,8 @@ impl IpStackTcpStream {
 
 impl AsyncRead for IpStackTcpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        // update the waker for shutdown every time to keep it up-to-date
+        self.read_notify_for_shutdown = Some(cx.waker().clone());
         loop {
             if self.tcb.get_state() == TcpState::Closed {
                 self.shutdown.ready();
@@ -432,17 +446,20 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        log::trace!("shutting down {}, status {:?}", self.network_tuple(), self.shutdown);
+        let (nt, ts, sd) = (self.network_tuple(), self.tcb.get_state(), &self.shutdown);
+        log::trace!("poll_shutdown {nt}, TCP state {ts:?}, shutdown status {sd}");
         match self.shutdown {
             Shutdown::None => {
                 self.shutdown.pending(cx.waker().clone());
+                self.read_notify_for_shutdown.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                Poll::Pending
             }
-            Shutdown::Pending(_) => {}
-            Shutdown::Ready => {
-                return Poll::Ready(Ok(()));
+            Shutdown::Pending(_) => {
+                self.read_notify_for_shutdown.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                Poll::Pending
             }
+            Shutdown::Ready => Poll::Ready(Ok(())),
         }
-        self.poll_read(cx, &mut tokio::io::ReadBuf::uninit(&mut [std::mem::MaybeUninit::<u8>::uninit()]))
     }
 }
 
