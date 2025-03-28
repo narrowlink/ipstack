@@ -103,7 +103,7 @@ impl Tcb {
     pub(super) fn get_state(&self) -> TcpState {
         self.state
     }
-    pub(super) fn change_send_window(&mut self, window: u16) {
+    pub(super) fn update_send_window(&mut self, window: u16) {
         self.avg_send_window.update(window as u64);
         self.send_window = window;
     }

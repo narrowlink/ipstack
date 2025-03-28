@@ -285,14 +285,14 @@ impl AsyncRead for IpStackTcpStream {
                             assert_eq!(incoming_ack, self.tcb.get_seq());
                             assert_eq!(incoming_seq, self.tcb.get_ack());
                             self.tcb.update_last_received_ack(incoming_ack);
-                            self.tcb.change_send_window(window_size);
+                            self.tcb.update_send_window(window_size);
                             self.tcb.change_state(TcpState::Established);
                         }
                     } else if self.tcb.get_state() == TcpState::Established {
                         if flags == ACK {
                             match pkt_type {
                                 PacketStatus::WindowUpdate => {
-                                    self.tcb.change_send_window(window_size);
+                                    self.tcb.update_send_window(window_size);
                                     if let Some(waker) = self.write_notify.take() {
                                         waker.wake_by_ref();
                                     }
@@ -300,7 +300,7 @@ impl AsyncRead for IpStackTcpStream {
                                 }
                                 PacketStatus::KeepAlive => {
                                     self.tcb.update_last_received_ack(incoming_ack);
-                                    self.tcb.change_send_window(window_size);
+                                    self.tcb.update_send_window(window_size);
                                     let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                                     let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
                                     self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
@@ -308,7 +308,7 @@ impl AsyncRead for IpStackTcpStream {
                                 }
                                 PacketStatus::RetransmissionRequest => {
                                     log::debug!("Retransmission request {} {}", self.network_tuple(), tcp_header_fmt(tcp_header));
-                                    self.tcb.change_send_window(window_size);
+                                    self.tcb.update_send_window(window_size);
                                     if let Some(packet) = self.tcb.find_inflight_packet(incoming_ack) {
                                         let (s, a, w) = (packet.seq.0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                                         let rev_packet = self.create_rev_packet(PSH | ACK, TTL, s, a, w, packet.payload.clone())?;
@@ -338,7 +338,7 @@ impl AsyncRead for IpStackTcpStream {
                                     self.tcb.update_last_received_ack(incoming_ack);
                                     self.tcb.add_unordered_packet(incoming_seq, payload.clone());
 
-                                    self.tcb.change_send_window(window_size);
+                                    self.tcb.update_send_window(window_size);
                                     if let Some(waker) = self.write_notify.take() {
                                         waker.wake_by_ref();
                                     }
@@ -346,7 +346,7 @@ impl AsyncRead for IpStackTcpStream {
                                 }
                                 PacketStatus::Ack => {
                                     self.tcb.update_last_received_ack(incoming_ack);
-                                    self.tcb.change_send_window(window_size);
+                                    self.tcb.update_send_window(window_size);
                                     if let Some(waker) = self.write_notify.take() {
                                         waker.wake_by_ref();
                                     }
@@ -373,7 +373,7 @@ impl AsyncRead for IpStackTcpStream {
                                 continue;
                             }
 
-                            self.tcb.change_send_window(window_size);
+                            self.tcb.update_send_window(window_size);
 
                             self.tcb.add_unordered_packet(incoming_seq, payload.clone());
                             continue;
@@ -390,7 +390,7 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.increase_ack();
                             let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                             let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
-                            self.tcb.change_send_window(window_size);
+                            self.tcb.update_send_window(window_size);
                             self.tcb.change_state(TcpState::TimeWait);
                             self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                             continue;
