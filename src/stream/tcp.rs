@@ -206,9 +206,6 @@ impl AsyncRead for IpStackTcpStream {
                 return Poll::Ready(Ok(()));
             }
 
-            let min = self.tcb.get_available_read_buffer_size() as u16;
-            self.tcb.change_recv_window(min);
-
             use std::io::Error;
             let final_reset = self.tcb.get_state() == TcpState::TimeWait;
             if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {

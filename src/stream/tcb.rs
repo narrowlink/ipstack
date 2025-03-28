@@ -35,7 +35,6 @@ pub(super) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     last_received_ack: SeqNum,
-    recv_window: u16,
     send_window: u16,
     state: TcpState,
     avg_send_window: Average,
@@ -54,7 +53,6 @@ impl Tcb {
             ack,
             last_received_ack: seq.into(),
             send_window: u16::MAX,
-            recv_window: 0,
             state: TcpState::Listen,
             avg_send_window: Average::default(),
             inflight_packets: VecDeque::new(),
@@ -115,11 +113,8 @@ impl Tcb {
     pub(super) fn get_avg_send_window(&self) -> u64 {
         self.avg_send_window.get()
     }
-    pub(super) fn change_recv_window(&mut self, window: u16) {
-        self.recv_window = window;
-    }
     pub(super) fn get_recv_window(&self) -> u16 {
-        self.recv_window
+        self.get_available_read_buffer_size() as u16
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
