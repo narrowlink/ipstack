@@ -101,7 +101,7 @@ impl IpStackTcpStream {
                 log::warn!("Error sending RST/ACK packet: {:?}", err);
             }
         }
-        let info = format!("Invalid TCP packet: {}", tcp_header_fmt(stream.network_tuple(), &tcp));
+        let info = format!("Invalid TCP packet: {} {}", stream.network_tuple(), tcp_header_fmt(&tcp));
         Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)))
     }
 
@@ -307,7 +307,7 @@ impl AsyncRead for IpStackTcpStream {
                                     continue;
                                 }
                                 PacketStatus::RetransmissionRequest => {
-                                    log::debug!("Retransmission request {}", tcp_header_fmt(self.network_tuple(), tcp_header));
+                                    log::debug!("Retransmission request {} {}", self.network_tuple(), tcp_header_fmt(tcp_header));
                                     self.tcb.change_send_window(window_size);
                                     if let Some(packet) = self.tcb.find_inflight_packet(incoming_ack) {
                                         let (s, a, w) = (packet.seq.0, self.tcb.get_ack().0, self.tcb.get_recv_window());
