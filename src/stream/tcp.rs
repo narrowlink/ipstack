@@ -381,9 +381,28 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.change_state(TcpState::Closed);
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait1 {
+                        if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
+                            // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
+                            self.tcb.increase_ack();
+                            let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
+                            let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
+                            self.tcb.update_send_window(window_size);
+                            self.tcb.change_state(TcpState::TimeWait);
+                            self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
+                            continue;
+                        }
                         if flags & ACK == ACK && len == 0 {
                             self.tcb.update_last_received_ack(incoming_ack);
                             self.tcb.increase_ack();
+                            self.tcb.change_state(TcpState::FinWait2);
+                            continue;
+                        }
+                        if flags & (ACK | PSH) == (ACK | PSH) && len > 0 {
+                            // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
+                            self.tcb.update_last_received_ack(incoming_ack);
+                            self.tcb.add_unordered_packet(incoming_seq, payload.clone());
+                            self.tcb.update_send_window(window_size);
+                            self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
                             self.tcb.change_state(TcpState::FinWait2);
                             continue;
                         }
@@ -395,6 +414,26 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.update_send_window(window_size);
                             self.tcb.change_state(TcpState::TimeWait);
                             self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
+                            continue;
+                        }
+                        if flags & ACK == ACK && len == 0 {
+                            // FIXME: unnormal case, we send back an ACK and not change state, like PacketStatus::KeepAlive, but seams NOT work
+                            self.tcb.update_last_received_ack(incoming_ack);
+                            self.tcb.update_send_window(window_size);
+                            let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
+                            let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
+                            self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
+                            continue;
+                        }
+                        if flags & (ACK | PSH) == (ACK | PSH) && len > 0 {
+                            // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
+                            self.tcb.update_last_received_ack(incoming_ack);
+                            self.tcb.add_unordered_packet(incoming_seq, payload.clone());
+                            self.tcb.update_send_window(window_size);
+                            self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            if flags & FIN == FIN {
+                                self.tcb.change_state(TcpState::TimeWait);
+                            }
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::TimeWait && flags & (ACK | FIN) == (ACK | FIN) {
