@@ -159,7 +159,7 @@ impl Tcb {
             }
         };
         #[rustfmt::skip]
-        log::trace!("recieved {{ ack = {rcvd_ack}, seq = {rcvd_seq}, window = {rcvd_window} }}, self {{ ack = {}, seq = {}, send_window = {} }}, {res:?}", self.ack, self.seq, self.send_window);
+        log::trace!("received {{ ack = {rcvd_ack}, seq = {rcvd_seq}, window = {rcvd_window} }}, self {{ ack = {}, seq = {}, send_window = {} }}, {res:?}", self.ack, self.seq, self.send_window);
         res
     }
 
