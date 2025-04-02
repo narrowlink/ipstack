@@ -99,7 +99,7 @@ impl IpStackTcpStream {
         }
         if !tcp.rst {
             let (seq, ack, window_size) = (stream.tcb.get_seq().0, stream.tcb.get_ack().0, stream.tcb.get_recv_window());
-            let pkt = stream.create_rev_packet(RST | ACK, TTL, seq, ack, window_size, Vec::new())?;
+            let pkt = stream.create_rev_packet(ACK | RST, TTL, seq, ack, window_size, Vec::new())?;
             if let Err(err) = stream.up_packet_sender.send(pkt) {
                 log::warn!("Error sending RST/ACK packet: {:?}", err);
             }
@@ -216,7 +216,7 @@ impl AsyncRead for IpStackTcpStream {
                     log::warn!("timeout reached for {network_tuple}");
                 }
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
-                let packet = self.create_rev_packet(RST | ACK, TTL, seq, ack, window_size, Vec::new())?;
+                let packet = self.create_rev_packet(ACK | RST, TTL, seq, ack, window_size, Vec::new())?;
                 self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 self.tcb.change_state(TcpState::Closed);
                 self.shutdown.ready();
@@ -226,7 +226,7 @@ impl AsyncRead for IpStackTcpStream {
 
             if self.tcb.get_state() == TcpState::Listen {
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
-                let packet = self.create_rev_packet(SYN | ACK, TTL, seq, ack, window_size, Vec::new())?;
+                let packet = self.create_rev_packet(ACK | SYN, TTL, seq, ack, window_size, Vec::new())?;
                 self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 self.tcb.increase_seq();
                 self.tcb.change_state(TcpState::SynReceived);
