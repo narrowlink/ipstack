@@ -288,11 +288,14 @@ impl AsyncRead for IpStackTcpStream {
                     log::trace!("{ts:?}: {network_tuple} {l_info} {info}, {pkt_type:?} len = {len}");
 
                     if self.tcb.get_state() == TcpState::SynReceived {
-                        if flags == ACK {
+                        if flags & ACK == ACK {
                             assert_eq!(incoming_ack, self.tcb.get_seq());
                             assert_eq!(incoming_seq, self.tcb.get_ack());
                             self.tcb.update_last_received_ack(incoming_ack);
                             self.tcb.update_send_window(window_size);
+                            if len > 0 {
+                                self.tcb.add_unordered_packet(incoming_seq, payload.clone());
+                            }
                             self.tcb.change_state(TcpState::Established);
                         }
                     } else if self.tcb.get_state() == TcpState::Established {
