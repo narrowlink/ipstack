@@ -467,7 +467,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
-        let pkt = self.create_rev_packet(ACK | PSH, TTL, seq, ack, window_size, buf.to_vec())?;
+        let pkt = self.create_rev_packet(ACK, TTL, seq, ack, window_size, buf.to_vec())?;
         let payload_len = pkt.payload.len();
         use std::io::{Error, ErrorKind::UnexpectedEof};
         self.up_packet_sender.send(pkt.clone()).map_err(|e| Error::new(UnexpectedEof, e))?;
