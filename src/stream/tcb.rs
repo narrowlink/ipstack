@@ -21,7 +21,7 @@ pub(crate) enum TcpState {
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(super) enum PacketStatus {
+pub(super) enum PacketType {
     WindowUpdate,
     Invalid,
     RetransmissionRequest,
@@ -129,31 +129,31 @@ impl Tcb {
     //     }
     // }
 
-    pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketStatus {
+    pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketType {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
         let rcvd_window = tcp_header.window_size;
         let res = if rcvd_ack > self.seq {
-            PacketStatus::Invalid
+            PacketType::Invalid
         } else {
             match rcvd_ack.cmp(&self.last_received_ack) {
-                std::cmp::Ordering::Less => PacketStatus::Invalid,
+                std::cmp::Ordering::Less => PacketType::Invalid,
                 std::cmp::Ordering::Equal => {
                     if !payload.is_empty() {
-                        PacketStatus::NewPacket
+                        PacketType::NewPacket
                     } else if self.send_window == rcvd_window && self.seq != self.last_received_ack {
-                        PacketStatus::RetransmissionRequest
+                        PacketType::RetransmissionRequest
                     } else if self.ack - 1 == rcvd_seq {
-                        PacketStatus::KeepAlive
+                        PacketType::KeepAlive
                     } else {
-                        PacketStatus::WindowUpdate
+                        PacketType::WindowUpdate
                     }
                 }
                 std::cmp::Ordering::Greater => {
                     if !payload.is_empty() {
-                        PacketStatus::NewPacket
+                        PacketType::NewPacket
                     } else {
-                        PacketStatus::Ack
+                        PacketType::Ack
                     }
                 }
             }

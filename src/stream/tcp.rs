@@ -5,7 +5,7 @@ use crate::{
         tcp_flags::{ACK, FIN, PSH, RST, SYN},
         tcp_header_flags, tcp_header_fmt, IpHeader, NetworkPacket, NetworkTuple, TransportHeader,
     },
-    stream::tcb::{PacketStatus, Tcb, TcpState},
+    stream::tcb::{PacketType, Tcb, TcpState},
     PacketReceiver, PacketSender, TTL,
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader};
@@ -279,7 +279,7 @@ impl AsyncRead for IpStackTcpStream {
                         return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
                     }
                     let pkt_type = self.tcb.check_pkt_type(tcp_header, payload);
-                    if pkt_type == PacketStatus::Invalid {
+                    if pkt_type == PacketType::Invalid {
                         continue;
                     }
 
@@ -301,12 +301,12 @@ impl AsyncRead for IpStackTcpStream {
                     } else if self.tcb.get_state() == TcpState::Established {
                         if flags == ACK {
                             match pkt_type {
-                                PacketStatus::WindowUpdate => {
+                                PacketType::WindowUpdate => {
                                     self.tcb.update_send_window(window_size);
                                     self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
                                     continue;
                                 }
-                                PacketStatus::KeepAlive => {
+                                PacketType::KeepAlive => {
                                     self.tcb.update_last_received_ack(incoming_ack);
                                     self.tcb.update_send_window(window_size);
                                     let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
@@ -314,7 +314,7 @@ impl AsyncRead for IpStackTcpStream {
                                     self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                                     continue;
                                 }
-                                PacketStatus::RetransmissionRequest => {
+                                PacketType::RetransmissionRequest => {
                                     self.tcb.update_send_window(window_size);
                                     if let Some(packet) = self.tcb.find_inflight_packet(incoming_ack) {
                                         let (s, a, w) = (packet.seq.0, self.tcb.get_ack().0, self.tcb.get_recv_window());
@@ -334,7 +334,7 @@ impl AsyncRead for IpStackTcpStream {
                                     }
                                     continue;
                                 }
-                                PacketStatus::NewPacket => {
+                                PacketType::NewPacket => {
                                     // if incoming_seq != self.tcb.get_ack() {
                                     //     dbg!(incoming_seq);
                                     //     let packet = self.create_rev_packet(ACK, TTL, None, Vec::new())?;
@@ -349,13 +349,13 @@ impl AsyncRead for IpStackTcpStream {
                                     self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
                                     continue;
                                 }
-                                PacketStatus::Ack => {
+                                PacketType::Ack => {
                                     self.tcb.update_last_received_ack(incoming_ack);
                                     self.tcb.update_send_window(window_size);
                                     self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
                                     continue;
                                 }
-                                PacketStatus::Invalid => continue,
+                                PacketType::Invalid => continue,
                             }
                         }
                         if flags == (ACK | FIN) {
@@ -369,7 +369,7 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         }
                         if flags == (ACK | PSH) {
-                            if pkt_type != PacketStatus::NewPacket {
+                            if pkt_type != PacketType::NewPacket {
                                 continue;
                             }
                             self.tcb.update_last_received_ack(incoming_ack);
