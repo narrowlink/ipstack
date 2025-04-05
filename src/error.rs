@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum IpStackError {
     #[error("The transport protocol is not supported")]

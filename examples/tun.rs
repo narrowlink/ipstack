@@ -5,12 +5,11 @@
 //!
 //! This example must be run as root or administrator privileges.
 //! ```
-//! sudo target/debug/examples/tun --server-addr 127.0.0.1:8080 # Linux or macOS
+//! sudo target/debug/examples/tun --server-addr 127.0.0.1:5201
 //! ```
-//! Then please run the `echo` example server, which listens on TCP & UDP ports 127.0.0.1:8080.
+//! Then run the `iperf3` as a server, which listens on TCP port 127.0.0.1:5201.
 //! ```
-//! cargo install socks5-impl --example echo-server
-//! echo-server --listen-addr 127.0.0.1:8080 --tcp-timeout 600
+//! iperf3 -s -p 5201
 //! ```
 //! To route traffic to the tun interface, run the following command with root or administrator privileges:
 //! ```
@@ -19,11 +18,13 @@
 //! sudo route add 1.2.3.4/32 10.0.0.1  # macOS
 //! ```
 //!
-//! Now you can test it with `nc 1.2.3.4 any_port` or `nc -u 1.2.3.4 any_port`.
-//! You can watch the echo information in the `nc` console.
+//! Now you can connect `1.2.3.4:any_port`, and the traffic will be routed to the tun interface then to the server `127.0.0.1:5201`.
+//! You can test it with `iperf3` as a client
 //! ```
-//! nc 1.2.3.4 2323 # TCP
-//! nc -u 1.2.3.4 2323 # UDP
+//! iperf3 -c 1.2.3.4       # TCP test
+//! iperf3 -c 1.2.3.4 -R    # TCP reverse test
+//! iperf3 -c 1.2.3.4 -u    # UDP test
+//! iperf3 -c 1.2.3.4 -u -R # UDP reverse test
 //! ```
 //!
 
