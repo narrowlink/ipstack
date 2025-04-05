@@ -233,7 +233,11 @@ impl AsyncRead for IpStackTcpStream {
                 continue;
             }
 
-            if let Some(data) = self.tcb.get_unordered_packets().filter(|_| matches!(self.shutdown, Shutdown::None)) {
+            if let Some(data) = self
+                .tcb
+                .get_unordered_packets(buf.remaining())
+                .filter(|_| matches!(self.shutdown, Shutdown::None))
+            {
                 buf.put_slice(&data);
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                 let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
