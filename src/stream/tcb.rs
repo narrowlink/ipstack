@@ -203,7 +203,6 @@ impl Tcb {
 
     pub(super) fn update_last_received_ack(&mut self, ack: SeqNum) {
         self.last_received_ack = ack;
-        self.update_inflight_packet_queue(ack);
     }
 
     pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
