@@ -31,7 +31,7 @@ pub(super) enum PacketType {
 }
 
 #[derive(Debug)]
-pub(super) struct Tcb {
+pub(crate) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     last_received_ack: SeqNum,

@@ -167,13 +167,9 @@ async fn process_device_read(
             let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
             match ip_stack_stream {
-                IpStackStream::Tcp(ref mut stream) => {
-                    stream.set_destroy_messenger(tx);
-                }
-                IpStackStream::Udp(ref mut stream) => {
-                    stream.set_destroy_messenger(tx);
-                }
-                _ => unreachable!(),
+                IpStackStream::Tcp(ref mut stream) => stream.set_destroy_messenger(tx),
+                IpStackStream::Udp(ref mut stream) => stream.set_destroy_messenger(tx),
+                _ => return Err(IpStackError::UnsupportedTransportProtocol),
             }
             tokio::spawn(async move {
                 rx.await.ok();
@@ -199,9 +195,7 @@ fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: Pack
             let stream = IpStackUdpStream::new(src_addr, dst_addr, packet.payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout);
             Ok((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
-        TransportHeader::Unknown => {
-            unreachable!()
-        }
+        TransportHeader::Unknown => Err(IpStackError::UnsupportedTransportProtocol),
     }
 }
 
