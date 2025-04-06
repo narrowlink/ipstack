@@ -200,7 +200,7 @@ impl IpStackTcpStream {
     pub(crate) fn write_packet_to_device(&self, flags: u8, seq: Option<SeqNum>, payload: Option<Vec<u8>>) -> std::io::Result<usize> {
         use std::io::Error;
         let seq = seq.unwrap_or(self.tcb.get_seq()).0;
-        let (ack, window_size) = (self.tcb.get_ack().0, self.tcb.get_recv_window());
+        let (ack, window_size) = (self.tcb.get_ack().0, self.tcb.get_recv_window().max(self.mtu));
         let packet = self.create_rev_packet(flags, TTL, seq, ack, window_size, payload.unwrap_or_default())?;
         let len = packet.payload.len();
         self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
