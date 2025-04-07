@@ -58,11 +58,10 @@ pub struct IpStackTcpStream {
     stream_sender: PacketSender,
     stream_receiver: Option<PacketReceiver>,
     up_packet_sender: PacketSender,
-    tcb: std::sync::Arc<tokio::sync::Mutex<Tcb>>,
+    tcb: std::sync::Arc<std::sync::Mutex<Tcb>>,
     mtu: u16,
-    shutdown: std::sync::Arc<tokio::sync::Mutex<Shutdown>>,
-    // read_notify_for_shutdown: Option<Waker>,
-    write_notify: std::sync::Arc<tokio::sync::Mutex<Option<Waker>>>,
+    shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
+    write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     destroy_messenger: Option<tokio::sync::oneshot::Sender<()>>,
     timeout: Pin<Box<tokio::time::Sleep>>,
     timeout_interval: Duration,
@@ -81,7 +80,7 @@ impl IpStackTcpStream {
     ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let tcb = std::sync::Arc::new(tokio::sync::Mutex::new(Tcb::new(SeqNum(tcp.sequence_number))));
+        let tcb = std::sync::Arc::new(std::sync::Mutex::new(Tcb::new(SeqNum(tcp.sequence_number))));
         let deadline = tokio::time::Instant::now() + timeout_interval;
         let mut stream = IpStackTcpStream {
             src_addr,
@@ -91,9 +90,8 @@ impl IpStackTcpStream {
             up_packet_sender,
             tcb,
             mtu,
-            shutdown: std::sync::Arc::new(tokio::sync::Mutex::new(Shutdown::None)),
-            // read_notify_for_shutdown: None,
-            write_notify: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
+            write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             destroy_messenger: None,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             timeout_interval,
@@ -106,7 +104,7 @@ impl IpStackTcpStream {
         }
         let tuple = stream.network_tuple();
         if !tcp.rst {
-            let tcb = futures::executor::block_on(stream.tcb.lock());
+            let tcb = stream.tcb.lock().unwrap();
             if let Err(err) = Self::write_packet_to_device(&stream.up_packet_sender, tuple, mtu, &tcb, ACK | RST, None, None) {
                 log::warn!("Error sending RST/ACK packet: {:?}", err);
             }
@@ -145,6 +143,7 @@ impl IpStackTcpStream {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_rev_packet(
         tuple: NetworkTuple,
         tcb: &Tcb,
@@ -239,273 +238,26 @@ static SESSION_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 
 impl AsyncRead for IpStackTcpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        /*
-        // Always store the newest waker for read-notifier in shutdown state
-        self.read_notify_for_shutdown = Some(cx.waker().clone());
-        let network_tuple = self.network_tuple();
-        loop {
-            let state = self.tcb.get_state();
-            if state == TcpState::Closed {
-                self.shutdown.ready();
-                return Poll::Ready(Ok(()));
-            }
-
-            let final_reset = state == TcpState::TimeWait;
-            if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {
-                let (seq, ack) = (self.tcb.get_seq().0, self.tcb.get_ack().0);
-                let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-                if final_reset {
-                    log::trace!("{network_tuple} {state:?}: {l_info}, timeout reached, closing session regularly...");
-                } else {
-                    log::warn!("{network_tuple} {state:?}: {l_info}, session timeout reached, closing forcefully...");
-                    self.write_packet_to_device(ACK | RST, None, None)?;
-                }
-                self.tcb.change_state(TcpState::Closed);
-                self.shutdown.ready();
-                if final_reset {
-                    continue;
-                }
-                return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
-            }
-            self.reset_timeout(final_reset);
-
-            if state == TcpState::Listen {
-                self.tcb.increase_ack();
-                let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                let (seq, ack) = (self.tcb.get_seq().0, self.tcb.get_ack().0);
-                let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-                log::trace!("{network_tuple} {state:?}: {l_info} session begins, total sessions: {sessions}");
-                self.write_packet_to_device(ACK | SYN, None, None)?;
-                self.tcb.increase_seq();
-                self.tcb.change_state(TcpState::SynReceived);
-                continue;
-            }
-
-            if let Some(data) = self.tcb.get_unordered_packets(buf.remaining()) {
-                if state != TcpState::Established {
-                    let l_info = format!("local {{ seq: {}, ack: {} }}", self.tcb.get_seq(), self.tcb.get_ack());
-                    log::trace!("{network_tuple} {state:?}: {l_info} still receiving data, len = {}", data.len());
-                }
-                buf.put_slice(&data);
-                self.write_packet_to_device(ACK, None, None)?;
-                return Poll::Ready(Ok(()));
-            }
-            if state == TcpState::CloseWait {
-                self.write_packet_to_device(ACK | FIN, None, None)?;
-                self.tcb.increase_seq();
-                self.tcb.change_state(TcpState::LastAck);
-                continue;
-            }
-            if matches!(self.shutdown, Shutdown::Pending(_))
-                && state == TcpState::Established
-                && self.tcb.get_last_received_ack() == self.tcb.get_seq()
-            {
-                log::trace!("{network_tuple} {state:?}: Shutting down, actively send a farewell packet to the other side...");
-                self.write_packet_to_device(ACK | FIN, None, None)?;
-                self.tcb.increase_seq();
-                self.tcb.change_state(TcpState::FinWait1);
-                continue;
-            }
-            match self.stream_receiver.poll_recv(cx) {
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(network_packet)) => {
-                    let TransportHeader::Tcp(tcp_header) = network_packet.transport_header() else {
-                        return Poll::Ready(Err(std::io::Error::new(InvalidData, "Invalid TCP packet")));
-                    };
-                    let payload = &network_packet.payload;
-                    let flags = tcp_header_flags(tcp_header);
-                    let incoming_ack: SeqNum = tcp_header.acknowledgment_number.into();
-                    let incoming_seq: SeqNum = tcp_header.sequence_number.into();
-                    let window_size = tcp_header.window_size;
-                    if flags & RST == RST {
-                        self.tcb.change_state(TcpState::Closed);
-                        self.shutdown.ready();
-                        return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
-                    }
-
-                    self.tcb.update_inflight_packet_queue(incoming_ack);
-
-                    let pkt_type = self.tcb.check_pkt_type(tcp_header, payload);
-                    if pkt_type == PacketType::Invalid {
-                        continue;
-                    }
-
-                    let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
-                    let l_info = format!("local {{ seq: {}, ack: {} }}", self.tcb.get_seq(), self.tcb.get_ack());
-                    log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
-
-                    if self.tcb.get_state() == TcpState::SynReceived {
-                        if flags & ACK == ACK {
-                            self.tcb.update_last_received_ack(incoming_ack);
-                            self.tcb.update_send_window(window_size);
-                            if len > 0 {
-                                self.tcb.add_unordered_packet(incoming_seq, payload.clone());
-                            }
-                            self.tcb.change_state(TcpState::Established);
-                        }
-                    } else if self.tcb.get_state() == TcpState::Established {
-                        if flags == ACK {
-                            match pkt_type {
-                                PacketType::WindowUpdate => {
-                                    self.tcb.update_send_window(window_size);
-                                    self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
-                                    continue;
-                                }
-                                PacketType::KeepAlive => {
-                                    self.tcb.update_last_received_ack(incoming_ack);
-                                    self.tcb.update_send_window(window_size);
-                                    self.write_packet_to_device(ACK, None, None)?;
-                                    continue;
-                                }
-                                PacketType::RetransmissionRequest => {
-                                    self.tcb.update_send_window(window_size);
-                                    if let Some(packet) = self.tcb.find_inflight_packet(incoming_ack) {
-                                        self.write_packet_to_device(ACK | PSH, Some(packet.seq), Some(packet.payload.clone()))?;
-                                    } else {
-                                        log::error!("Packet {} not found in inflight_packets", incoming_ack);
-                                        log::error!("seq: {}", self.tcb.get_seq());
-                                        log::error!("last_received_ack: {}", self.tcb.get_last_received_ack());
-                                        log::error!("ack: {}", self.tcb.get_ack());
-                                        log::error!("inflight_packets:");
-                                        for p in self.tcb.get_all_inflight_packets().iter() {
-                                            log::error!("seq: {}", p.seq);
-                                            log::error!("payload len: {}", p.payload.len());
-                                        }
-                                        panic!("Please report these values at: https://github.com/narrowlink/ipstack/");
-                                    }
-                                    continue;
-                                }
-                                PacketType::NewPacket => {
-                                    // if incoming_seq != self.tcb.get_ack() {
-                                    //     dbg!(incoming_seq);
-                                    //     let packet = self.create_rev_packet(ACK, TTL, None, Vec::new())?;
-                                    //     self.up_packet_sender.send(packet).or(Err(ErrorKind::UnexpectedEof))?;
-                                    //     continue;
-                                    // }
-
-                                    self.tcb.update_last_received_ack(incoming_ack);
-                                    self.tcb.add_unordered_packet(incoming_seq, payload.clone());
-
-                                    self.tcb.update_send_window(window_size);
-                                    self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
-                                    continue;
-                                }
-                                PacketType::Ack => {
-                                    self.tcb.update_last_received_ack(incoming_ack);
-                                    self.tcb.update_send_window(window_size);
-                                    self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
-                                    continue;
-                                }
-                                PacketType::Invalid => continue,
-                            }
-                        }
-                        if flags == (ACK | FIN) {
-                            // The other side is closing the connection, we need to send an ACK and change state to CloseWait
-                            log::trace!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, closed by the other side...");
-                            self.tcb.increase_ack();
-                            self.write_packet_to_device(ACK, None, None)?;
-                            self.tcb.change_state(TcpState::CloseWait);
-                            continue;
-                        }
-                        if flags == (ACK | PSH) {
-                            if pkt_type != PacketType::NewPacket {
-                                continue;
-                            }
-                            self.tcb.update_last_received_ack(incoming_ack);
-                            if payload.is_empty() || self.tcb.get_ack() != incoming_seq {
-                                continue;
-                            }
-                            self.tcb.update_send_window(window_size);
-                            self.tcb.add_unordered_packet(incoming_seq, payload.clone());
-                            continue;
-                        }
-                    } else if self.tcb.get_state() == TcpState::LastAck {
-                        if flags == ACK {
-                            self.tcb.change_state(TcpState::Closed);
-                        }
-                    } else if self.tcb.get_state() == TcpState::FinWait1 {
-                        if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
-                            // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
-                            self.tcb.increase_ack();
-                            self.write_packet_to_device(ACK, None, None)?;
-                            self.tcb.update_send_window(window_size);
-                            self.tcb.change_state(TcpState::TimeWait);
-                            continue;
-                        }
-                        if flags & ACK == ACK && len == 0 {
-                            self.tcb.update_last_received_ack(incoming_ack);
-                            self.tcb.change_state(TcpState::FinWait2);
-                            continue;
-                        }
-                        if flags & (ACK | PSH) == (ACK | PSH) && len > 0 {
-                            // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                            self.tcb.update_last_received_ack(incoming_ack);
-                            self.tcb.add_unordered_packet(incoming_seq, payload.clone());
-                            self.tcb.update_send_window(window_size);
-                            self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
-                            self.tcb.change_state(TcpState::FinWait2);
-                            continue;
-                        }
-                    } else if self.tcb.get_state() == TcpState::FinWait2 {
-                        if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
-                            self.tcb.increase_ack();
-                            self.write_packet_to_device(ACK, None, None)?;
-                            self.tcb.update_send_window(window_size);
-                            self.tcb.change_state(TcpState::TimeWait);
-                            continue;
-                        }
-                        if flags & ACK == ACK && len == 0 {
-                            // unnormal case, we do nothing here
-                            self.tcb.update_send_window(window_size);
-                            let l_ack = self.tcb.get_ack();
-                            if incoming_seq < l_ack {
-                                log::trace!("{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {l_ack}");
-                            }
-                            continue;
-                        }
-                        if flags & (ACK | PSH) == (ACK | PSH) && len > 0 {
-                            // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                            self.tcb.update_last_received_ack(incoming_ack);
-                            self.tcb.add_unordered_packet(incoming_seq, payload.clone());
-                            self.tcb.update_send_window(window_size);
-                            self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
-                            if flags & FIN == FIN {
-                                self.tcb.change_state(TcpState::TimeWait);
-                            }
-                            continue;
-                        }
-                    } else if self.tcb.get_state() == TcpState::TimeWait && flags & (ACK | FIN) == (ACK | FIN) {
-                        self.write_packet_to_device(ACK, None, None)?;
-                        // wait to timeout, can't change state here
-                        // self.tcb.change_state(TcpState::Closed);
-                        // now we need to wait for the timeout to reach...
-                    }
-                }
-            }
-        }
-        // */
-        // self.read_notify_for_shutdown = Some(cx.waker().clone());
         let network_tuple = self.network_tuple();
 
-        let state = futures::executor::block_on(self.tcb.lock()).get_state();
+        let state = self.tcb.lock().unwrap().get_state();
         if state == TcpState::Closed {
-            futures::executor::block_on(self.shutdown.lock()).ready();
+            self.shutdown.lock().unwrap().ready();
             return Poll::Ready(Ok(()));
         }
 
         // handle timeout
         if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {
             {
-                let mut tcb = futures::executor::block_on(self.tcb.lock());
+                let mut tcb = self.tcb.lock().unwrap();
                 let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
                 let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
                 log::warn!("{network_tuple} {state:?}: {l_info}, session timeout reached, closing forcefully...");
                 let sender = &self.up_packet_sender;
-                Self::write_packet_to_device(&sender, network_tuple, self.mtu, &tcb, ACK | RST, None, None)?;
+                Self::write_packet_to_device(sender, network_tuple, self.mtu, &tcb, ACK | RST, None, None)?;
                 tcb.change_state(TcpState::Closed);
             }
-            futures::executor::block_on(self.shutdown.lock()).ready();
+            self.shutdown.lock().unwrap().ready();
             return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         }
         self.reset_timeout();
@@ -526,7 +278,7 @@ impl AsyncWrite for IpStackTcpStream {
     fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let nt = self.network_tuple();
         let (state, send_window, avg_send_window, is_send_buffer_full) = {
-            let tcb = futures::executor::block_on(self.tcb.lock());
+            let tcb = self.tcb.lock().unwrap();
             (
                 tcb.get_state(),
                 tcb.get_send_window(),
@@ -537,13 +289,13 @@ impl AsyncWrite for IpStackTcpStream {
         self.reset_timeout();
 
         if (send_window as u64) < avg_send_window / 2 || is_send_buffer_full {
-            self.write_notify = std::sync::Arc::new(tokio::sync::Mutex::new(Some(cx.waker().clone())));
+            self.write_notify = std::sync::Arc::new(std::sync::Mutex::new(Some(cx.waker().clone())));
             return Poll::Pending;
         }
 
-        let mut tcb = futures::executor::block_on(self.tcb.lock());
+        let mut tcb = self.tcb.lock().unwrap();
         let sender = &self.up_packet_sender;
-        let payload_len = Self::write_packet_to_device(&sender, nt, self.mtu, &tcb, ACK | PSH, None, Some(buf.to_vec()))?;
+        let payload_len = Self::write_packet_to_device(sender, nt, self.mtu, &tcb, ACK | PSH, None, Some(buf.to_vec()))?;
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
 
         let l_info = format!("local {{ seq: {}, ack: {} }}", tcb.get_seq(), tcb.get_ack());
@@ -557,18 +309,14 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match *futures::executor::block_on(self.shutdown.lock()) {
+        match *self.shutdown.lock().unwrap() {
             Shutdown::None => {
-                futures::executor::block_on(self.shutdown.lock()).pending(cx.waker().clone());
-                // self.read_notify_for_shutdown.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                self.shutdown.lock().unwrap().pending(cx.waker().clone());
                 Poll::Pending
             }
-            Shutdown::Pending(_) => {
-                // self.read_notify_for_shutdown.take().map(|w| w.wake_by_ref()).unwrap_or(());
-                Poll::Pending
-            }
+            Shutdown::Pending(_) => Poll::Pending,
             Shutdown::Ready => {
-                let (nt, state) = (self.network_tuple(), futures::executor::block_on(self.tcb.lock()).get_state());
+                let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
                 let sessions = SESSION_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
                 log::trace!("{nt} {state:?}: session closed, total sessions: {sessions}");
                 Poll::Ready(Ok(()))
@@ -587,7 +335,6 @@ impl Drop for IpStackTcpStream {
 
 impl IpStackTcpStream {
     fn spawn_tasks(&mut self) -> std::io::Result<()> {
-        // let data_tx = self.data_tx.clone();
         let network_tuple = self.network_tuple();
         let data_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
@@ -601,7 +348,7 @@ impl IpStackTcpStream {
         let write_notify = self.write_notify.clone();
         tokio::spawn(async move {
             {
-                let mut tcb = tcb.lock().await;
+                let mut tcb = tcb.lock().unwrap();
 
                 let state = tcb.get_state();
                 if state != TcpState::Listen {
@@ -623,9 +370,9 @@ impl IpStackTcpStream {
             type ExitNotifier = tokio::sync::mpsc::Sender<()>;
             let (exit_notifier, mut exit_receiver) = tokio::sync::mpsc::channel::<()>(u16::MAX as usize);
 
-            async fn task_wait_to_close(tcb: std::sync::Arc<tokio::sync::Mutex<Tcb>>, notifier: ExitNotifier) {
+            async fn task_wait_to_close(tcb: std::sync::Arc<std::sync::Mutex<Tcb>>, notifier: ExitNotifier) {
                 tokio::time::sleep(TWO_MSL).await;
-                tcb.lock().await.change_state(TcpState::Closed);
+                tcb.lock().unwrap().change_state(TcpState::Closed);
                 notifier.send(()).await.unwrap_or(());
             }
 
@@ -635,15 +382,15 @@ impl IpStackTcpStream {
                         network_packet
                     }
                     Some(_) = exit_receiver.recv() => {
-                        let state = tcb.lock().await.get_state();
+                        let state = tcb.lock().unwrap().get_state();
                         if state != TcpState::Closed {
                             log::debug!("{network_tuple} {state:?}: session closed unexpectedly");
                         }
-                        shutdown.lock().await.ready();
+                        shutdown.lock().unwrap().ready();
                         break;
                     }
                     else => {
-                        let state = tcb.lock().await.get_state();
+                        let state = tcb.lock().unwrap().get_state();
                         log::debug!("{network_tuple} {state:?}: session closed unexpectedly");
                         break;
                     }
@@ -660,20 +407,20 @@ impl IpStackTcpStream {
                 let window_size = tcp_header.window_size;
 
                 if flags & RST == RST {
-                    tcb.lock().await.change_state(TcpState::Closed);
+                    tcb.lock().unwrap().change_state(TcpState::Closed);
                     let exit_notifier = exit_notifier.clone();
                     tokio::spawn(async move { exit_notifier.send(()).await.unwrap_or(()) });
                     continue;
                 }
 
-                tcb.lock().await.update_inflight_packet_queue(incoming_ack);
-                let pkt_type = tcb.lock().await.check_pkt_type(tcp_header, payload);
+                tcb.lock().unwrap().update_inflight_packet_queue(incoming_ack);
+                let pkt_type = tcb.lock().unwrap().check_pkt_type(tcp_header, payload);
                 if pkt_type == PacketType::Invalid {
                     continue;
                 }
 
                 let (state, seq, ack) = {
-                    let tcb = tcb.lock().await;
+                    let tcb = tcb.lock().unwrap();
                     (tcb.get_state(), tcb.get_seq().0, tcb.get_ack().0)
                 };
                 let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
@@ -683,59 +430,59 @@ impl IpStackTcpStream {
                 match state {
                     TcpState::SynReceived => {
                         if flags & ACK == ACK {
-                            tcb.lock().await.update_last_received_ack(incoming_ack);
-                            tcb.lock().await.update_send_window(window_size);
+                            tcb.lock().unwrap().update_last_received_ack(incoming_ack);
+                            tcb.lock().unwrap().update_send_window(window_size);
                             if len > 0 {
-                                tcb.lock().await.add_unordered_packet(incoming_seq, payload.to_vec());
+                                tcb.lock().unwrap().add_unordered_packet(incoming_seq, payload.to_vec());
                                 data_notify_clone.notify_one();
                             }
-                            tcb.lock().await.change_state(TcpState::Established);
+                            tcb.lock().unwrap().change_state(TcpState::Established);
                         }
                     }
                     TcpState::Established => {
                         if flags == ACK {
                             match pkt_type {
                                 PacketType::WindowUpdate => {
-                                    tcb.lock().await.update_send_window(window_size);
-                                    write_notify.lock().await.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                                    tcb.lock().unwrap().update_send_window(window_size);
+                                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                                     continue;
                                 }
                                 PacketType::KeepAlive => {
-                                    let mut tcb = tcb.lock().await;
+                                    let mut tcb = tcb.lock().unwrap();
                                     tcb.update_last_received_ack(incoming_ack);
                                     tcb.update_send_window(window_size);
                                     Self::write_packet_to_device(&up_packet_sender, network_tuple, mtu, &tcb, ACK, None, None)?;
                                     continue;
                                 }
                                 PacketType::RetransmissionRequest => {
-                                    tcb.lock().await.update_send_window(window_size);
-                                    if let Some(packet) = tcb.lock().await.find_inflight_packet(incoming_ack) {
+                                    tcb.lock().unwrap().update_send_window(window_size);
+                                    if let Some(packet) = tcb.lock().unwrap().find_inflight_packet(incoming_ack) {
                                         let s = Some(packet.seq);
                                         let p = Some(packet.payload.clone());
-                                        let tcb = tcb.lock().await;
+                                        let tcb = tcb.lock().unwrap();
                                         Self::write_packet_to_device(&up_packet_sender, network_tuple, mtu, &tcb, ACK | PSH, s, p)?;
                                     }
                                     continue;
                                 }
                                 PacketType::NewPacket => {
-                                    tcb.lock().await.update_last_received_ack(incoming_ack);
-                                    tcb.lock().await.add_unordered_packet(incoming_seq, payload.clone());
+                                    tcb.lock().unwrap().update_last_received_ack(incoming_ack);
+                                    tcb.lock().unwrap().add_unordered_packet(incoming_seq, payload.clone());
                                     data_notify_clone.notify_one();
-                                    tcb.lock().await.update_send_window(window_size);
-                                    write_notify.lock().await.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                                    tcb.lock().unwrap().update_send_window(window_size);
+                                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                                     continue;
                                 }
                                 PacketType::Ack => {
-                                    tcb.lock().await.update_last_received_ack(incoming_ack);
-                                    tcb.lock().await.update_send_window(window_size);
-                                    write_notify.lock().await.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                                    tcb.lock().unwrap().update_last_received_ack(incoming_ack);
+                                    tcb.lock().unwrap().update_send_window(window_size);
+                                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                                     continue;
                                 }
                                 PacketType::Invalid => {}
                             }
 
-                            let mut tcb = tcb.lock().await;
-                            if matches!(*shutdown.lock().await, Shutdown::Pending(_)) && tcb.get_last_received_ack() == tcb.get_seq() {
+                            let mut tcb = tcb.lock().unwrap();
+                            if matches!(*shutdown.lock().unwrap(), Shutdown::Pending(_)) && tcb.get_last_received_ack() == tcb.get_seq() {
                                 let nt = network_tuple;
                                 log::trace!("{nt} {state:?}: Shutting down, actively send a farewell packet to the other side...");
                                 Self::write_packet_to_device(&up_packet_sender, network_tuple, mtu, &tcb, ACK | FIN, None, None)?;
@@ -745,7 +492,7 @@ impl IpStackTcpStream {
                         }
                         if flags == (ACK | FIN) {
                             // The other side is closing the connection, we need to send an ACK and change state to CloseWait
-                            let mut tcb = tcb.lock().await;
+                            let mut tcb = tcb.lock().unwrap();
                             log::trace!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, closed by the other side...");
                             tcb.increase_ack();
                             Self::write_packet_to_device(&up_packet_sender, network_tuple, mtu, &tcb, ACK, None, None)?;
@@ -753,7 +500,7 @@ impl IpStackTcpStream {
                             continue;
                         }
                         if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
-                            let mut tcb = tcb.lock().await;
+                            let mut tcb = tcb.lock().unwrap();
                             tcb.update_last_received_ack(incoming_ack);
                             if !payload.is_empty() && tcb.get_ack() == incoming_seq {
                                 tcb.update_send_window(window_size);
@@ -765,7 +512,7 @@ impl IpStackTcpStream {
                     }
                     TcpState::CloseWait => {
                         if flags == ACK {
-                            let mut tcb = tcb.lock().await;
+                            let mut tcb = tcb.lock().unwrap();
                             Self::write_packet_to_device(&up_packet_sender, network_tuple, mtu, &tcb, ACK | FIN, None, None)?;
                             tcb.increase_seq();
                             tcb.change_state(TcpState::LastAck);
@@ -773,14 +520,14 @@ impl IpStackTcpStream {
                     }
                     TcpState::LastAck => {
                         if flags == ACK {
-                            tcb.lock().await.change_state(TcpState::Closed);
+                            tcb.lock().unwrap().change_state(TcpState::Closed);
                             let exit_notifier = exit_notifier.clone();
                             tokio::spawn(async move { exit_notifier.send(()).await.unwrap_or(()) });
                         }
                     }
                     TcpState::FinWait1 => {
                         if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
-                            let mut tcb = tcb.lock().await;
+                            let mut tcb = tcb.lock().unwrap();
                             // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
                             tcb.increase_ack();
                             Self::write_packet_to_device(&up_packet_sender, network_tuple, mtu, &tcb, ACK, None, None)?;
@@ -790,37 +537,37 @@ impl IpStackTcpStream {
                             continue;
                         }
                         if flags & ACK == ACK && len == 0 {
-                            let mut tcb = tcb.lock().await;
+                            let mut tcb = tcb.lock().unwrap();
                             tcb.update_last_received_ack(incoming_ack);
                             tcb.change_state(TcpState::FinWait2);
                             continue;
                         }
                         if flags & (ACK | PSH) == (ACK | PSH) && len > 0 {
-                            let mut tcb = tcb.lock().await;
+                            let mut tcb = tcb.lock().unwrap();
                             // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                             tcb.update_last_received_ack(incoming_ack);
                             tcb.add_unordered_packet(incoming_seq, payload.clone());
                             data_notify_clone.notify_one();
                             tcb.update_send_window(window_size);
                             tcb.change_state(TcpState::FinWait2);
-                            write_notify.lock().await.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                             continue;
                         }
                     }
                     TcpState::FinWait2 => {
                         if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
-                            tcb.lock().await.increase_ack();
-                            let _tcb = tcb.lock().await;
+                            tcb.lock().unwrap().increase_ack();
+                            let _tcb = tcb.lock().unwrap();
                             Self::write_packet_to_device(&up_packet_sender, network_tuple, mtu, &_tcb, ACK, None, None)?;
-                            tcb.lock().await.update_send_window(window_size);
-                            tcb.lock().await.change_state(TcpState::TimeWait);
+                            tcb.lock().unwrap().update_send_window(window_size);
+                            tcb.lock().unwrap().change_state(TcpState::TimeWait);
                             tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier.clone()));
                             continue;
                         }
                         if flags & ACK == ACK && len == 0 {
                             // unnormal case, we do nothing here
-                            tcb.lock().await.update_send_window(window_size);
-                            let l_ack = tcb.lock().await.get_ack();
+                            tcb.lock().unwrap().update_send_window(window_size);
+                            let l_ack = tcb.lock().unwrap().get_ack();
                             if incoming_seq < l_ack {
                                 log::trace!("{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {l_ack}");
                             }
@@ -828,12 +575,12 @@ impl IpStackTcpStream {
                         }
                         if flags & (ACK | PSH) == (ACK | PSH) && len > 0 {
                             // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                            tcb.lock().await.update_last_received_ack(incoming_ack);
-                            tcb.lock().await.add_unordered_packet(incoming_seq, payload.clone());
-                            tcb.lock().await.update_send_window(window_size);
-                            write_notify.lock().await.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            tcb.lock().unwrap().update_last_received_ack(incoming_ack);
+                            tcb.lock().unwrap().add_unordered_packet(incoming_seq, payload.clone());
+                            tcb.lock().unwrap().update_send_window(window_size);
+                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                             if flags & FIN == FIN {
-                                tcb.lock().await.change_state(TcpState::TimeWait);
+                                tcb.lock().unwrap().change_state(TcpState::TimeWait);
                                 tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier.clone()));
                             }
                             continue;
@@ -841,7 +588,7 @@ impl IpStackTcpStream {
                     }
                     TcpState::TimeWait => {
                         if flags & (ACK | FIN) == (ACK | FIN) {
-                            let tcb = tcb.lock().await;
+                            let tcb = tcb.lock().unwrap();
                             Self::write_packet_to_device(&up_packet_sender, network_tuple, mtu, &tcb, ACK, None, None)?;
                             // wait to timeout, can't call `tcb.change_state(TcpState::Closed);` to change state here
                             // now we need to wait for the timeout to reach...
@@ -860,12 +607,15 @@ impl IpStackTcpStream {
         let data_notify_clone = data_notify.clone();
         tokio::spawn(async move {
             loop {
-                data_notify_clone.notified().await;
-                let mut tcb = tcb.lock().await;
+                tokio::select! {
+                    _ = data_notify_clone.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(1000)) => {},
+                };
+                let mut tcb = tcb.lock().unwrap();
                 if let Some(data) = tcb.get_unordered_packets(u16::MAX as usize) {
-                    let state = tcb.get_state();
+                    let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
                     if state != TcpState::Established {
-                        let l_info = format!("local {{ seq: {}, ack: {} }}", tcb.get_seq(), tcb.get_ack());
+                        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
                         log::trace!("{network_tuple} {state:?}: {l_info} still receiving data, len = {}", data.len());
                     }
                     data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;

@@ -30,7 +30,7 @@ pub(super) enum PacketType {
     KeepAlive,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
@@ -161,6 +161,7 @@ impl Tcb {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
         let rcvd_window = tcp_header.window_size;
+        let len = payload.len();
         let res = if rcvd_ack > self.seq {
             PacketType::Invalid
         } else {
@@ -187,7 +188,7 @@ impl Tcb {
             }
         };
         #[rustfmt::skip]
-        log::trace!("received {{ ack = {rcvd_ack}, seq = {rcvd_seq}, window = {rcvd_window} }}, self {{ ack = {}, seq = {}, send_window = {} }}, {res:?}", self.ack, self.seq, self.send_window);
+        log::trace!("received {{ ack = {:08X?}, seq = {:08X?}, window = {rcvd_window} }}, self {{ ack = {:08X?}, seq = {:08X?}, send_window = {} }}, len = {len}, {res:?}", rcvd_ack.0, rcvd_seq.0, self.ack.0, self.seq.0, self.send_window);
         res
     }
 

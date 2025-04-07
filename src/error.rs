@@ -25,6 +25,9 @@ pub enum IpStackError {
     SendError(#[from] tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>),
 }
 
+unsafe impl Send for IpStackError {}
+unsafe impl Sync for IpStackError {}
+
 impl From<IpStackError> for std::io::Error {
     fn from(e: IpStackError) -> Self {
         match e {
