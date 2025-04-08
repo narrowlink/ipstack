@@ -34,6 +34,7 @@ pub(super) enum PacketType {
 pub(crate) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
+    mtu: u16,
     last_received_ack: SeqNum,
     send_window: u16,
     state: TcpState,
@@ -43,7 +44,7 @@ pub(crate) struct Tcb {
 }
 
 impl Tcb {
-    pub(super) fn new(ack: SeqNum) -> Tcb {
+    pub(super) fn new(ack: SeqNum, mtu: u16) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
@@ -51,6 +52,7 @@ impl Tcb {
         Tcb {
             seq: seq.into(),
             ack,
+            mtu,
             last_received_ack: seq.into(),
             send_window: u16::MAX,
             state: TcpState::Listen,
@@ -121,6 +123,9 @@ impl Tcb {
     }
     pub(super) fn get_ack(&self) -> SeqNum {
         self.ack
+    }
+    pub(super) fn get_mtu(&self) -> u16 {
+        self.mtu
     }
     pub(super) fn get_last_received_ack(&self) -> SeqNum {
         self.last_received_ack
@@ -297,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_get_unordered_packets_with_max_bytes() {
-        let mut tcb = Tcb::new(SeqNum(1000));
+        let mut tcb = Tcb::new(SeqNum(1000), 1500);
 
         // insert 3 consecutive packets
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]); // seq=1000, len=500
@@ -329,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_update_inflight_packet_queue() {
-        let mut tcb = Tcb::new(SeqNum(1000));
+        let mut tcb = Tcb::new(SeqNum(1000), 1500);
         tcb.seq = SeqNum(100); // setting the initial seq
 
         // insert 3 consecutive packets
@@ -353,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_update_inflight_packet_queue_cumulative_ack() {
-        let mut tcb = Tcb::new(SeqNum(1000));
+        let mut tcb = Tcb::new(SeqNum(1000), 1500);
         tcb.seq = SeqNum(1000);
 
         // Insert 3 consecutive packets
