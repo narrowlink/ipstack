@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
@@ -41,6 +42,8 @@ pub(crate) struct Tcb {
     avg_send_window: Average,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
+    duplicate_ack_count: usize,
+    duplicate_ack_count_helper: SeqNum,
 }
 
 impl Tcb {
@@ -59,7 +62,23 @@ impl Tcb {
             avg_send_window: Average::default(),
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
+            duplicate_ack_count: 0,
+            duplicate_ack_count_helper: seq.into(),
         }
+    }
+
+    pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
+        // If the received rcvd_ack is the same as duplicate_ack_count_helper and not all data has been acknowledged (rcvd_ack < self.seq), increment the count.
+        if rcvd_ack == self.duplicate_ack_count_helper && rcvd_ack < self.seq {
+            self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
+        } else {
+            self.duplicate_ack_count_helper = rcvd_ack;
+            self.duplicate_ack_count = 0; // reset duplicate ACK count
+        }
+    }
+
+    pub fn is_duplicate_ack_count_exceeded(&self) -> bool {
+        self.duplicate_ack_count >= MAX_COUNT_FOR_DUP_ACK
     }
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
@@ -175,7 +194,7 @@ impl Tcb {
                 std::cmp::Ordering::Equal => {
                     if !payload.is_empty() {
                         PacketType::NewPacket
-                    } else if self.send_window == rcvd_window && self.seq != self.last_received_ack {
+                    } else if self.send_window == rcvd_window && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
                         PacketType::RetransmissionRequest
                     } else if self.ack - 1 == rcvd_seq {
                         PacketType::KeepAlive

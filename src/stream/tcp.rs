@@ -420,6 +420,8 @@ impl IpStackTcpStream {
                     continue;
                 }
 
+                tcb.update_duplicate_ack_count(incoming_ack);
+
                 tcb.update_inflight_packet_queue(incoming_ack);
                 let pkt_type = tcb.check_pkt_type(tcp_header, payload);
                 if pkt_type == PacketType::Invalid {
@@ -460,9 +462,9 @@ impl IpStackTcpStream {
                                 PacketType::RetransmissionRequest => {
                                     tcb.update_send_window(incoming_win);
                                     if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
-                                        let s = Some(packet.seq);
-                                        let p = Some(packet.payload.clone());
-                                        Self::write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | PSH, s, p)?;
+                                        let (s, p) = (packet.seq, packet.payload.clone());
+                                        log::info!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}", p.len());
+                                        Self::write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | PSH, Some(s), Some(p))?;
                                     }
                                     continue;
                                 }
