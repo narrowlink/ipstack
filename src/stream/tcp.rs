@@ -608,16 +608,16 @@ impl IpStackTcpStream {
             loop {
                 let duration = Duration::from_millis(1000);
                 tokio::time::timeout(duration, data_notify_clone.notified()).await.ok();
+                let mut tcb = tcb.lock().unwrap();
+                let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
+                let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
                 if exit_flag_clone.load(std::sync::atomic::Ordering::SeqCst) {
-                    log::debug!("{network_tuple} session closed, exiting \"data extraction task\"...");
+                    log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
                     break;
                 }
 
-                let mut tcb = tcb.lock().unwrap();
                 if let Some(data) = tcb.get_unordered_packets(4096) {
-                    let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
                     let hint = if state == TcpState::Established { "normally" } else { "still" };
-                    let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
                     log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
                     data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
                     read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
