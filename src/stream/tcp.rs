@@ -67,6 +67,7 @@ pub struct IpStackTcpStream {
     timeout_interval: Duration,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
 }
 
 impl IpStackTcpStream {
@@ -97,6 +98,7 @@ impl IpStackTcpStream {
             timeout_interval,
             data_tx,
             data_rx,
+            read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         if tcp.syn {
             stream.spawn_tasks()?;
@@ -269,7 +271,10 @@ impl AsyncRead for IpStackTcpStream {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                self.read_notify.lock().unwrap().replace(cx.waker().clone());
+                Poll::Pending
+            }
         }
     }
 }
@@ -596,6 +601,7 @@ impl IpStackTcpStream {
         let tcb = self.tcb.clone();
         let up_packet_sender = self.up_packet_sender.clone();
         let data_tx = self.data_tx.clone();
+        let read_notify = self.read_notify.clone();
         let data_notify_clone = data_notify.clone();
         let exit_flag_clone = exit_flag.clone();
         tokio::spawn(async move {
@@ -614,6 +620,7 @@ impl IpStackTcpStream {
                     let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
                     log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
                     data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
+                    read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     Self::write_packet_to_device(&up_packet_sender, network_tuple, mtu, &tcb, ACK, None, None)?;
                 }
             }
