@@ -244,7 +244,7 @@ impl Tcb {
     }
 
     pub fn is_send_buffer_full(&self) -> bool {
-        (self.seq - self.last_received_ack).0 >= MAX_UNACK
+        self.seq.distance(self.last_received_ack) >= MAX_UNACK
     }
 }
 
