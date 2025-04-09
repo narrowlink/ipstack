@@ -304,7 +304,8 @@ impl AsyncWrite for IpStackTcpStream {
 
         log::debug!("{nt} {state:?}: current send window: {send_window}, average send window: {avg_send_window}, is send buffer full: {is_send_buffer_full}");
 
-        if (send_window as u64) < avg_send_window / 2 || is_send_buffer_full {
+        // if (send_window as u64) < avg_send_window / 2 || is_send_buffer_full {
+        if send_window == 0 || is_send_buffer_full {
             self.write_notify.lock().unwrap().replace(cx.waker().clone());
             log::debug!("{nt} {state:?}: send buffer is full, waiting for the other side to send ACK...");
             return Poll::Pending;
