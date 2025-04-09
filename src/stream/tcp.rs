@@ -18,6 +18,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+type ExitNotifier = tokio::sync::mpsc::Sender<Option<NetworkPacket>>;
 
 /// 2 * MSL (Maximum Segment Lifetime) is the maximum time a TCP connection can be in the TIME_WAIT state.
 const TWO_MSL: Duration = Duration::from_secs(2);
@@ -67,6 +68,7 @@ pub struct IpStackTcpStream {
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    exit_notifier: Option<ExitNotifier>,
 }
 
 impl IpStackTcpStream {
@@ -97,6 +99,7 @@ impl IpStackTcpStream {
             data_tx,
             data_rx,
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            exit_notifier: None,
         };
         if tcp.syn {
             let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
@@ -266,6 +269,11 @@ impl AsyncRead for IpStackTcpStream {
                 tcb.change_state(TcpState::Closed);
             }
             self.shutdown.lock().unwrap().ready();
+            self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            if let Some(n) = self.exit_notifier.take() {
+                std::thread::spawn(move || n.blocking_send(None).unwrap_or(())).join().unwrap_or(());
+            }
+
             return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         }
         self.reset_timeout();
@@ -362,6 +370,8 @@ impl IpStackTcpStream {
         let network_tuple = self.network_tuple();
         let data_notify = std::sync::Arc::new(tokio::sync::Notify::new());
         let exit_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (exit_notifier, mut exit_receiver) = tokio::sync::mpsc::channel::<Option<NetworkPacket>>(u16::MAX as usize);
+        self.exit_notifier = Some(exit_notifier.clone());
 
         // task 1: data receiving and processing
         let data_notify_clone = data_notify.clone();
@@ -392,8 +402,6 @@ impl IpStackTcpStream {
             }
 
             let tcb_clone = tcb.clone();
-            type ExitNotifier = tokio::sync::mpsc::Sender<Option<NetworkPacket>>;
-            let (exit_notifier, mut exit_receiver) = tokio::sync::mpsc::channel::<Option<NetworkPacket>>(u16::MAX as usize);
 
             async fn task_wait_to_close(tcb: std::sync::Arc<std::sync::Mutex<Tcb>>, exit_notifier: ExitNotifier) {
                 tokio::time::sleep(TWO_MSL).await;
@@ -620,7 +628,7 @@ impl IpStackTcpStream {
                     }
                     _ => {}
                 }
-            }
+            } // end of loop
             Ok::<(), std::io::Error>(())
         });
 
