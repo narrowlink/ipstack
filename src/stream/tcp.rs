@@ -521,14 +521,11 @@ impl IpStackTcpStream {
                             Self::write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
                             tcb.change_state(TcpState::CloseWait);
 
-                            // delay some time (we assume 0.2 second here) and then change state to LastAck,
-                            // the dummy packet is used to make the progress of shutdown more smooth
-                            let dummy_packet = network_packet.clone();
-                            let exit_notifier = exit_notifier.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                                exit_notifier.send(Some(dummy_packet)).await.unwrap_or(())
-                            });
+                            // Here we don't wait, just send FIN to the other side and change state to LastAck directly,
+                            // or we encounter some errors in Windows.
+                            Self::write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | FIN, None, None)?;
+                            tcb.increase_seq();
+                            tcb.change_state(TcpState::LastAck);
 
                             continue;
                         }
