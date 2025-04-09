@@ -99,6 +99,15 @@ impl IpStackTcpStream {
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         if tcp.syn {
+            let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
+            let (seq, ack, state) = {
+                let tcb = stream.tcb.lock().unwrap();
+                (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state())
+            };
+            let network_tuple = stream.network_tuple();
+            let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+            log::debug!("{network_tuple} {state:?}: {l_info} session begins, total sessions: {sessions}");
+
             stream.spawn_tasks()?;
             return Ok(stream);
         }
@@ -241,6 +250,7 @@ impl AsyncRead for IpStackTcpStream {
         let state = self.tcb.lock().unwrap().get_state();
         if state == TcpState::Closed {
             self.shutdown.lock().unwrap().ready();
+            self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
             return Poll::Ready(Ok(()));
         }
 
@@ -286,6 +296,12 @@ impl AsyncWrite for IpStackTcpStream {
             (state, tcb.get_send_window(), tcb.get_avg_send_window(), tcb.is_send_buffer_full())
         };
 
+        if state == TcpState::Closed {
+            self.shutdown.lock().unwrap().ready();
+            self.read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
+        }
+
         log::debug!("{nt} {state:?}: current send window: {send_window}, average send window: {avg_send_window}, is send buffer full: {is_send_buffer_full}");
 
         if (send_window as u64) < avg_send_window / 2 || is_send_buffer_full {
@@ -319,8 +335,7 @@ impl AsyncWrite for IpStackTcpStream {
             Shutdown::Pending(_) => Poll::Pending,
             Shutdown::Ready => {
                 let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
-                let sessions = SESSION_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
-                log::trace!("{nt} {state:?}: session closed, total sessions: {sessions}");
+                log::trace!("{nt} {state:?}: poll_shutdown called, session closed");
                 Poll::Ready(Ok(()))
             }
         }
@@ -329,6 +344,12 @@ impl AsyncWrite for IpStackTcpStream {
 
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
+        let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
+        if state != TcpState::Listen {
+            let sessions = SESSION_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst).saturating_sub(1);
+            log::trace!("{nt} {state:?}: session dropped, total sessions: {sessions}");
+        }
+
         if let Some(messenger) = self.destroy_messenger.take() {
             let _ = messenger.send(());
         }
@@ -348,6 +369,7 @@ impl IpStackTcpStream {
         let up_packet_sender = self.up_packet_sender.clone();
         let shutdown = self.shutdown.clone();
         let write_notify = self.write_notify.clone();
+        let read_notify_clone = self.read_notify.clone();
         let exit_flag_clone = exit_flag.clone();
         tokio::spawn(async move {
             {
@@ -360,45 +382,43 @@ impl IpStackTcpStream {
                 }
 
                 tcb.increase_ack();
-                let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
                 let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-                log::trace!("{network_tuple} {state:?}: {l_info} session begins, total sessions: {sessions}");
+                log::debug!("{network_tuple} {state:?}: {l_info} session begins");
                 Self::write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | SYN, None, None)?;
                 tcb.increase_seq();
                 tcb.change_state(TcpState::SynReceived);
             }
 
             let tcb_clone = tcb.clone();
-            type ExitNotifier = tokio::sync::mpsc::Sender<()>;
-            let (exit_notifier, mut exit_receiver) = tokio::sync::mpsc::channel::<()>(u16::MAX as usize);
+            type ExitNotifier = tokio::sync::mpsc::Sender<Option<NetworkPacket>>;
+            let (exit_notifier, mut exit_receiver) = tokio::sync::mpsc::channel::<Option<NetworkPacket>>(u16::MAX as usize);
 
-            async fn task_wait_to_close(tcb: std::sync::Arc<std::sync::Mutex<Tcb>>, notifier: ExitNotifier) {
+            async fn task_wait_to_close(tcb: std::sync::Arc<std::sync::Mutex<Tcb>>, exit_notifier: ExitNotifier) {
                 tokio::time::sleep(TWO_MSL).await;
                 tcb.lock().unwrap().change_state(TcpState::Closed);
-                notifier.send(()).await.unwrap_or(());
+                exit_notifier.send(None).await.unwrap_or(());
             }
 
             loop {
                 let network_packet = tokio::select! {
-                    Some(network_packet) = stream_receiver.recv() => {
-                        network_packet
-                    }
-                    Some(_) = exit_receiver.recv() => {
-                        let state = tcb.lock().unwrap().get_state();
-                        let hint =  if state == TcpState::Closed { "gracefully" } else { "unexpectedly" };
-                        let ending = "exit \"data receiving and processing task\"";
-                        log::debug!("{network_tuple} {state:?}: session closed {hint}, {ending}");
-                        shutdown.lock().unwrap().ready();
-                        exit_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                        break;
-                    }
-                    else => {
-                        let state = tcb.lock().unwrap().get_state();
-                        let ending = "exit \"data receiving and processing task\"";
-                        log::debug!("{network_tuple} {state:?}: session closed unexpectedly, {ending}");
-                        break;
-                    }
+                    network_packet = stream_receiver.recv() => network_packet,
+                    Some(dummy_packet) = exit_receiver.recv() => dummy_packet,
+                    else => None,
+                };
+
+                let Some(network_packet) = network_packet else {
+                    // log::debug!("{network_tuple} session closed, dummy packet: {packet:?}");
+                    let state = { tcb.lock().unwrap().get_state() };
+                    let hint = if state == TcpState::Closed { "gracefully" } else { "unexpectedly" };
+                    let ending = "exit \"data receiving and processing task\"";
+                    log::debug!("{network_tuple} {state:?}: session closed {hint}, {ending}");
+                    shutdown.lock().unwrap().ready();
+                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    read_notify_clone.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    data_notify_clone.notify_one();
+                    exit_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
                 };
 
                 let TransportHeader::Tcp(tcp_header) = network_packet.transport_header() else {
@@ -416,7 +436,7 @@ impl IpStackTcpStream {
                 if flags & RST == RST {
                     tcb.change_state(TcpState::Closed);
                     let exit_notifier = exit_notifier.clone();
-                    tokio::spawn(async move { exit_notifier.send(()).await.unwrap_or(()) });
+                    tokio::spawn(async move { exit_notifier.send(None).await.unwrap_or(()) });
                     continue;
                 }
 
@@ -424,14 +444,14 @@ impl IpStackTcpStream {
 
                 tcb.update_inflight_packet_queue(incoming_ack);
                 let pkt_type = tcb.check_pkt_type(tcp_header, payload);
-                if pkt_type == PacketType::Invalid {
-                    continue;
-                }
 
                 let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq().0, tcb.get_ack().0) };
                 let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
                 let l_info = format!("local {{ seq: {}, ack: {} }}", seq, ack);
                 log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
+                if pkt_type == PacketType::Invalid {
+                    continue;
+                }
 
                 match state {
                     TcpState::SynReceived => {
@@ -463,7 +483,7 @@ impl IpStackTcpStream {
                                     tcb.update_send_window(incoming_win);
                                     if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
                                         let (s, p) = (packet.seq, packet.payload.clone());
-                                        log::info!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}", p.len());
+                                        log::debug!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}", p.len());
                                         Self::write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | PSH, Some(s), Some(p))?;
                                     }
                                     continue;
@@ -499,6 +519,16 @@ impl IpStackTcpStream {
                             tcb.increase_ack();
                             Self::write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
                             tcb.change_state(TcpState::CloseWait);
+
+                            // delay some time (we assume 0.2 second here) and then change state to LastAck,
+                            // the dummy packet is used to make the progress of shutdown more smooth
+                            let dummy_packet = network_packet.clone();
+                            let exit_notifier = exit_notifier.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                exit_notifier.send(Some(dummy_packet)).await.unwrap_or(())
+                            });
+
                             continue;
                         }
                         if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
@@ -512,7 +542,7 @@ impl IpStackTcpStream {
                         }
                     }
                     TcpState::CloseWait => {
-                        if flags == ACK {
+                        if flags & ACK == ACK {
                             Self::write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | FIN, None, None)?;
                             tcb.increase_seq();
                             tcb.change_state(TcpState::LastAck);
@@ -522,7 +552,7 @@ impl IpStackTcpStream {
                         if flags == ACK {
                             tcb.change_state(TcpState::Closed);
                             let exit_notifier = exit_notifier.clone();
-                            tokio::spawn(async move { exit_notifier.send(()).await.unwrap_or(()) });
+                            tokio::spawn(async move { exit_notifier.send(None).await.unwrap_or(()) });
                         }
                     }
                     TcpState::FinWait1 => {
@@ -610,7 +640,7 @@ impl IpStackTcpStream {
                 let mut tcb = tcb.lock().unwrap();
                 let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
                 let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-                if exit_flag_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                if exit_flag_clone.load(std::sync::atomic::Ordering::SeqCst) || state == TcpState::Closed {
                     log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
                     break;
                 }
