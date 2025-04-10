@@ -149,8 +149,9 @@ impl IpStackTcpStream {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create_rev_packet(
-        tuple: NetworkTuple,
+    pub(crate) fn create_raw_packet(
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
         tcb: &Tcb,
         flags: u8,
         ttl: u8,
@@ -159,7 +160,7 @@ impl IpStackTcpStream {
         win: u16,
         mut payload: Vec<u8>,
     ) -> std::io::Result<NetworkPacket> {
-        let mut tcp_header = etherparse::TcpHeader::new(tuple.dst.port(), tuple.src.port(), seq, win);
+        let mut tcp_header = etherparse::TcpHeader::new(src_addr.port(), dst_addr.port(), seq, win);
         tcp_header.acknowledgment_number = ack;
         tcp_header.syn = flags & SYN != 0;
         tcp_header.ack = flags & ACK != 0;
@@ -167,10 +168,10 @@ impl IpStackTcpStream {
         tcp_header.fin = flags & FIN != 0;
         tcp_header.psh = flags & PSH != 0;
 
-        let ip_header = match (tuple.dst.ip(), tuple.src.ip()) {
-            (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
+        let ip_header = match (src_addr.ip(), dst_addr.ip()) {
+            (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
                 let mut ip_h =
-                    Ipv4Header::new(0, ttl, IpNumber::TCP, dst.octets(), src.octets()).map_err(|e| std::io::Error::new(InvalidInput, e))?;
+                    Ipv4Header::new(0, ttl, IpNumber::TCP, src.octets(), dst.octets()).map_err(|e| std::io::Error::new(InvalidInput, e))?;
                 let payload_len = tcb.calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
                 payload.truncate(payload_len);
                 ip_h.set_payload_len(payload.len() + tcp_header.header_len())
@@ -178,15 +179,15 @@ impl IpStackTcpStream {
                 ip_h.dont_fragment = true;
                 IpHeader::Ipv4(ip_h)
             }
-            (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
+            (std::net::IpAddr::V6(src), std::net::IpAddr::V6(dst)) => {
                 let mut ip_h = etherparse::Ipv6Header {
                     traffic_class: 0,
                     flow_label: Ipv6FlowLabel::ZERO,
                     payload_length: 0,
                     next_header: IpNumber::TCP,
                     hop_limit: ttl,
-                    source: dst.octets(),
-                    destination: src.octets(),
+                    source: src.octets(),
+                    destination: dst.octets(),
                 };
                 let payload_len = tcb.calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
                 payload.truncate(payload_len);
@@ -230,7 +231,8 @@ impl IpStackTcpStream {
         use std::io::Error;
         let seq = seq.unwrap_or(tcb.get_seq()).0;
         let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window().max(tcb.get_mtu()));
-        let packet = Self::create_rev_packet(tuple, tcb, flags, TTL, seq, ack, window_size, payload.unwrap_or_default())?;
+        let (src, dst) = (tuple.dst, tuple.src);
+        let packet = Self::create_raw_packet(src, dst, tcb, flags, TTL, seq, ack, window_size, payload.unwrap_or_default())?;
         let len = packet.payload.len();
         up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
         Ok(len)
