@@ -363,20 +363,18 @@ impl Drop for IpStackTcpStream {
 impl IpStackTcpStream {
     fn spawn_tasks(&mut self) -> std::io::Result<()> {
         let network_tuple = self.network_tuple();
-        let data_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        let exit_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (data_notifier, mut data_receiver) = tokio::sync::mpsc::channel::<bool>(u16::MAX as usize);
         let (exit_notifier, mut exit_receiver) = tokio::sync::mpsc::channel::<Option<NetworkPacket>>(u16::MAX as usize);
         self.exit_notifier = Some(exit_notifier.clone());
 
         // task 1: data receiving and processing
-        let data_notify_clone = data_notify.clone();
+        let data_notifier_clone = data_notifier.clone();
         let tcb = self.tcb.clone();
         let mut stream_receiver = self.stream_receiver.take().unwrap();
         let up_packet_sender = self.up_packet_sender.clone();
         let shutdown = self.shutdown.clone();
         let write_notify = self.write_notify.clone();
         let read_notify_clone = self.read_notify.clone();
-        let exit_flag_clone = exit_flag.clone();
         tokio::spawn(async move {
             {
                 let mut tcb = tcb.lock().unwrap();
@@ -420,8 +418,10 @@ impl IpStackTcpStream {
                     shutdown.lock().unwrap().ready();
                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     read_notify_clone.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                    data_notify_clone.notify_one();
-                    exit_flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+
+                    let d = data_notifier_clone.clone();
+                    // tokio::spawn(async move { d.send(true).await.unwrap_or(()) }).await.unwrap_or(());
+                    let _ = std::thread::spawn(move || d.blocking_send(true)).join();
                     break;
                 };
 
@@ -464,7 +464,9 @@ impl IpStackTcpStream {
                             tcb.update_send_window(incoming_win);
                             if len > 0 {
                                 tcb.add_unordered_packet(incoming_seq, payload.to_vec());
-                                data_notify_clone.notify_one();
+
+                                let d = data_notifier_clone.clone();
+                                let _ = std::thread::spawn(move || d.blocking_send(false)).join();
                             }
                             tcb.change_state(TcpState::Established);
                         }
@@ -495,7 +497,8 @@ impl IpStackTcpStream {
                                 PacketType::NewPacket => {
                                     tcb.update_last_received_ack(incoming_ack);
                                     tcb.add_unordered_packet(incoming_seq, payload.clone());
-                                    data_notify_clone.notify_one();
+                                    let d = data_notifier_clone.clone();
+                                    let _ = std::thread::spawn(move || d.blocking_send(false)).join();
                                     tcb.update_send_window(incoming_win);
                                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                                     continue;
@@ -537,7 +540,8 @@ impl IpStackTcpStream {
                             if !payload.is_empty() && tcb.get_ack() == incoming_seq {
                                 tcb.update_send_window(incoming_win);
                                 tcb.add_unordered_packet(incoming_seq, payload.clone());
-                                data_notify_clone.notify_one();
+                                let d = data_notifier_clone.clone();
+                                let _ = std::thread::spawn(move || d.blocking_send(false)).join();
                             }
                             continue;
                         }
@@ -550,7 +554,7 @@ impl IpStackTcpStream {
                         }
                     }
                     TcpState::LastAck => {
-                        if flags == ACK {
+                        if flags & ACK == ACK {
                             tcb.change_state(TcpState::Closed);
                             let exit_notifier = exit_notifier.clone();
                             tokio::spawn(async move { exit_notifier.send(None).await.unwrap_or(()) });
@@ -575,7 +579,8 @@ impl IpStackTcpStream {
                             // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                             tcb.update_last_received_ack(incoming_ack);
                             tcb.add_unordered_packet(incoming_seq, payload.clone());
-                            data_notify_clone.notify_one();
+                            let d = data_notifier_clone.clone();
+                            let _ = std::thread::spawn(move || d.blocking_send(false)).join();
                             tcb.update_send_window(incoming_win);
                             tcb.change_state(TcpState::FinWait2);
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
@@ -604,7 +609,8 @@ impl IpStackTcpStream {
                             // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                             tcb.update_last_received_ack(incoming_ack);
                             tcb.add_unordered_packet(incoming_seq, payload.clone());
-                            data_notify_clone.notify_one();
+                            let d = data_notifier_clone.clone();
+                            let _ = std::thread::spawn(move || d.blocking_send(false)).join();
                             tcb.update_send_window(incoming_win);
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                             if flags & FIN == FIN {
@@ -632,16 +638,13 @@ impl IpStackTcpStream {
         let up_packet_sender = self.up_packet_sender.clone();
         let data_tx = self.data_tx.clone();
         let read_notify = self.read_notify.clone();
-        let data_notify_clone = data_notify.clone();
-        let exit_flag_clone = exit_flag.clone();
         tokio::spawn(async move {
             loop {
-                let duration = Duration::from_millis(1000);
-                tokio::time::timeout(duration, data_notify_clone.notified()).await.ok();
+                let ret = data_receiver.recv().await;
                 let mut tcb = tcb.lock().unwrap();
                 let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
                 let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-                if exit_flag_clone.load(std::sync::atomic::Ordering::SeqCst) || state == TcpState::Closed {
+                if ret.unwrap_or(false) || state == TcpState::Closed {
                     log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
                     break;
                 }
