@@ -148,13 +148,6 @@ impl IpStackTcpStream {
         self.destroy_messenger = Some(messenger);
     }
 
-    fn calculate_payload_max_len(tcb: &Tcb, ip_header_size: usize, tcp_header_size: usize) -> usize {
-        std::cmp::min(
-            tcb.get_send_window() as usize,
-            (tcb.get_mtu() as usize).saturating_sub(ip_header_size + tcp_header_size),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn create_rev_packet(
         tuple: NetworkTuple,
@@ -178,7 +171,7 @@ impl IpStackTcpStream {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
                 let mut ip_h =
                     Ipv4Header::new(0, ttl, IpNumber::TCP, dst.octets(), src.octets()).map_err(|e| std::io::Error::new(InvalidInput, e))?;
-                let payload_len = Self::calculate_payload_max_len(tcb, ip_h.header_len(), tcp_header.header_len());
+                let payload_len = tcb.calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
                 payload.truncate(payload_len);
                 ip_h.set_payload_len(payload.len() + tcp_header.header_len())
                     .map_err(|e| std::io::Error::new(InvalidInput, e))?;
@@ -195,7 +188,7 @@ impl IpStackTcpStream {
                     source: dst.octets(),
                     destination: src.octets(),
                 };
-                let payload_len = Self::calculate_payload_max_len(tcb, ip_h.header_len(), tcp_header.header_len());
+                let payload_len = tcb.calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
                 payload.truncate(payload_len);
                 let len = payload.len() + tcp_header.header_len();
                 ip_h.set_payload_length(len).map_err(|e| std::io::Error::new(InvalidInput, e))?;

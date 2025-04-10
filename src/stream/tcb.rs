@@ -67,6 +67,12 @@ impl Tcb {
         }
     }
 
+    pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
+        let send_window = self.get_send_window() as usize;
+        let mtu = self.get_mtu() as usize;
+        std::cmp::min(send_window, mtu.saturating_sub(ip_header_size + tcp_header_size))
+    }
+
     pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
         // If the received rcvd_ack is the same as duplicate_ack_count_helper and not all data has been acknowledged (rcvd_ack < self.seq), increment the count.
         if rcvd_ack == self.duplicate_ack_count_helper && rcvd_ack < self.seq {
