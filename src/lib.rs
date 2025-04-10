@@ -166,9 +166,13 @@ async fn process_device_read(
             log::debug!("session created: {}", network_tuple);
             let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            match ip_stack_stream {
-                IpStackStream::Tcp(ref mut stream) => stream.set_destroy_messenger(tx),
-                IpStackStream::Udp(ref mut stream) => stream.set_destroy_messenger(tx),
+            match &mut ip_stack_stream {
+                IpStackStream::Tcp(stream) => {
+                    stream.set_destroy_messenger(tx);
+                }
+                IpStackStream::Udp(stream) => {
+                    stream.set_destroy_messenger(tx);
+                }
                 _ => return Err(IpStackError::UnsupportedTransportProtocol),
             }
             tokio::spawn(async move {
