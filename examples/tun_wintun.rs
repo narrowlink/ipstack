@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use clap::Parser;
 use etherparse::Icmpv4Header;
 use ipstack::{stream::IpStackStream, IpNumber};
-use tokio::net::TcpStream;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 use udp_stream::UdpStream;
 
 // const MTU: u16 = 1500;
@@ -64,6 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("==== New TCP connection ====");
                 tokio::spawn(async move {
                     _ = tokio::io::copy_bidirectional(&mut tcp, &mut s).await;
+                    _ = s.shutdown().await;
+                    _ = tcp.shutdown().await;
                     println!("====== end tcp connection ======");
                 });
             }
@@ -78,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("==== New UDP connection ====");
                 tokio::spawn(async move {
                     let _ = tokio::io::copy_bidirectional(&mut udp, &mut s).await;
+                    s.shutdown();
+                    let _ = udp.shutdown().await;
                     println!("==== end UDP connection ====");
                 });
             }

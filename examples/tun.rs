@@ -32,7 +32,7 @@ use clap::Parser;
 use etherparse::Icmpv4Header;
 use ipstack::{stream::IpStackStream, IpNumber};
 use std::net::{Ipv4Addr, SocketAddr};
-use tokio::net::TcpStream;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 use udp_stream::UdpStream;
 
 // const MTU: u16 = 1500;
@@ -129,6 +129,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(err) = tokio::io::copy_bidirectional(&mut tcp, &mut s).await {
                         log::info!("#{number1} TCP error: {}", err);
                     }
+                    if let Err(e) = s.shutdown().await {
+                        log::info!("#{number1} TCP upstream shutdown error: {}", e);
+                    }
+                    if let Err(e) = tcp.shutdown().await {
+                        log::info!("#{number1} TCP stack stream shutdown error: {}", e);
+                    }
                     let c = count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     log::info!("#{number1} TCP closed, session count {c}");
                 });
@@ -147,6 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(async move {
                     if let Err(err) = tokio::io::copy_bidirectional(&mut udp, &mut s).await {
                         log::info!("#{number2} UDP error: {}", err);
+                    }
+                    s.shutdown();
+                    if let Err(e) = udp.shutdown().await {
+                        log::info!("#{number2} UDP stack stream shutdown error: {}", e);
                     }
                     let c = count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     log::info!("#{number2} UDP closed, session count {c}");

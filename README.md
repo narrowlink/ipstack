@@ -16,7 +16,7 @@ Unstable, under development.
 use etherparse::Icmpv4Header;
 use ipstack::{stream::IpStackStream, IpNumber};
 use std::net::{Ipv4Addr, SocketAddr};
-use tokio::net::TcpStream;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 use udp_stream::UdpStream;
 
 #[tokio::main]
@@ -47,6 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut rhs = TcpStream::connect("1.1.1.1:80").await?;
                 tokio::spawn(async move {
                     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut rhs).await;
+                    let _ = rhs.shutdown().await;
+                    let _ = tcp.shutdown().await;
                 });
             }
             IpStackStream::Udp(mut udp) => {
@@ -54,6 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut rhs = UdpStream::connect(addr).await?;
                 tokio::spawn(async move {
                     let _ = tokio::io::copy_bidirectional(&mut udp, &mut rhs).await;
+                    rhs.shutdown();
+                    let _ = udp.shutdown().await;
                 });
             }
             IpStackStream::UnknownTransport(u) => {
