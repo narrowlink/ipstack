@@ -52,6 +52,8 @@ impl std::fmt::Display for Shutdown {
     }
 }
 
+static SESSION_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Debug)]
 pub struct IpStackTcpStream {
     src_addr: SocketAddr,
@@ -101,16 +103,17 @@ impl IpStackTcpStream {
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task_handle: None,
         };
-        if tcp.syn {
-            let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
-            let (seq, ack, state) = {
-                let tcb = stream.tcb.lock().unwrap();
-                (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state())
-            };
-            let network_tuple = stream.network_tuple();
-            let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-            log::debug!("{network_tuple} {state:?}: {l_info} session begins, total sessions: {sessions}");
 
+        let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
+        let (seq, ack, state) = {
+            let tcb = stream.tcb.lock().unwrap();
+            (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state())
+        };
+        let network_tuple = stream.network_tuple();
+        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+        log::debug!("{network_tuple} {state:?}: {l_info} session begins, total sessions: {sessions}");
+
+        if tcp.syn {
             stream.task_handle = Some(stream.spawn_tasks()?);
             return Ok(stream);
         }
@@ -239,8 +242,6 @@ impl IpStackTcpStream {
     }
 }
 
-static SESSION_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 impl AsyncRead for IpStackTcpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let network_tuple = self.network_tuple();
@@ -346,10 +347,8 @@ impl AsyncWrite for IpStackTcpStream {
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
-        if state != TcpState::Listen {
-            let sessions = SESSION_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst).saturating_sub(1);
-            log::debug!("{nt} {state:?}: session dropped, total sessions: {sessions}");
-        }
+        let sessions = SESSION_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst).saturating_sub(1);
+        log::debug!("{nt} {state:?}: session dropped, total sessions: {sessions}");
 
         if let Some(messenger) = self.destroy_messenger.take() {
             let _ = messenger.send(());
