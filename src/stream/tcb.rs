@@ -236,10 +236,10 @@ impl Tcb {
         self.last_received_ack = ack;
     }
 
-    pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
+    pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) -> usize {
         match self.inflight_packets.first_key_value() {
-            None => return,
-            Some((&seq, _)) if ack < seq => return,
+            None => return 0,
+            Some((&seq, _)) if ack < seq => return self.inflight_packets.values().map(|p| p.payload.len()).sum(),
             _ => {}
         }
         if let Some(seq) = self
@@ -257,6 +257,8 @@ impl Tcb {
             }
         }
         self.inflight_packets.retain(|_, p| ack < p.seq + p.payload.len() as u32);
+
+        self.inflight_packets.values().map(|p| p.payload.len()).sum()
     }
 
     pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {

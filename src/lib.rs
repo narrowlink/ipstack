@@ -166,14 +166,14 @@ async fn process_device_read(
             log::debug!("session created: {}", network_tuple);
             let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            let task_handle = match &mut ip_stack_stream {
+            let (task_handle, keep_alive_on_drop_sender) = match &mut ip_stack_stream {
                 IpStackStream::Tcp(stream) => {
                     stream.set_destroy_messenger(tx);
-                    stream.task_handle.take()
+                    (stream.task_handle.take(), stream.keep_alive_on_drop_sender.take())
                 }
                 IpStackStream::Udp(stream) => {
                     stream.set_destroy_messenger(tx);
-                    None
+                    (None, None)
                 }
                 _ => return Err(IpStackError::UnsupportedTransportProtocol),
             };
@@ -181,6 +181,7 @@ async fn process_device_read(
                 rx.await.ok();
                 if let Some(handle) = task_handle {
                     let _ = handle.await;
+                    keep_alive_on_drop_sender.map(|s| s.send(()));
                 }
                 sessions_clone.lock().await.remove(&network_tuple);
                 log::debug!("session destroyed: {}", network_tuple);
