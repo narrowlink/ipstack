@@ -178,7 +178,7 @@ impl AsyncRead for IpStackTcpStream {
                 let mut tcb = self.tcb.lock().unwrap();
                 let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
                 let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-                log::warn!("{network_tuple} {state:?}: {l_info}, session timeout reached, closing forcefully...");
+                log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session timeout reached, closing forcefully...");
                 let sender = &self.up_packet_sender;
                 write_packet_to_device(sender, network_tuple, &tcb, ACK | RST, None, None)?;
                 tcb.change_state(TcpState::Closed);
@@ -222,12 +222,12 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
 
-        log::trace!("{nt} {state:?}: current send window: {send_window}, average send window: {avg_send_window}, is send buffer full: {is_send_buffer_full}");
+        log::trace!("{nt} {state:?}: [poll_write] current send window: {send_window}, average send window: {avg_send_window}, is send buffer full: {is_send_buffer_full}");
 
         // if (send_window as u64) < avg_send_window / 2 || is_send_buffer_full {
         if send_window == 0 || is_send_buffer_full {
             self.write_notify.lock().unwrap().replace(cx.waker().clone());
-            log::trace!("{nt} {state:?}: send buffer is full, waiting for the other side to send ACK...");
+            log::trace!("{nt} {state:?}: [poll_write] send buffer is full, waiting for the other side to send ACK...");
             return Poll::Pending;
         }
 
@@ -238,7 +238,7 @@ impl AsyncWrite for IpStackTcpStream {
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-        log::trace!("{nt} {state:?}: {l_info} upstream data written to device, len = {payload_len}");
+        log::trace!("{nt} {state:?}: [poll_write] {l_info} upstream data written to device, len = {payload_len}");
 
         Poll::Ready(Ok(payload_len))
     }
@@ -249,7 +249,7 @@ impl AsyncWrite for IpStackTcpStream {
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
-        log::trace!("{nt} {state:?}: poll_shutdown called, shutdown {}", self.shutdown.lock().unwrap());
+        log::trace!("{nt} {state:?}: [poll_shutdown] shutdown {}", self.shutdown.lock().unwrap());
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
@@ -257,7 +257,7 @@ impl AsyncWrite for IpStackTcpStream {
             Shutdown::None => {
                 if !self.farewell.load(std::sync::atomic::Ordering::SeqCst) {
                     self.farewell.store(true, std::sync::atomic::Ordering::SeqCst);
-                    log::trace!("{nt} {state:?}: Shutting down, actively send a farewell packet to the other side...");
+                    log::trace!("{nt} {state:?}: [poll_shutdown] actively send a farewell packet to the other side...");
                     let mut tcb = self.tcb.lock().unwrap();
                     write_packet_to_device(&self.up_packet_sender, nt, &tcb, ACK | FIN, None, None)?;
                     tcb.increase_seq();
