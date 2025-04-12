@@ -70,6 +70,7 @@ pub struct IpStackTcpStream {
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    farewell: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     keep_alive_on_drop: Option<std::sync::mpsc::Receiver<()>>, // this and the next one are used to keep the `task_handle` alive before `Self::drop()` returned since there no `AsyncDrop` exist yet.
     pub(crate) keep_alive_on_drop_sender: Option<std::sync::mpsc::Sender<()>>,
@@ -103,6 +104,7 @@ impl IpStackTcpStream {
             data_tx,
             data_rx,
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            farewell: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             task_handle: None,
             keep_alive_on_drop: None,
             keep_alive_on_drop_sender: None,
@@ -253,6 +255,14 @@ impl AsyncWrite for IpStackTcpStream {
         }
         match *self.shutdown.lock().unwrap() {
             Shutdown::None => {
+                if !self.farewell.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.farewell.store(true, std::sync::atomic::Ordering::SeqCst);
+                    log::trace!("{nt} {state:?}: Shutting down, actively send a farewell packet to the other side...");
+                    let mut tcb = self.tcb.lock().unwrap();
+                    write_packet_to_device(&self.up_packet_sender, nt, &tcb, ACK | FIN, None, None)?;
+                    tcb.increase_seq();
+                    tcb.change_state(TcpState::FinWait1);
+                }
                 self.shutdown.lock().unwrap().pending(cx.waker().clone());
                 Poll::Pending
             }
@@ -289,6 +299,7 @@ impl IpStackTcpStream {
         let write_notify = self.write_notify.clone();
         let read_notify_clone = self.read_notify.clone();
         let data_tx = self.data_tx.clone();
+        let farewell = self.farewell.clone();
 
         let task_handle = tokio::spawn(async move {
             {
@@ -392,15 +403,6 @@ impl IpStackTcpStream {
                     }
                     TcpState::Established => {
                         if flags == ACK {
-                            if matches!(*shutdown.lock().unwrap(), Shutdown::Pending(_)) && tcb.get_last_received_ack() == tcb.get_seq() {
-                                let nt = network_tuple;
-                                log::trace!("{nt} {state:?}: Shutting down, actively send a farewell packet to the other side...");
-                                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | FIN, None, None)?;
-                                tcb.increase_seq();
-                                tcb.change_state(TcpState::FinWait1);
-                                continue;
-                            }
-
                             match pkt_type {
                                 PacketType::WindowUpdate => {
                                     tcb.update_send_window(incoming_win);
@@ -442,6 +444,8 @@ impl IpStackTcpStream {
                         }
                         if flags == (ACK | FIN) {
                             // The other side is closing the connection, we need to send an ACK and change state to CloseWait
+                            farewell.store(true, std::sync::atomic::Ordering::SeqCst);
+
                             tcb.increase_ack();
                             write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
                             tcb.change_state(TcpState::CloseWait);

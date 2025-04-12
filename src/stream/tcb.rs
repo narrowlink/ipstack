@@ -152,6 +152,7 @@ impl Tcb {
     pub(super) fn get_mtu(&self) -> u16 {
         self.mtu
     }
+    #[allow(dead_code)]
     pub(super) fn get_last_received_ack(&self) -> SeqNum {
         self.last_received_ack
     }
