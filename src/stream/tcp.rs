@@ -70,7 +70,7 @@ pub struct IpStackTcpStream {
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-    farewell: Arc<std::sync::atomic::AtomicBool>,
+    match_point: Arc<std::sync::atomic::AtomicU32>,
     pub(crate) task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     keep_alive_on_drop: Option<std::sync::mpsc::Receiver<()>>, // this and the next one are used to keep the `task_handle` alive before `Self::drop()` returned since there no `AsyncDrop` exist yet.
     pub(crate) keep_alive_on_drop_sender: Option<std::sync::mpsc::Sender<()>>,
@@ -104,7 +104,7 @@ impl IpStackTcpStream {
             data_tx,
             data_rx,
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            farewell: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            match_point: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             task_handle: None,
             keep_alive_on_drop: None,
             keep_alive_on_drop_sender: None,
@@ -248,16 +248,19 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
-        log::trace!("{nt} {state:?}: [poll_shutdown] shutdown {}", self.shutdown.lock().unwrap());
+        let (nt, state, seq, shutdown) = {
+            let tcb = self.tcb.lock().unwrap();
+            let shutdown = format!("{}", self.shutdown.lock().unwrap());
+            (self.network_tuple(), tcb.get_state(), tcb.get_seq(), shutdown)
+        };
+        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, shutdown {shutdown}",);
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
         match *self.shutdown.lock().unwrap() {
             Shutdown::None => {
-                if !self.farewell.load(std::sync::atomic::Ordering::SeqCst) {
-                    self.farewell.store(true, std::sync::atomic::Ordering::SeqCst);
-                    log::trace!("{nt} {state:?}: [poll_shutdown] actively send a farewell packet to the other side...");
+                if self.match_point.load(std::sync::atomic::Ordering::SeqCst) == seq.0 {
+                    log::debug!("{nt} {state:?}: [poll_shutdown] actively send a farewell packet to the other side...");
                     let mut tcb = self.tcb.lock().unwrap();
                     write_packet_to_device(&self.up_packet_sender, nt, &tcb, ACK | FIN, None, None)?;
                     tcb.increase_seq();
@@ -275,11 +278,12 @@ impl AsyncWrite for IpStackTcpStream {
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
+        log::info!("{nt} {state:?}: session dropped, ========================= ");
         if let Some(messenger) = self.destroy_messenger.take() {
             std::thread::spawn(move || messenger.send(()).unwrap_or(()));
-            if let Some(keeper) = self.keep_alive_on_drop.take() {
-                keeper.recv().unwrap_or(());
-            }
+            // if let Some(keeper) = self.keep_alive_on_drop.take() {
+            //     keeper.recv().unwrap_or(());
+            // }
         }
         let sessions = SESSION_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst).saturating_sub(1);
         log::debug!("{nt} {state:?}: session dropped, total sessions: {sessions}");
@@ -299,7 +303,7 @@ impl IpStackTcpStream {
         let write_notify = self.write_notify.clone();
         let read_notify_clone = self.read_notify.clone();
         let data_tx = self.data_tx.clone();
-        let farewell = self.farewell.clone();
+        let match_point = self.match_point.clone();
 
         let task_handle = tokio::spawn(async move {
             {
@@ -403,6 +407,11 @@ impl IpStackTcpStream {
                     }
                     TcpState::Established => {
                         if flags == ACK {
+                            if tcb.get_last_received_ack() == seq {
+                                match_point.store(seq, std::sync::atomic::Ordering::SeqCst);
+                                log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} >>> match point <<<");
+                            }
+
                             match pkt_type {
                                 PacketType::WindowUpdate => {
                                     tcb.update_send_window(incoming_win);
@@ -444,8 +453,6 @@ impl IpStackTcpStream {
                         }
                         if flags == (ACK | FIN) {
                             // The other side is closing the connection, we need to send an ACK and change state to CloseWait
-                            farewell.store(true, std::sync::atomic::Ordering::SeqCst);
-
                             tcb.increase_ack();
                             write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
                             tcb.change_state(TcpState::CloseWait);
@@ -503,21 +510,20 @@ impl IpStackTcpStream {
                             tcb.change_state(TcpState::TimeWait);
 
                             tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet));
+                            log::trace!("{network_tuple} {state:?}: Received final ACK, transitioning to TimeWait");
                             continue;
                         }
-                        if flags & ACK == ACK && len == 0 {
+                        if flags & ACK == ACK {
                             // tcb.update_last_received_ack(incoming_ack);
                             tcb.change_state(TcpState::FinWait2);
-                            continue;
-                        }
-                        if flags & (ACK | PSH) == (ACK | PSH) && len > 0 {
-                            // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                            // tcb.update_last_received_ack(incoming_ack);
-                            tcb.add_unordered_packet(incoming_seq, payload.clone());
-                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
-                            tcb.update_send_window(incoming_win);
-                            tcb.change_state(TcpState::FinWait2);
-                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            if len > 0 {
+                                // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
+                                // tcb.update_last_received_ack(incoming_ack);
+                                tcb.add_unordered_packet(incoming_seq, payload.clone());
+                                extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
+                                tcb.update_send_window(incoming_win);
+                                write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            }
                             continue;
                         }
                     }
@@ -528,6 +534,7 @@ impl IpStackTcpStream {
                             tcb.update_send_window(incoming_win);
                             tcb.change_state(TcpState::TimeWait);
                             tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet));
+                            log::trace!("{network_tuple} {state:?}: Received final ACK, transitioning to TimeWait");
                             continue;
                         }
                         if flags & ACK == ACK && len == 0 {
@@ -539,7 +546,7 @@ impl IpStackTcpStream {
                             }
                             continue;
                         }
-                        if flags & (ACK | PSH) == (ACK | PSH) && len > 0 {
+                        if flags & ACK == ACK && len > 0 {
                             // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                             // tcb.update_last_received_ack(incoming_ack);
                             tcb.add_unordered_packet(incoming_seq, payload.clone());
@@ -549,6 +556,7 @@ impl IpStackTcpStream {
                             if flags & FIN == FIN {
                                 tcb.change_state(TcpState::TimeWait);
                                 tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet));
+                                log::trace!("{network_tuple} {state:?}: Received final ACK, transitioning to TimeWait");
                             }
                             continue;
                         }
