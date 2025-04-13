@@ -164,25 +164,10 @@ async fn process_device_read(
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
             log::debug!("session created: {}", network_tuple);
-            let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            let (task_handle, keep_alive_on_drop_sender) = match &mut ip_stack_stream {
-                IpStackStream::Tcp(stream) => {
-                    stream.set_destroy_messenger(tx);
-                    (stream.task_handle.take(), stream.keep_alive_on_drop_sender.take())
-                }
-                IpStackStream::Udp(stream) => {
-                    stream.set_destroy_messenger(tx);
-                    (None, None)
-                }
-                _ => return Err(IpStackError::UnsupportedTransportProtocol),
-            };
+            let (packet_sender, ip_stack_stream) = create_stream(packet, config, up_pkt_sender, Some(tx))?;
             tokio::spawn(async move {
                 rx.await.ok();
-                if let Some(handle) = task_handle {
-                    let _ = handle.await;
-                    keep_alive_on_drop_sender.map(|s| s.send(()));
-                }
                 sessions_clone.lock().await.remove(&network_tuple);
                 log::debug!("session destroyed: {}", network_tuple);
             });
@@ -193,16 +178,21 @@ async fn process_device_read(
     Ok(())
 }
 
-fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: PacketSender) -> Result<(PacketSender, IpStackStream)> {
+fn create_stream(
+    packet: NetworkPacket,
+    cfg: &IpStackConfig,
+    up_pkt_sender: PacketSender,
+    msgr: Option<::tokio::sync::oneshot::Sender<()>>,
+) -> Result<(PacketSender, IpStackStream)> {
     let src_addr = packet.src_addr();
     let dst_addr = packet.dst_addr();
     match packet.transport_header() {
         TransportHeader::Tcp(h) => {
-            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, cfg.tcp_timeout)?;
+            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, cfg.tcp_timeout, msgr)?;
             Ok((stream.stream_sender(), IpStackStream::Tcp(stream)))
         }
         TransportHeader::Udp(_) => {
-            let stream = IpStackUdpStream::new(src_addr, dst_addr, packet.payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout);
+            let stream = IpStackUdpStream::new(src_addr, dst_addr, packet.payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, msgr);
             Ok((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
         TransportHeader::Unknown => Err(IpStackError::UnsupportedTransportProtocol),

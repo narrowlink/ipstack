@@ -6,7 +6,7 @@ use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
 use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     time::Sleep,
 };
 
@@ -21,7 +21,7 @@ pub struct IpStackUdpStream {
     timeout: Pin<Box<Sleep>>,
     timeout_interval: Duration,
     mtu: u16,
-    destroy_messenger: Option<oneshot::Sender<()>>,
+    destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
 }
 
 impl IpStackUdpStream {
@@ -32,6 +32,7 @@ impl IpStackUdpStream {
         up_pkt_sender: PacketSender,
         mtu: u16,
         timeout_interval: Duration,
+        destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     ) -> Self {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
         let deadline = tokio::time::Instant::now() + timeout_interval;
@@ -45,12 +46,8 @@ impl IpStackUdpStream {
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             timeout_interval,
             mtu,
-            destroy_messenger: None,
+            destroy_messenger,
         }
-    }
-
-    pub(crate) fn set_destroy_messenger(&mut self, messenger: oneshot::Sender<()>) {
-        self.destroy_messenger = Some(messenger);
     }
 
     pub(crate) fn stream_sender(&self) -> PacketSender {
