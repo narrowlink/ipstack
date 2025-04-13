@@ -85,17 +85,29 @@ impl IpStackTcpStream {
         mtu: u16,
         timeout_interval: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
+        let tcb = Tcb::new(SeqNum(tcp.sequence_number), mtu);
+        let tuple = NetworkTuple::new(src_addr, dst_addr, true);
+        if !tcp.syn {
+            if !tcp.rst {
+                if let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, ACK | RST, None, None) {
+                    log::warn!("Error sending RST/ACK packet: {:?}", err);
+                }
+            }
+            let info = format!("Invalid TCP packet: {} {}", tuple, tcp_header_fmt(&tcp));
+            return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
+        }
+
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let tcb = std::sync::Arc::new(std::sync::Mutex::new(Tcb::new(SeqNum(tcp.sequence_number), mtu)));
         let deadline = tokio::time::Instant::now() + timeout_interval;
+
         let mut stream = IpStackTcpStream {
             src_addr,
             dst_addr,
             stream_sender,
             stream_receiver: Some(stream_receiver),
             up_packet_sender,
-            tcb,
+            tcb: std::sync::Arc::new(std::sync::Mutex::new(tcb.clone())),
             shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
             write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             destroy_messenger: None,
@@ -111,30 +123,12 @@ impl IpStackTcpStream {
         };
 
         let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
-        let (seq, ack, state) = {
-            let tcb = stream.tcb.lock().unwrap();
-            (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state())
-        };
-        let network_tuple = stream.network_tuple();
+        let (seq, ack, state) = { (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state()) };
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-        log::debug!("{network_tuple} {state:?}: {l_info} session begins, total sessions: {sessions}");
+        log::debug!("{tuple} {state:?}: {l_info} session begins, total sessions: {sessions}");
 
-        if tcp.syn {
-            stream.task_handle = Some(stream.spawn_tasks()?);
-            let (keep_alive_on_drop_sender, keep_alive_on_drop) = std::sync::mpsc::channel::<()>();
-            stream.keep_alive_on_drop_sender = Some(keep_alive_on_drop_sender);
-            stream.keep_alive_on_drop = Some(keep_alive_on_drop);
-            return Ok(stream);
-        }
-        let tuple = stream.network_tuple();
-        if !tcp.rst {
-            let tcb = stream.tcb.lock().unwrap();
-            if let Err(err) = write_packet_to_device(&stream.up_packet_sender, tuple, &tcb, ACK | RST, None, None) {
-                log::warn!("Error sending RST/ACK packet: {:?}", err);
-            }
-        }
-        let info = format!("Invalid TCP packet: {} {}", tuple, tcp_header_fmt(&tcp));
-        Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)))
+        stream.spawn_tasks()?;
+        Ok(stream)
     }
 
     fn reset_timeout(&mut self) {
@@ -291,7 +285,7 @@ impl Drop for IpStackTcpStream {
 }
 
 impl IpStackTcpStream {
-    fn spawn_tasks(&mut self) -> std::io::Result<tokio::task::JoinHandle<std::io::Result<()>>> {
+    fn spawn_tasks(&mut self) -> std::io::Result<()> {
         let network_tuple = self.network_tuple();
 
         // task: data receiving and processing
@@ -573,7 +567,12 @@ impl IpStackTcpStream {
             } // end of loop
             Ok::<(), std::io::Error>(())
         });
-        Ok(task_handle)
+
+        self.task_handle = Some(task_handle);
+        let (keep_alive_on_drop_sender, keep_alive_on_drop) = std::sync::mpsc::channel::<()>();
+        self.keep_alive_on_drop_sender = Some(keep_alive_on_drop_sender);
+        self.keep_alive_on_drop = Some(keep_alive_on_drop);
+        Ok(())
     }
 }
 
