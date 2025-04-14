@@ -152,7 +152,6 @@ impl Tcb {
     pub(super) fn get_mtu(&self) -> u16 {
         self.mtu
     }
-    #[allow(dead_code)]
     pub(super) fn get_last_received_ack(&self) -> SeqNum {
         self.last_received_ack
     }
@@ -196,12 +195,12 @@ impl Tcb {
         let res = if rcvd_ack > self.seq {
             PacketType::Invalid
         } else {
-            match rcvd_ack.cmp(&self.last_received_ack) {
+            match rcvd_ack.cmp(&self.get_last_received_ack()) {
                 std::cmp::Ordering::Less => PacketType::Invalid,
                 std::cmp::Ordering::Equal => {
                     if !payload.is_empty() {
                         PacketType::NewPacket
-                    } else if self.send_window == rcvd_window && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
+                    } else if self.get_send_window() == rcvd_window && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
                         PacketType::RetransmissionRequest
                     } else if self.ack - 1 == rcvd_seq {
                         PacketType::KeepAlive
@@ -219,7 +218,7 @@ impl Tcb {
             }
         };
         #[rustfmt::skip]
-        log::trace!("received {{ ack = {:08X?}, seq = {:08X?}, window = {rcvd_window} }}, self {{ ack = {:08X?}, seq = {:08X?}, send_window = {} }}, len = {len}, {res:?}", rcvd_ack.0, rcvd_seq.0, self.ack.0, self.seq.0, self.send_window);
+        log::trace!("received {{ ack = {:08X?}, seq = {:08X?}, window = {rcvd_window} }}, self {{ ack = {:08X?}, seq = {:08X?}, send_window = {} }}, len = {len}, {res:?}", rcvd_ack.0, rcvd_seq.0, self.ack.0, self.seq.0, self.get_send_window());
         res
     }
 
@@ -272,7 +271,7 @@ impl Tcb {
     }
 
     pub fn is_send_buffer_full(&self) -> bool {
-        self.seq.distance(self.last_received_ack) >= MAX_UNACK
+        self.seq.distance(self.get_last_received_ack()) >= MAX_UNACK
     }
 }
 
