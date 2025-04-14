@@ -40,6 +40,15 @@ impl Shutdown {
         }
         *self = Shutdown::Ready;
     }
+
+    // Just for comparison purpose
+    fn fake_clone(&self) -> Shutdown {
+        match self {
+            Shutdown::None => Shutdown::None,
+            Shutdown::Pending(_) => Shutdown::Pending(futures::task::noop_waker()),
+            Shutdown::Ready => Shutdown::Ready,
+        }
+    }
 }
 
 impl std::fmt::Display for Shutdown {
@@ -233,16 +242,16 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let (nt, state, seq, shutdown) = {
+        let shutdown = { self.shutdown.lock().unwrap().fake_clone() };
+        let (nt, state, seq) = {
             let tcb = self.tcb.lock().unwrap();
-            let shutdown = format!("{}", self.shutdown.lock().unwrap());
-            (self.network_tuple(), tcb.get_state(), tcb.get_seq(), shutdown)
+            (self.network_tuple(), tcb.get_state(), tcb.get_seq())
         };
         log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, shutdown {shutdown}",);
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
-        match *self.shutdown.lock().unwrap() {
+        match shutdown {
             Shutdown::None => {
                 if self.match_point.load(std::sync::atomic::Ordering::SeqCst) == seq.0 {
                     log::debug!("{nt} {state:?}: [poll_shutdown] actively send a farewell packet to the other side...");
@@ -287,7 +296,7 @@ impl IpStackTcpStream {
         let stream_receiver = self.stream_receiver.take().unwrap();
         let dummy_sender = self.stream_sender.clone();
         let up_packet_sender = self.up_packet_sender.clone();
-        // let shutdown = self.shutdown.clone();
+        let shutdown = self.shutdown.clone();
         let write_notify = self.write_notify.clone();
         let read_notify_clone = self.read_notify.clone();
         let data_tx = self.data_tx.clone();
@@ -312,8 +321,8 @@ impl IpStackTcpStream {
             }
             _ = destroy_messenger.map(|m| m.send(())).unwrap_or(Ok(()));
             log::debug!("{network_tuple} task completed, destroy messenger sent successfully");
-            // shutdown.lock().unwrap().ready();
-            // log::debug!("{network_tuple} shutdown.lock().unwrap().ready() ==========");
+            shutdown.lock().unwrap().ready();
+            log::debug!("{network_tuple} shutdown.lock().unwrap().ready() ==========");
             v
         });
         self.task_handle = Some(task_handle);
