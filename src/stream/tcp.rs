@@ -447,6 +447,12 @@ async fn tcp_main_logic_loop(
 
         let inflight_len = tcb.update_inflight_packet_queue(incoming_ack);
 
+        for packet in tcb.collect_timed_out_inflight_packets() {
+            let (seq, count) = (packet.seq, packet.retransmit_count);
+            log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
+            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | PSH, Some(seq), Some(packet.payload))?;
+        }
+
         let pkt_type = tcb.check_pkt_type(tcp_header, payload);
 
         let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq().0, tcb.get_ack().0) };

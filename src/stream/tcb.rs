@@ -6,6 +6,12 @@ const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
+/// Retransmission timeout
+const RTO: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Maximum count of retransmissions before dropping the packet
+pub(crate) const MAX_RETRANSMIT_COUNT: usize = 3;
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
     // Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
@@ -265,6 +271,26 @@ impl Tcb {
         self.inflight_packets.get(&seq)
     }
 
+    #[must_use]
+    pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> Vec<InflightPacket> {
+        let mut retransmit_list = Vec::new();
+
+        self.inflight_packets.retain(|_, packet| {
+            if packet.retransmit_count >= MAX_RETRANSMIT_COUNT {
+                log::warn!("Packet with seq {:?} reached max retransmit count, dropping packet", packet.seq);
+                return false; // remove this packet
+            }
+            if packet.is_timed_out() {
+                packet.retransmit_count += 1;
+                packet.retransmit_timeout *= 2; // increase timeout exponentially
+                packet.send_time = std::time::Instant::now();
+                retransmit_list.push(packet.clone());
+            }
+            true // keep the packet in the inflight_packets
+        });
+        retransmit_list
+    }
+
     #[allow(dead_code)]
     pub(crate) fn get_all_inflight_packets(&self) -> Vec<&InflightPacket> {
         self.inflight_packets.values().collect::<Vec<_>>()
@@ -294,7 +320,9 @@ impl Average {
 pub struct InflightPacket {
     pub seq: SeqNum,
     pub payload: Vec<u8>,
-    // pub send_time: SystemTime, // todo
+    pub send_time: std::time::Instant,
+    pub retransmit_count: usize,
+    pub retransmit_timeout: std::time::Duration, // current retransmission timeout
 }
 
 impl InflightPacket {
@@ -302,11 +330,16 @@ impl InflightPacket {
         Self {
             seq,
             payload,
-            // send_time: SystemTime::now(), // todo
+            send_time: std::time::Instant::now(),
+            retransmit_count: 0,
+            retransmit_timeout: RTO,
         }
     }
     pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
         self.seq <= seq && seq < self.seq + self.payload.len() as u32
+    }
+    pub(crate) fn is_timed_out(&self) -> bool {
+        self.send_time.elapsed() >= self.retransmit_timeout
     }
 }
 
@@ -396,5 +429,30 @@ mod tests {
         // Emulate cumulative ACK: ack=2500
         tcb.update_inflight_packet_queue(SeqNum(2500));
         assert_eq!(tcb.inflight_packets.len(), 0); // all packets should be removed
+    }
+
+    #[test]
+    fn test_retransmit_with_exponential_backoff() {
+        let mut tcb = Tcb::new(SeqNum(1000), 1500);
+
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+
+        // Simulate retransmission timeouts
+        for i in 0..MAX_RETRANSMIT_COUNT {
+            // Simulate a timeout for the first packet
+            let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + std::time::Duration::from_millis(100);
+            println!("timeout: {:?}", timeout);
+            std::thread::sleep(timeout);
+
+            let packets = tcb.collect_timed_out_inflight_packets();
+            assert_eq!(packets.len(), 1);
+            let packet = &packets[0];
+            assert_eq!(packet.retransmit_count, i + 1);
+            assert!(packet.retransmit_timeout > RTO);
+        }
+
+        let packets = tcb.collect_timed_out_inflight_packets();
+        assert!(packets.is_empty());
+        assert!(tcb.inflight_packets.is_empty());
     }
 }
