@@ -81,6 +81,7 @@ pub struct IpStackTcpStream {
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     match_point: Arc<std::sync::atomic::AtomicU32>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    force_exit_task_notifier: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl IpStackTcpStream {
@@ -126,6 +127,7 @@ impl IpStackTcpStream {
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             match_point: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             task_handle: None,
+            force_exit_task_notifier: None,
         };
 
         let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
@@ -275,7 +277,9 @@ impl Drop for IpStackTcpStream {
         log::info!("{nt} {state:?}: session dropped, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
-                // self.cancellation_token.take().map(|c| c.cancel()).unwrap_or(());
+                if let Some(notifier) = self.force_exit_task_notifier.take() {
+                    _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(notifier.send(())));
+                }
                 // synchronously wait for the task to finish
                 _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(task_handle));
             } else {
@@ -303,6 +307,9 @@ impl IpStackTcpStream {
         let match_point = self.match_point.clone();
         let destroy_messenger = self.destroy_messenger.take();
 
+        let (force_exit_task_notifier, force_exit_task_monitor) = tokio::sync::mpsc::channel::<()>(10);
+        self.force_exit_task_notifier = Some(force_exit_task_notifier);
+
         let task_handle = tokio::spawn(async move {
             let v = tcp_main_logic_loop(
                 tcb,
@@ -314,6 +321,7 @@ impl IpStackTcpStream {
                 read_notify_clone,
                 data_tx,
                 match_point,
+                force_exit_task_monitor,
             )
             .await;
             if let Err(e) = &v {
@@ -341,6 +349,7 @@ async fn tcp_main_logic_loop(
     read_notify_clone: Arc<std::sync::Mutex<Option<Waker>>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     match_point: Arc<std::sync::atomic::AtomicU32>,
+    mut force_exit_task_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
     {
         let mut tcb = tcb.lock().unwrap();
@@ -375,16 +384,22 @@ async fn tcp_main_logic_loop(
         if let Some(ack) = last_rcv_ack {
             tcb.lock().unwrap().update_last_received_ack(ack);
         }
-        let network_packet = match stream_receiver.recv().await {
-            Some(network_packet) => network_packet,
-            None => {
-                let state = { tcb.lock().unwrap().get_state() };
-                log::debug!("{network_tuple} {state:?}: session closed unexpectedly by pipe broken, exiting task");
-                tcb.lock().unwrap().change_state(TcpState::Closed);
-                write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                read_notify_clone.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+
+        let network_packet = tokio::select! {
+            _ = force_exit_task_monitor.recv() => {
+                log::debug!("{network_tuple} task exited due to force exit signal");
                 break;
             }
+            network_packet = stream_receiver.recv() => {network_packet}
+        };
+
+        let Some(network_packet) = network_packet else {
+            let state = { tcb.lock().unwrap().get_state() };
+            log::debug!("{network_tuple} {state:?}: session closed unexpectedly by pipe broken, exiting task");
+            tcb.lock().unwrap().change_state(TcpState::Closed);
+            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            read_notify_clone.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            break;
         };
 
         let TransportHeader::Tcp(tcp_header) = network_packet.transport_header() else {
