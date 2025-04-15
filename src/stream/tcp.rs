@@ -257,7 +257,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
         match shutdown {
             Shutdown::None => {
-                if self.match_point.load(std::sync::atomic::Ordering::SeqCst) == seq.0 {
+                if self.match_point.load(std::sync::atomic::Ordering::SeqCst) == seq.0 && state == TcpState::Established {
                     log::debug!("{nt} {state:?}: [poll_shutdown] actively send a farewell packet to the other side...");
                     let mut tcb = self.tcb.lock().unwrap();
                     write_packet_to_device(&self.up_packet_sender, nt, &tcb, ACK | FIN, None, None)?;
@@ -477,6 +477,8 @@ async fn tcp_main_logic_loop(
             TcpState::Established => {
                 if flags == ACK {
                     if tcb.get_last_received_ack() == seq {
+                        // FIXME: Here we always store the appropriate sequence number in case of an unexpected
+                        // poll_shutdown call. This may not be the best solution.
                         match_point.store(seq, std::sync::atomic::Ordering::SeqCst);
                         log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} >>> match point <<<");
                     }
@@ -521,6 +523,8 @@ async fn tcp_main_logic_loop(
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
                     tcb.change_state(TcpState::CloseWait);
 
+                    // FIXME: This is a workaround for the case where the other side sends a FIN packet
+                    // and we are not sure whether the upstream has sent all the data.
                     let s = tcb.get_state();
                     if let Some(w) = write_notify.lock().unwrap().take() {
                         log::debug!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, closed by the other side, notify upstream");
