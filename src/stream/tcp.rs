@@ -463,7 +463,6 @@ async fn tcp_main_logic_loop(
                 if flags & ACK == ACK {
                     if len > 0 {
                         tcb.add_unordered_packet(incoming_seq, payload.to_vec());
-
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
                     }
                     tcb.change_state(TcpState::Established);
@@ -534,6 +533,10 @@ async fn tcp_main_logic_loop(
 
                         let s = tcb.get_state();
                         log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, wait the last ack from the other side");
+
+                        // TODO: Here we need to set a timer to wait for the last ACK from the other side.
+                        // If the timer expires, we need to send a ACK|FIN packet to the other side again and reset the timer
+                        // till the retries reach the limit, and then close the session forcibly.
                     }
 
                     continue;
@@ -553,6 +556,10 @@ async fn tcp_main_logic_loop(
                     tcb.change_state(TcpState::LastAck);
                     let state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {state:?}");
+
+                    // TODO: Here we need to set a timer to wait for the last ACK from the other side.
+                    // If the timer expires, we need to send a ACK|FIN packet to the other side again and reset the timer
+                    // till the retries reach the limit, and then close the session forcibly.
                 } else {
                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 }
@@ -563,6 +570,8 @@ async fn tcp_main_logic_loop(
                     tokio::spawn(async move { dummy_sender.send(network_packet) });
                     let state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {state:?}");
+
+                    // TODO: Here we need to cancel the timer seted in the CloseWait state.
                 }
             }
             TcpState::FinWait1 => {
@@ -630,7 +639,7 @@ async fn tcp_main_logic_loop(
                 }
             }
             _ => {}
-        }
+        } // end of match state
     } // end of loop
     Ok::<(), std::io::Error>(())
 }
