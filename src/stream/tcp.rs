@@ -14,7 +14,7 @@ use std::{
     io::ErrorKind::{BrokenPipe, ConnectionRefused, InvalidInput, UnexpectedEof},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -22,6 +22,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 /// 2 * MSL (Maximum Segment Lifetime) is the maximum time a TCP connection can be in the TIME_WAIT state.
 const TWO_MSL: Duration = Duration::from_secs(2);
+
+const MAX_RETRIES: usize = 3;
+const LAST_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 enum Shutdown {
@@ -383,6 +386,36 @@ async fn tcp_main_logic_loop(
         sender.send(packet).unwrap_or(());
     }
 
+    async fn task_last_ack(tcb: Arc<Mutex<Tcb>>, sdr: PacketSender, pkt: NetworkPacket, nt: NetworkTuple, pkt_sdr: PacketSender) {
+        for idx in 1..=MAX_RETRIES {
+            let state = { tcb.lock().unwrap().get_state() };
+            if state == TcpState::Closed {
+                log::debug!("{nt} {state:?}: [task_last_ack] session closed, exiting 1...");
+                return;
+            }
+
+            tokio::time::sleep(LAST_ACK_TIMEOUT).await;
+
+            {
+                let tcb = tcb.lock().unwrap();
+                let state = tcb.get_state();
+                if state == TcpState::Closed {
+                    log::debug!("{nt} {state:?}: [task_last_ack] session closed, exiting 2...");
+                    return;
+                }
+                log::debug!("{nt} {state:?}: [task_last_ack] timer expired, resending ACK|FIN (retry {idx}/{MAX_RETRIES})");
+                _ = write_packet_to_device(&pkt_sdr, nt, &tcb, ACK | FIN, None, None);
+            }
+        }
+        {
+            let mut tcb = tcb.lock().unwrap();
+            tcb.change_state(TcpState::Closed);
+            let state = tcb.get_state();
+            log::warn!("{nt} {state:?}: [task_last_ack] max retries reached, forcibly closing session");
+            sdr.send(pkt).unwrap_or(());
+        }
+    }
+
     loop {
         let dummy_sender = dummy_sender.clone();
 
@@ -516,9 +549,11 @@ async fn tcp_main_logic_loop(
                         let s = tcb.get_state();
                         log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, wait the last ack from the other side");
 
-                        // TODO: Here we need to set a timer to wait for the last ACK from the other side.
-                        // If the timer expires, we need to send a ACK|FIN packet to the other side again and reset the timer
+                        // Here we set a timer to wait for the last ACK from the other side.
+                        // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
                         // till the retries reach the limit, and then close the session forcibly.
+                        let up = up_packet_sender.clone();
+                        tokio::spawn(task_last_ack(tcb_clone.clone(), dummy_sender, network_packet, network_tuple, up));
                     }
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     if !payload.is_empty() && tcb.get_ack() == incoming_seq {
@@ -538,9 +573,11 @@ async fn tcp_main_logic_loop(
                     let state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {state:?}");
 
-                    // TODO: Here we need to set a timer to wait for the last ACK from the other side.
-                    // If the timer expires, we need to send a ACK|FIN packet to the other side again and reset the timer
+                    // Here we set a timer to wait for the last ACK from the other side.
+                    // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
                     // till the retries reach the limit, and then close the session forcibly.
+                    let up = up_packet_sender.clone();
+                    tokio::spawn(task_last_ack(tcb_clone.clone(), dummy_sender, network_packet, network_tuple, up));
                 } else {
                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 }
@@ -551,8 +588,6 @@ async fn tcp_main_logic_loop(
                     tokio::spawn(async move { dummy_sender.send(network_packet) });
                     let state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {state:?}");
-
-                    // TODO: Here we need to cancel the timer seted in the CloseWait state.
                 }
             }
             TcpState::FinWait1 => {
