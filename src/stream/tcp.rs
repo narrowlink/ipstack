@@ -480,11 +480,9 @@ async fn tcp_main_logic_loop(
                     match pkt_type {
                         PacketType::WindowUpdate => {
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                            continue;
                         }
                         PacketType::KeepAlive => {
                             write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
-                            continue;
                         }
                         PacketType::RetransmissionRequest => {
                             if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
@@ -495,23 +493,19 @@ async fn tcp_main_logic_loop(
                                 );
                                 write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | PSH, Some(s), Some(p))?;
                             }
-                            continue;
                         }
                         PacketType::NewPacket => {
                             tcb.add_unordered_packet(incoming_seq, payload.clone());
                             let nt = network_tuple;
                             extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify_clone)?;
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                            continue;
                         }
                         PacketType::Ack => {
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                            continue;
                         }
                         PacketType::Invalid => {}
                     }
-                }
-                if flags == (ACK | FIN) {
+                } else if flags == (ACK | FIN) {
                     // The other side is closing the connection, we need to send an ACK and change state to CloseWait
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
@@ -538,15 +532,14 @@ async fn tcp_main_logic_loop(
                         // If the timer expires, we need to send a ACK|FIN packet to the other side again and reset the timer
                         // till the retries reach the limit, and then close the session forcibly.
                     }
-
-                    continue;
-                }
-                if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
+                } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     if !payload.is_empty() && tcb.get_ack() == incoming_seq {
                         tcb.add_unordered_packet(incoming_seq, payload.clone());
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
                     }
-                    continue;
+                } else {
+                    // unnormal case, we do nothing here
+                    log::trace!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, unnormal case, we do nothing here");
                 }
             }
             TcpState::CloseWait => {
@@ -584,9 +577,7 @@ async fn tcp_main_logic_loop(
                     tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet, network_tuple));
                     let state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {state:?}");
-                    continue;
-                }
-                if flags & ACK == ACK {
+                } else if flags & ACK == ACK {
                     tcb.change_state(TcpState::FinWait2);
                     if len > 0 {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
@@ -596,7 +587,9 @@ async fn tcp_main_logic_loop(
                     }
                     let state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {state:?}");
-                    continue;
+                } else {
+                    // unnormal case, we do nothing here
+                    log::trace!("{network_tuple} {state:?}: Some unnormal case, we do nothing here");
                 }
             }
             TcpState::FinWait2 => {
@@ -607,17 +600,13 @@ async fn tcp_main_logic_loop(
                     tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet, network_tuple));
                     let state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {state:?}");
-                    continue;
-                }
-                if flags & ACK == ACK && len == 0 {
+                } else if flags & ACK == ACK && len == 0 {
                     // unnormal case, we do nothing here
                     let l_ack = tcb.get_ack();
                     if incoming_seq < l_ack {
                         log::trace!("{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {l_ack}");
                     }
-                    continue;
-                }
-                if flags & ACK == ACK && len > 0 {
+                } else if flags & ACK == ACK && len > 0 {
                     // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                     tcb.add_unordered_packet(incoming_seq, payload.clone());
                     extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
@@ -628,7 +617,9 @@ async fn tcp_main_logic_loop(
                         let state = tcb.get_state();
                         log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {state:?}");
                     }
-                    continue;
+                } else {
+                    // unnormal case, we do nothing here
+                    log::trace!("{network_tuple} {state:?}: Some unnormal case, we do nothing here");
                 }
             }
             TcpState::TimeWait => {
