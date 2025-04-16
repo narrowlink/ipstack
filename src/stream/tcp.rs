@@ -79,7 +79,6 @@ pub struct IpStackTcpStream {
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-    match_point: Arc<std::sync::atomic::AtomicU32>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     force_exit_task_notifier: Option<tokio::sync::mpsc::Sender<()>>,
 }
@@ -125,7 +124,6 @@ impl IpStackTcpStream {
             data_tx,
             data_rx,
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            match_point: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             task_handle: None,
             force_exit_task_notifier: None,
         };
@@ -247,9 +245,9 @@ impl AsyncWrite for IpStackTcpStream {
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let shutdown = { self.shutdown.lock().unwrap().fake_clone() };
-        let (nt, state, seq) = {
+        let (nt, state, seq, is_at_match_point) = {
             let tcb = self.tcb.lock().unwrap();
-            (self.network_tuple(), tcb.get_state(), tcb.get_seq())
+            (self.network_tuple(), tcb.get_state(), tcb.get_seq(), tcb.is_at_match_point())
         };
         log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, shutdown {shutdown}",);
         if state == TcpState::Closed {
@@ -257,7 +255,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
         match shutdown {
             Shutdown::None => {
-                if self.match_point.load(std::sync::atomic::Ordering::SeqCst) == seq.0 && state == TcpState::Established {
+                if is_at_match_point {
                     log::debug!("{nt} {state:?}: [poll_shutdown] actively send a farewell packet to the other side...");
                     let mut tcb = self.tcb.lock().unwrap();
                     write_packet_to_device(&self.up_packet_sender, nt, &tcb, ACK | FIN, None, None)?;
@@ -308,7 +306,6 @@ impl IpStackTcpStream {
         let write_notify = self.write_notify.clone();
         let read_notify_clone = self.read_notify.clone();
         let data_tx = self.data_tx.clone();
-        let match_point = self.match_point.clone();
         let destroy_messenger = self.destroy_messenger.take();
 
         let (force_exit_task_notifier, force_exit_task_monitor) = tokio::sync::mpsc::channel::<()>(10);
@@ -324,7 +321,6 @@ impl IpStackTcpStream {
                 write_notify,
                 read_notify_clone,
                 data_tx,
-                match_point,
                 force_exit_task_monitor,
             )
             .await;
@@ -352,7 +348,6 @@ async fn tcp_main_logic_loop(
     write_notify: Arc<std::sync::Mutex<Option<Waker>>>,
     read_notify_clone: Arc<std::sync::Mutex<Option<Waker>>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    match_point: Arc<std::sync::atomic::AtomicU32>,
     mut force_exit_task_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
     {
@@ -455,7 +450,7 @@ async fn tcp_main_logic_loop(
 
         let pkt_type = tcb.check_pkt_type(tcp_header, payload);
 
-        let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq().0, tcb.get_ack().0) };
+        let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq(), tcb.get_ack()) };
         let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
         let l_info = format!("local {{ seq: {}, ack: {} }}", seq, ack);
         log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
@@ -479,7 +474,7 @@ async fn tcp_main_logic_loop(
                     if tcb.get_last_received_ack() == seq {
                         // FIXME: Here we always store the appropriate sequence number in case of an unexpected
                         // poll_shutdown call. This may not be the best solution.
-                        match_point.store(seq, std::sync::atomic::Ordering::SeqCst);
+                        tcb.match_point = seq;
                         log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} >>> match point <<<");
                     }
 

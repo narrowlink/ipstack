@@ -50,6 +50,7 @@ pub(crate) struct Tcb {
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
+    pub(crate) match_point: SeqNum,
 }
 
 impl Tcb {
@@ -70,7 +71,12 @@ impl Tcb {
             unordered_packets: BTreeMap::new(),
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
+            match_point: seq.into(),
         }
+    }
+
+    pub fn is_at_match_point(&self) -> bool {
+        self.seq == self.match_point && self.state == TcpState::Established
     }
 
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
