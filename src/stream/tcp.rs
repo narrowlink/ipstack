@@ -672,8 +672,9 @@ pub(crate) fn write_packet_to_device(
     use std::io::Error;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
     let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window().max(tcb.get_mtu()));
-    let (src, dst) = (tuple.dst, tuple.src);
-    let packet = create_raw_packet(src, dst, tcb, flags, TTL, seq, ack, window_size, payload.unwrap_or_default())?;
+    let (src, dst) = (tuple.dst, tuple.src); // the address is reversed here
+    let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
+    let packet = create_raw_packet(src, dst, calc, flags, TTL, seq, ack, window_size, payload.unwrap_or_default())?;
     let len = packet.payload.len();
     up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
     Ok(len)
@@ -683,7 +684,7 @@ pub(crate) fn write_packet_to_device(
 pub(crate) fn create_raw_packet(
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
-    tcb: &Tcb,
+    calculate_payload_max_len: impl Fn(usize, usize) -> usize,
     flags: u8,
     ttl: u8,
     seq: u32,
@@ -703,7 +704,7 @@ pub(crate) fn create_raw_packet(
         (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
             let mut ip_h =
                 Ipv4Header::new(0, ttl, IpNumber::TCP, src.octets(), dst.octets()).map_err(|e| std::io::Error::new(InvalidInput, e))?;
-            let payload_len = tcb.calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
+            let payload_len = calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
             payload.truncate(payload_len);
             ip_h.set_payload_len(payload.len() + tcp_header.header_len())
                 .map_err(|e| std::io::Error::new(InvalidInput, e))?;
@@ -720,7 +721,7 @@ pub(crate) fn create_raw_packet(
                 source: src.octets(),
                 destination: dst.octets(),
             };
-            let payload_len = tcb.calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
+            let payload_len = calculate_payload_max_len(ip_h.header_len(), tcp_header.header_len());
             payload.truncate(payload_len);
             let len = payload.len() + tcp_header.header_len();
             ip_h.set_payload_length(len).map_err(|e| std::io::Error::new(InvalidInput, e))?;
