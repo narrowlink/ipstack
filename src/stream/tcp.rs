@@ -383,17 +383,8 @@ async fn tcp_main_logic_loop(
         sender.send(packet).unwrap_or(());
     }
 
-    let mut last_rcv_ack = None;
-    let mut last_rcv_win = None;
-
     loop {
         let dummy_sender = dummy_sender.clone();
-        if let Some(ack) = last_rcv_ack {
-            tcb.lock().unwrap().update_last_received_ack(ack);
-        }
-        if let Some(win) = last_rcv_win {
-            tcb.lock().unwrap().update_send_window(win);
-        }
 
         let network_packet = tokio::select! {
             _ = force_exit_task_monitor.recv() => {
@@ -421,9 +412,6 @@ async fn tcp_main_logic_loop(
         let incoming_ack: SeqNum = tcp_header.acknowledgment_number.into();
         let incoming_seq: SeqNum = tcp_header.sequence_number.into();
         let incoming_win = tcp_header.window_size;
-
-        last_rcv_ack = Some(incoming_ack);
-        last_rcv_win = Some(incoming_win);
 
         let mut tcb = tcb.lock().unwrap();
 
@@ -631,6 +619,9 @@ async fn tcp_main_logic_loop(
             }
             _ => {}
         } // end of match state
+
+        tcb.update_last_received_ack(incoming_ack);
+        tcb.update_send_window(incoming_win);
     } // end of loop
     Ok::<(), std::io::Error>(())
 }
