@@ -50,7 +50,6 @@ pub(crate) struct Tcb {
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
-    pub(crate) match_point: SeqNum,
 }
 
 impl Tcb {
@@ -71,12 +70,7 @@ impl Tcb {
             unordered_packets: BTreeMap::new(),
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
-            match_point: seq.into(),
         }
-    }
-
-    pub fn is_at_match_point(&self) -> bool {
-        self.seq == self.match_point && self.state == TcpState::Established
     }
 
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
@@ -248,10 +242,10 @@ impl Tcb {
         self.last_received_ack = ack;
     }
 
-    pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) -> usize {
+    pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
         match self.inflight_packets.first_key_value() {
-            None => return 0,
-            Some((&seq, _)) if ack < seq => return self.inflight_packets.values().map(|p| p.payload.len()).sum(),
+            None => return,
+            Some((&seq, _)) if ack < seq => return,
             _ => {}
         }
         if let Some(seq) = self
@@ -269,8 +263,6 @@ impl Tcb {
             }
         }
         self.inflight_packets.retain(|_, p| ack < p.seq + p.payload.len() as u32);
-
-        self.inflight_packets.values().map(|p| p.payload.len()).sum()
     }
 
     pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
@@ -295,6 +287,10 @@ impl Tcb {
             true // keep the packet in the inflight_packets
         });
         retransmit_list
+    }
+
+    pub(crate) fn is_inflight_packets_empty(&self) -> bool {
+        self.inflight_packets.is_empty()
     }
 
     #[allow(dead_code)]

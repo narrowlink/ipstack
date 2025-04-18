@@ -248,32 +248,51 @@ impl AsyncWrite for IpStackTcpStream {
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let shutdown = { self.shutdown.lock().unwrap().fake_clone() };
-        let (nt, state, seq, is_at_match_point) = {
+        let (nt, state, seq, is_ready) = {
             let tcb = self.tcb.lock().unwrap();
-            (self.network_tuple(), tcb.get_state(), tcb.get_seq(), tcb.is_at_match_point())
+            let is_ready = tcb.is_inflight_packets_empty();
+            (self.network_tuple(), tcb.get_state(), tcb.get_seq(), is_ready)
         };
-        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, shutdown {shutdown}",);
+        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}, shutdown {shutdown}",);
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
         match shutdown {
             Shutdown::None => {
-                if is_at_match_point {
-                    log::debug!("{nt} {state:?}: [poll_shutdown] actively send a farewell packet to the other side...");
+                if is_ready && state == TcpState::Established {
                     let mut tcb = self.tcb.lock().unwrap();
-                    write_packet_to_device(&self.up_packet_sender, nt, &tcb, ACK | FIN, None, None)?;
-                    tcb.increase_seq();
-                    tcb.change_state(TcpState::FinWait1);
-                    let state = tcb.get_state();
-                    log::debug!("{nt} {state:?}: [poll_shutdown] now in {state:?} state");
+                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
                 }
                 self.shutdown.lock().unwrap().pending(cx.waker().clone());
                 Poll::Pending
             }
-            Shutdown::Pending(_) => Poll::Pending,
+            Shutdown::Pending(_) => {
+                if is_ready && state == TcpState::Established {
+                    let mut tcb = self.tcb.lock().unwrap();
+                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
+                }
+                Poll::Pending
+            }
             Shutdown::Ready => Poll::Ready(Ok(())),
         }
     }
+}
+
+fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<()> {
+    let state = tcb.get_state();
+    if !(tcb.is_inflight_packets_empty() && state == TcpState::Established) {
+        log::warn!("{nt} {state:?}: {hint} session is not in a valid state to send FIN, skipping...");
+        return Ok(());
+    }
+
+    log::debug!("{nt} {state:?}: {hint} actively send a farewell packet to the other side...");
+    write_packet_to_device(sender, nt, tcb, ACK | FIN, None, None)?;
+    tcb.increase_seq();
+    tcb.change_state(TcpState::FinWait1);
+    let state = tcb.get_state();
+    log::debug!("{nt} {state:?}: {hint} now in {state:?} state");
+
+    Ok(())
 }
 
 impl Drop for IpStackTcpStream {
@@ -461,7 +480,7 @@ async fn tcp_main_logic_loop(
 
         tcb.update_duplicate_ack_count(incoming_ack);
 
-        let inflight_len = tcb.update_inflight_packet_queue(incoming_ack);
+        tcb.update_inflight_packet_queue(incoming_ack);
 
         for packet in tcb.collect_timed_out_inflight_packets() {
             let (seq, count) = (packet.seq, packet.retransmit_count);
@@ -491,13 +510,6 @@ async fn tcp_main_logic_loop(
             }
             TcpState::Established => {
                 if flags == ACK {
-                    if tcb.get_last_received_ack() == seq {
-                        // FIXME: Here we always store the appropriate sequence number in case of an unexpected
-                        // poll_shutdown call. This may not be the best solution.
-                        tcb.match_point = seq;
-                        log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} >>> match point <<<");
-                    }
-
                     match pkt_type {
                         PacketType::WindowUpdate => {
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
@@ -566,12 +578,12 @@ async fn tcp_main_logic_loop(
                 }
             }
             TcpState::CloseWait => {
-                if flags & ACK == ACK && inflight_len == 0 {
+                if flags & ACK == ACK && tcb.is_inflight_packets_empty() {
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | FIN, None, None)?;
                     tcb.increase_seq();
                     tcb.change_state(TcpState::LastAck);
-                    let state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {state:?}");
+                    let new_state = tcb.get_state();
+                    log::trace!("{network_tuple} {state:?}: Received ACK|FIN, transitioned to {new_state:?}");
 
                     // Here we set a timer to wait for the last ACK from the other side.
                     // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
@@ -586,8 +598,8 @@ async fn tcp_main_logic_loop(
                 if flags & ACK == ACK {
                     tcb.change_state(TcpState::Closed);
                     tokio::spawn(async move { dummy_sender.send(network_packet) });
-                    let state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {state:?}");
+                    let new_state = tcb.get_state();
+                    log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
                 }
             }
             TcpState::FinWait1 => {
@@ -598,8 +610,8 @@ async fn tcp_main_logic_loop(
                     tcb.change_state(TcpState::TimeWait);
 
                     tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet, network_tuple));
-                    let state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {state:?}");
+                    let new_state = tcb.get_state();
+                    log::trace!("{network_tuple} {state:?}: Final ACK|FIN received too early, transitioned to {new_state:?} directly");
                 } else if flags & ACK == ACK {
                     tcb.change_state(TcpState::FinWait2);
                     if len > 0 {
@@ -608,8 +620,8 @@ async fn tcp_main_logic_loop(
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
-                    let state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {state:?}");
+                    let new_state = tcb.get_state();
+                    log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {new_state:?}");
                 } else {
                     // unnormal case, we do nothing here
                     log::trace!("{network_tuple} {state:?}: Some unnormal case, we do nothing here");
@@ -621,8 +633,8 @@ async fn tcp_main_logic_loop(
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
                     tcb.change_state(TcpState::TimeWait);
                     tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet, network_tuple));
-                    let state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {state:?}");
+                    let new_state = tcb.get_state();
+                    log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
                 } else if flags & ACK == ACK && len == 0 {
                     // unnormal case, we do nothing here
                     let l_ack = tcb.get_ack();
@@ -637,8 +649,8 @@ async fn tcp_main_logic_loop(
                     if flags & FIN == FIN {
                         tcb.change_state(TcpState::TimeWait);
                         tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet, network_tuple));
-                        let state = tcb.get_state();
-                        log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {state:?}");
+                        let new_state = tcb.get_state();
+                        log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
                     }
                 } else {
                     // unnormal case, we do nothing here
