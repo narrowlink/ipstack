@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// 2 * MSL (Maximum Segment Lifetime) is the maximum time a TCP connection can be in the TIME_WAIT state.
 const TWO_MSL: Duration = Duration::from_secs(2);
 
-const MAX_RETRIES: usize = 3;
+const LAST_ACK_MAX_RETRIES: usize = 3;
 const LAST_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
@@ -406,10 +406,11 @@ async fn tcp_main_logic_loop(
     }
 
     async fn task_last_ack(tcb: Arc<Mutex<Tcb>>, sdr: PacketSender, pkt: NetworkPacket, nt: NetworkTuple, pkt_sdr: PacketSender) {
-        for idx in 1..=MAX_RETRIES {
+        let hint = "[task_last_ack]";
+        for idx in 1..=LAST_ACK_MAX_RETRIES {
             let state = { tcb.lock().unwrap().get_state() };
             if state == TcpState::Closed {
-                log::debug!("{nt} {state:?}: [task_last_ack] session closed, exiting 1...");
+                log::debug!("{nt} {state:?}: {hint} session closed, exiting 1...");
                 return;
             }
 
@@ -419,10 +420,10 @@ async fn tcp_main_logic_loop(
                 let tcb = tcb.lock().unwrap();
                 let state = tcb.get_state();
                 if state == TcpState::Closed {
-                    log::debug!("{nt} {state:?}: [task_last_ack] session closed, exiting 2...");
+                    log::debug!("{nt} {state:?}: {hint} session closed, exiting 2...");
                     return;
                 }
-                log::debug!("{nt} {state:?}: [task_last_ack] timer expired, resending ACK|FIN (retry {idx}/{MAX_RETRIES})");
+                log::debug!("{nt} {state:?}: {hint} timer expired, resending ACK|FIN (retry {idx}/{LAST_ACK_MAX_RETRIES})");
                 _ = write_packet_to_device(&pkt_sdr, nt, &tcb, ACK | FIN, None, None);
             }
         }
@@ -430,7 +431,7 @@ async fn tcp_main_logic_loop(
             let mut tcb = tcb.lock().unwrap();
             tcb.change_state(TcpState::Closed);
             let state = tcb.get_state();
-            log::warn!("{nt} {state:?}: [task_last_ack] max retries reached, forcibly closing session");
+            log::warn!("{nt} {state:?}: {hint} max retries reached, forcibly closing session");
             sdr.send(pkt).unwrap_or(());
         }
     }
