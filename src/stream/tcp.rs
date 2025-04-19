@@ -23,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// 2 * MSL (Maximum Segment Lifetime) is the maximum time a TCP connection can be in the TIME_WAIT state.
 const TWO_MSL: Duration = Duration::from_secs(2);
 
+const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAST_ACK_MAX_RETRIES: usize = 3;
 const LAST_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -250,7 +251,7 @@ impl AsyncWrite for IpStackTcpStream {
         let shutdown = { self.shutdown.lock().unwrap().fake_clone() };
         let (nt, state, seq, is_ready) = {
             let tcb = self.tcb.lock().unwrap();
-            let is_ready = tcb.is_inflight_packets_empty();
+            let is_ready = tcb.get_inflight_packets_total_len() == 0;
             (self.network_tuple(), tcb.get_state(), tcb.get_seq(), is_ready)
         };
         log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}, shutdown {shutdown}",);
@@ -280,8 +281,8 @@ impl AsyncWrite for IpStackTcpStream {
 
 fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<()> {
     let state = tcb.get_state();
-    if !(tcb.is_inflight_packets_empty() && state == TcpState::Established) {
-        log::warn!("{nt} {state:?}: {hint} session is not in a valid state to send FIN, skipping...");
+    if !(tcb.get_inflight_packets_total_len() == 0 && state == TcpState::Established) {
+        log::debug!("{nt} {state:?}: {hint} session is not in a valid state to send FIN, skipping...");
         return Ok(());
     }
 
@@ -436,6 +437,33 @@ async fn tcp_main_logic_loop(
         }
     }
 
+    async fn task_timed_out_for_close_wait(
+        tcb: Arc<Mutex<Tcb>>,
+        dummy_sender: PacketSender,
+        dummy: NetworkPacket,
+        nt: NetworkTuple,
+        up_packet_sender: PacketSender,
+    ) -> std::io::Result<()> {
+        tokio::time::sleep(CLOSE_WAIT_TIMEOUT).await; // Wait CLOSE_WAIT_TIMEOUT for upstream
+        let tcb_clone = tcb.clone();
+        let mut tcb = tcb.lock().unwrap();
+        let state = tcb.get_state();
+        if state != TcpState::CloseWait {
+            return Ok(());
+        }
+        log::warn!("{nt} {state:?}: Upstream timeout, forcing FIN");
+        write_packet_to_device(&up_packet_sender, nt, &tcb, ACK | FIN, None, None)?;
+        tcb.increase_seq();
+        tcb.change_state(TcpState::LastAck);
+        let new_state = tcb.get_state();
+        log::debug!("{nt} {state:?}: Forced transition to {new_state:?}");
+
+        // Here we set a timer to wait for the last ACK from the other side.
+        tokio::spawn(task_last_ack(tcb_clone, dummy_sender, dummy, nt, up_packet_sender));
+
+        Ok::<(), std::io::Error>(())
+    }
+
     loop {
         let dummy_sender = dummy_sender.clone();
 
@@ -545,13 +573,10 @@ async fn tcp_main_logic_loop(
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
                     tcb.change_state(TcpState::CloseWait);
 
-                    // FIXME: This is a workaround for the case where the other side sends a FIN packet
-                    // and we are not sure whether the upstream has sent all the data.
                     let s = tcb.get_state();
-                    if let Some(w) = write_notify.lock().unwrap().take() {
-                        log::debug!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, closed by the other side, notify upstream");
-                        w.wake_by_ref();
-                    } else {
+                    let len = tcb.get_inflight_packets_total_len();
+                    if len == 0 {
+                        // All upstream data sent, proceed to LastAck
                         log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, closed by the other side, no upstream data");
 
                         // Here we don't wait, just send FIN to the other side and change state to LastAck directly,
@@ -567,6 +592,15 @@ async fn tcp_main_logic_loop(
                         // till the retries reach the limit, and then close the session forcibly.
                         let up = up_packet_sender.clone();
                         tokio::spawn(task_last_ack(tcb_clone.clone(), dummy_sender, network_packet, network_tuple, up));
+                    } else {
+                        // Upstream data pending, wake write_notify and wait
+                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                        log::debug!("{network_tuple} {state:?}: Waiting for upstream data to complete, inflight packets: {len}",);
+
+                        // Spawn a timeout task to force FIN if upstream is unresponsive
+                        let tcb = tcb_clone.clone();
+                        let up = up_packet_sender.clone();
+                        tokio::spawn(task_timed_out_for_close_wait(tcb, dummy_sender, network_packet, network_tuple, up));
                     }
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     if !payload.is_empty() && tcb.get_ack() == incoming_seq {
@@ -579,7 +613,7 @@ async fn tcp_main_logic_loop(
                 }
             }
             TcpState::CloseWait => {
-                if flags & ACK == ACK && tcb.is_inflight_packets_empty() {
+                if flags & ACK == ACK && tcb.get_inflight_packets_total_len() == 0 {
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | FIN, None, None)?;
                     tcb.increase_seq();
                     tcb.change_state(TcpState::LastAck);

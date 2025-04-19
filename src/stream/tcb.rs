@@ -289,8 +289,8 @@ impl Tcb {
         retransmit_list
     }
 
-    pub(crate) fn is_inflight_packets_empty(&self) -> bool {
-        self.inflight_packets.is_empty()
+    pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
+        self.inflight_packets.values().map(|p| p.payload.len()).sum()
     }
 
     #[allow(dead_code)]
