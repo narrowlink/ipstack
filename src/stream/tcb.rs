@@ -51,7 +51,6 @@ pub(crate) struct Tcb {
     last_received_ack: SeqNum,
     send_window: u16,
     state: TcpState,
-    avg_send_window: Average,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
     duplicate_ack_count: usize,
@@ -71,7 +70,6 @@ impl Tcb {
             last_received_ack: seq.into(),
             send_window: u16::MAX,
             state: TcpState::Listen,
-            avg_send_window: Average::default(),
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
             duplicate_ack_count: 0,
@@ -178,14 +176,10 @@ impl Tcb {
         self.state
     }
     pub(super) fn update_send_window(&mut self, window: u16) {
-        self.avg_send_window.update(window as u64);
         self.send_window = window;
     }
     pub(super) fn get_send_window(&self) -> u16 {
         self.send_window
-    }
-    pub(super) fn get_avg_send_window(&self) -> u64 {
-        self.avg_send_window.get()
     }
     pub(super) fn get_recv_window(&self) -> u16 {
         self.get_available_read_buffer_size() as u16
@@ -310,21 +304,6 @@ impl Tcb {
 
     pub fn is_send_buffer_full(&self) -> bool {
         self.seq.distance(self.get_last_received_ack()) >= MAX_UNACK
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Average {
-    pub(crate) avg: u64,
-    pub(crate) count: u64,
-}
-impl Average {
-    fn update(&mut self, value: u64) {
-        self.avg = ((self.avg * self.count) + value) / (self.count + 1);
-        self.count += 1;
-    }
-    fn get(&self) -> u64 {
-        self.avg
     }
 }
 

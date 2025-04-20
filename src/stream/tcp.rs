@@ -211,10 +211,10 @@ impl AsyncWrite for IpStackTcpStream {
         let nt = self.network_tuple();
         self.reset_timeout();
 
-        let (state, send_window, avg_send_window, is_full) = {
+        let (state, send_window, is_full) = {
             let tcb = self.tcb.lock().unwrap();
             let state = tcb.get_state();
-            (state, tcb.get_send_window(), tcb.get_avg_send_window(), tcb.is_send_buffer_full())
+            (state, tcb.get_send_window(), tcb.is_send_buffer_full())
         };
 
         if state == TcpState::Closed {
@@ -223,10 +223,9 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
 
-        // if (send_window as u64) < avg_send_window / 2 || is_full {
         if send_window == 0 || is_full {
             self.write_notify.lock().unwrap().replace(cx.waker().clone());
-            let info = format!("current send window: {send_window}, average send window: {avg_send_window}, send buffer full: {is_full}");
+            let info = format!("current send window: {send_window}, send buffer full: {is_full}");
             log::trace!("{nt} {state:?}: [poll_write] {info}, waiting for the other side to send ACK...");
             return Poll::Pending;
         }
