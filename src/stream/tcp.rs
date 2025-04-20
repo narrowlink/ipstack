@@ -722,7 +722,7 @@ fn extract_data_n_write_upstream(
         return Ok(());
     }
 
-    if let Some(data) = tcb.get_unordered_packets(4096) {
+    if let Some(data) = tcb.consume_unordered_packets(4096) {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;

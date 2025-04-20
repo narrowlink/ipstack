@@ -37,6 +37,12 @@ pub(super) enum PacketType {
     KeepAlive,
 }
 
+/// TCP Control Block
+/// - `inflight_packets` is prerepresented bytes stream from upstream application,
+///   which have been sent to the lower device but not yet acknowledged.
+/// - `unordered_packets` is the bytes stream received from the lower device,
+///   which can be acknowledged and extracted by `consume_unordered_packets` method
+///   then can be read by upstream application via `Tcp::poll_read` method.
 #[derive(Debug, Clone)]
 pub(crate) struct Tcb {
     seq: SeqNum,
@@ -101,10 +107,14 @@ impl Tcb {
         self.unordered_packets.insert(seq, buf);
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        READ_BUFFER_SIZE.saturating_sub(self.unordered_packets.values().map(|p| p.len()).sum())
+        READ_BUFFER_SIZE.saturating_sub(self.get_unordered_packets_total_len())
+    }
+    #[inline]
+    pub(crate) fn get_unordered_packets_total_len(&self) -> usize {
+        self.unordered_packets.values().map(|p| p.len()).sum()
     }
 
-    pub(super) fn get_unordered_packets(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
+    pub(super) fn consume_unordered_packets(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
         let mut data = Vec::new();
         let mut remaining_bytes = max_bytes;
 
@@ -372,7 +382,7 @@ mod tests {
         tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]); // seq=2000, len=500
 
         // test 1: extract up to 700 bytes
-        let data = tcb.get_unordered_packets(700).unwrap();
+        let data = tcb.consume_unordered_packets(700).unwrap();
         assert_eq!(data.len(), 700); // extract 500 + 200
         assert_eq!(data[..500], vec![1; 500]); // the first packet
         assert_eq!(data[500..700], vec![2; 200]); // the first 200 bytes of the second packet
@@ -382,7 +392,7 @@ mod tests {
         assert_eq!(tcb.unordered_packets.get(&SeqNum(2000)).unwrap().len(), 500); // the third packet unchanged
 
         // test 2: extract up to 800 bytes
-        let data = tcb.get_unordered_packets(800).unwrap();
+        let data = tcb.consume_unordered_packets(800).unwrap();
         assert_eq!(data.len(), 800); // extract 300 bytes of the second packet and the third packet
         assert_eq!(data[..300], vec![2; 300]); // the remaining 300 bytes of the second packet
         assert_eq!(data[300..800], vec![3; 500]); // the third packet
@@ -390,7 +400,7 @@ mod tests {
         assert_eq!(tcb.unordered_packets.len(), 0); // no remaining packets
 
         // test 3: no data to extract
-        let data = tcb.get_unordered_packets(1000);
+        let data = tcb.consume_unordered_packets(1000);
         assert!(data.is_none());
     }
 
