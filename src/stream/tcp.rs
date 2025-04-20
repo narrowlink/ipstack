@@ -85,6 +85,7 @@ pub struct IpStackTcpStream {
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     force_exit_task_notifier: Option<tokio::sync::mpsc::Sender<()>>,
+    temp_read_buffer: Vec<u8>,
 }
 
 impl IpStackTcpStream {
@@ -130,6 +131,7 @@ impl IpStackTcpStream {
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task_handle: None,
             force_exit_task_notifier: None,
+            temp_read_buffer: Vec::new(),
         };
 
         let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
@@ -163,6 +165,14 @@ impl IpStackTcpStream {
 
 impl AsyncRead for IpStackTcpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        // if there is data in the temp buffer, read it first
+        if !self.temp_read_buffer.is_empty() {
+            let len = std::cmp::min(buf.remaining(), self.temp_read_buffer.len());
+            buf.put_slice(&self.temp_read_buffer[..len]);
+            self.temp_read_buffer.drain(..len); // remove the read data from the temp buffer
+            return Poll::Ready(Ok(()));
+        }
+
         let network_tuple = self.network_tuple();
 
         let state = self.tcb.lock().unwrap().get_state();
@@ -194,7 +204,14 @@ impl AsyncRead for IpStackTcpStream {
         // read data from channel
         match self.data_rx.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
-                buf.put_slice(&data);
+                let remaining = buf.remaining();
+                if remaining >= data.len() {
+                    buf.put_slice(&data);
+                } else {
+                    // if `buf` is not enough, put the remaining data into the temp buffer
+                    buf.put_slice(&data[..remaining]);
+                    self.temp_read_buffer.extend_from_slice(&data[remaining..]);
+                }
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
@@ -721,7 +738,7 @@ fn extract_data_n_write_upstream(
         return Ok(());
     }
 
-    if let Some(data) = tcb.consume_unordered_packets(4096) {
+    if let Some(data) = tcb.consume_unordered_packets(8192) {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
