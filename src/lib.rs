@@ -1,6 +1,5 @@
 #![doc = include_str!("../README.md")]
 
-use crate::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 use ahash::AHashMap;
 use packet::{NetworkPacket, NetworkTuple, TransportHeader};
 use std::time::Duration;
@@ -17,9 +16,10 @@ pub(crate) type SessionCollection = std::sync::Arc<tokio::sync::Mutex<AHashMap<N
 
 mod error;
 mod packet;
-pub mod stream;
+mod stream;
 
 pub use self::error::{IpStackError, Result};
+pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 pub use ::etherparse::IpNumber;
 
 #[cfg(unix)]
@@ -80,7 +80,7 @@ impl IpStackConfig {
 
 pub struct IpStack {
     accept_receiver: UnboundedReceiver<IpStackStream>,
-    pub handle: JoinHandle<Result<()>>,
+    _handle: JoinHandle<Result<()>>, // Just hold the task handle
 }
 
 impl IpStack {
@@ -91,7 +91,7 @@ impl IpStack {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
         IpStack {
             accept_receiver,
-            handle: run(config, device, accept_sender),
+            _handle: run(config, device, accept_sender),
         }
     }
 
