@@ -117,7 +117,12 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 Ok(n) = device.read(&mut buffer) => {
                     let u = up_pkt_sender.clone();
                     if let Err(e) = process_device_read(&buffer[offset..n], sessions.clone(), u, &config, &accept_sender).await {
-                        log::warn!("process_device_read error: {}", e);
+                        let io_err: std::io::Error = e.into();
+                        if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
+                            log::trace!("Received junk data: {}", io_err);
+                        } else {
+                            log::warn!("process_device_read error: {}", io_err);
+                        }
                     }
                 }
                 Some(packet) = up_pkt_receiver.recv() => {
@@ -163,45 +168,39 @@ async fn process_device_read(
             entry.get().send(packet).map_err(|e| Error::new(Other, e))?;
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
-            log::debug!("session created: {}", network_tuple);
-            let (packet_sender, mut ip_stack_stream) = create_stream(packet, config, up_pkt_sender)?;
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            match ip_stack_stream {
-                IpStackStream::Tcp(ref mut stream) => {
-                    stream.set_destroy_messenger(tx);
-                }
-                IpStackStream::Udp(ref mut stream) => {
-                    stream.set_destroy_messenger(tx);
-                }
-                _ => unreachable!(),
-            }
+            let (packet_sender, ip_stack_stream) = create_stream(packet, config, up_pkt_sender, Some(tx))?;
             tokio::spawn(async move {
                 rx.await.ok();
                 sessions_clone.lock().await.remove(&network_tuple);
                 log::debug!("session destroyed: {}", network_tuple);
             });
-            entry.insert(packet_sender);
             accept_sender.send(ip_stack_stream)?;
+            entry.insert(packet_sender);
+            log::debug!("session created: {}", network_tuple);
         }
     }
     Ok(())
 }
 
-fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: PacketSender) -> Result<(PacketSender, IpStackStream)> {
+fn create_stream(
+    packet: NetworkPacket,
+    cfg: &IpStackConfig,
+    up_pkt_sender: PacketSender,
+    msgr: Option<::tokio::sync::oneshot::Sender<()>>,
+) -> Result<(PacketSender, IpStackStream)> {
     let src_addr = packet.src_addr();
     let dst_addr = packet.dst_addr();
     match packet.transport_header() {
         TransportHeader::Tcp(h) => {
-            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, cfg.tcp_timeout)?;
+            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, cfg.tcp_timeout, msgr)?;
             Ok((stream.stream_sender(), IpStackStream::Tcp(stream)))
         }
         TransportHeader::Udp(_) => {
-            let stream = IpStackUdpStream::new(src_addr, dst_addr, packet.payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout);
+            let stream = IpStackUdpStream::new(src_addr, dst_addr, packet.payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, msgr);
             Ok((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
-        TransportHeader::Unknown => {
-            unreachable!()
-        }
+        TransportHeader::Unknown => Err(IpStackError::UnsupportedTransportProtocol),
     }
 }
 

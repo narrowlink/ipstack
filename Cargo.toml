@@ -2,7 +2,7 @@
 authors = ['Narrowlink <opensource@narrowlink.com>']
 description = 'Asynchronous lightweight userspace implementation of TCP/IP stack for Tun device'
 name = "ipstack"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = 'https://github.com/narrowlink/ipstack'
@@ -12,6 +12,7 @@ readme = "README.md"
 [dependencies]
 ahash = "0.8"
 etherparse = { version = "0.17", default-features = false, features = ["std"] }
+futures = "0.3"
 log = { version = "0.4", default-features = false }
 rand = { version = "0.9", default-features = false, features = ["thread_rng"] }
 thiserror = { version = "2.0", default-features = false }
@@ -21,6 +22,7 @@ tokio = { version = "1.43", default-features = false, features = [
     "time",
     "io-util",
     "macros",
+    "rt-multi-thread",
 ] }
 
 [dev-dependencies]
