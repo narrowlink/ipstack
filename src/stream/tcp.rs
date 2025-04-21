@@ -204,13 +204,13 @@ impl AsyncRead for IpStackTcpStream {
         // read data from channel
         match self.data_rx.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
-                let remaining = buf.remaining();
-                if remaining >= data.len() {
+                let capacity = buf.remaining();
+                if capacity >= data.len() {
                     buf.put_slice(&data);
                 } else {
                     // if `buf` is not enough, put the remaining data into the temp buffer
-                    buf.put_slice(&data[..remaining]);
-                    self.temp_read_buffer.extend_from_slice(&data[remaining..]);
+                    buf.put_slice(&data[..capacity]);
+                    self.temp_read_buffer.extend_from_slice(&data[capacity..]);
                 }
                 Poll::Ready(Ok(()))
             }
@@ -488,7 +488,7 @@ async fn tcp_main_logic_loop(
                 log::debug!("{network_tuple} task exited due to force exit signal");
                 break;
             }
-            network_packet = stream_receiver.recv() => {network_packet}
+            network_packet = stream_receiver.recv() => network_packet,
         };
 
         let Some(network_packet) = network_packet else {
