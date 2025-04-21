@@ -25,7 +25,12 @@ pub enum IpStackError {
     SendError(#[from] tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>),
 }
 
+// Safety: All variants of IpStackError either contain no data or wrap types that are `Send`.
+// This ensures that IpStackError as a whole is safe to send between threads.
 unsafe impl Send for IpStackError {}
+
+// Safety: All variants of IpStackError either contain no data or wrap types that are `Sync`.
+// This ensures that IpStackError as a whole is safe to share between threads.
 unsafe impl Sync for IpStackError {}
 
 impl From<IpStackError> for std::io::Error {
