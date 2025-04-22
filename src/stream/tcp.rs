@@ -339,7 +339,6 @@ impl IpStackTcpStream {
         // task: data receiving and processing
         let tcb = self.tcb.clone();
         let stream_receiver = self.stream_receiver.take().unwrap();
-        let dummy_sender = self.stream_sender.clone();
         let up_packet_sender = self.up_packet_sender.clone();
         let shutdown = self.shutdown.clone();
         let write_notify = self.write_notify.clone();
@@ -348,6 +347,7 @@ impl IpStackTcpStream {
         let destroy_messenger = self.destroy_messenger.take();
 
         let (force_exit_task_notifier, force_exit_task_monitor) = tokio::sync::mpsc::channel::<()>(10);
+        let exit_notifier = force_exit_task_notifier.clone();
         self.force_exit_task_notifier = Some(force_exit_task_notifier);
 
         let task_handle = tokio::spawn(async move {
@@ -355,7 +355,7 @@ impl IpStackTcpStream {
                 tcb,
                 stream_receiver,
                 up_packet_sender,
-                dummy_sender,
+                exit_notifier,
                 network_tuple,
                 write_notify,
                 read_notify_clone,
@@ -382,7 +382,7 @@ async fn tcp_main_logic_loop(
     tcb: Arc<std::sync::Mutex<Tcb>>,
     mut stream_receiver: PacketReceiver,
     up_packet_sender: PacketSender,
-    dummy_sender: PacketSender,
+    exit_notifier: tokio::sync::mpsc::Sender<()>,
     network_tuple: NetworkTuple,
     write_notify: Arc<std::sync::Mutex<Option<Waker>>>,
     read_notify_clone: Arc<std::sync::Mutex<Option<Waker>>>,
@@ -411,7 +411,7 @@ async fn tcp_main_logic_loop(
 
     let tcb_clone = tcb.clone();
 
-    async fn task_wait_to_close(tcb: Arc<std::sync::Mutex<Tcb>>, sender: PacketSender, packet: NetworkPacket, nt: NetworkTuple) {
+    async fn task_wait_to_close(tcb: Arc<std::sync::Mutex<Tcb>>, exit_notifier: tokio::sync::mpsc::Sender<()>, nt: NetworkTuple) {
         tokio::time::sleep(TWO_MSL).await;
         {
             let mut tcb = tcb.lock().unwrap();
@@ -419,10 +419,10 @@ async fn tcp_main_logic_loop(
             let state = tcb.get_state();
             log::debug!("{nt} {state:?}: [task_wait_to_close] session closed after {TWO_MSL:?}");
         }
-        sender.send(packet).unwrap_or(());
+        exit_notifier.send(()).await.unwrap_or(());
     }
 
-    async fn task_last_ack(tcb: Arc<Mutex<Tcb>>, sdr: PacketSender, pkt: NetworkPacket, nt: NetworkTuple, pkt_sdr: PacketSender) {
+    async fn task_last_ack(tcb: Arc<Mutex<Tcb>>, exit_notifier: tokio::sync::mpsc::Sender<()>, nt: NetworkTuple, pkt_sdr: PacketSender) {
         let hint = "[task_last_ack]";
         for idx in 1..=LAST_ACK_MAX_RETRIES {
             let state = { tcb.lock().unwrap().get_state() };
@@ -449,14 +449,13 @@ async fn tcp_main_logic_loop(
             tcb.change_state(TcpState::Closed);
             let state = tcb.get_state();
             log::warn!("{nt} {state:?}: {hint} max retries reached, forcibly closing session");
-            sdr.send(pkt).unwrap_or(());
         }
+        exit_notifier.send(()).await.unwrap_or(());
     }
 
     async fn task_timed_out_for_close_wait(
         tcb: Arc<Mutex<Tcb>>,
-        dummy_sender: PacketSender,
-        dummy: NetworkPacket,
+        exit_notifier: tokio::sync::mpsc::Sender<()>,
         nt: NetworkTuple,
         up_packet_sender: PacketSender,
     ) -> std::io::Result<()> {
@@ -475,13 +474,13 @@ async fn tcp_main_logic_loop(
         log::debug!("{nt} {state:?}: Forced transition to {new_state:?}");
 
         // Here we set a timer to wait for the last ACK from the other side.
-        tokio::spawn(task_last_ack(tcb_clone, dummy_sender, dummy, nt, up_packet_sender));
+        tokio::spawn(task_last_ack(tcb_clone, exit_notifier, nt, up_packet_sender));
 
         Ok::<(), std::io::Error>(())
     }
 
     loop {
-        let dummy_sender = dummy_sender.clone();
+        let exit_notifier = exit_notifier.clone();
 
         let network_packet = tokio::select! {
             _ = force_exit_task_monitor.recv() => {
@@ -607,7 +606,7 @@ async fn tcp_main_logic_loop(
                         // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
                         // till the retries reach the limit, and then close the session forcibly.
                         let up = up_packet_sender.clone();
-                        tokio::spawn(task_last_ack(tcb_clone.clone(), dummy_sender, network_packet, network_tuple, up));
+                        tokio::spawn(task_last_ack(tcb_clone.clone(), exit_notifier, network_tuple, up));
                     } else {
                         // Upstream data pending, wake write_notify and wait
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
@@ -616,7 +615,7 @@ async fn tcp_main_logic_loop(
                         // Spawn a timeout task to force FIN if upstream is unresponsive
                         let tcb = tcb_clone.clone();
                         let up = up_packet_sender.clone();
-                        tokio::spawn(task_timed_out_for_close_wait(tcb, dummy_sender, network_packet, network_tuple, up));
+                        tokio::spawn(task_timed_out_for_close_wait(tcb, exit_notifier, network_tuple, up));
                     }
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     if !payload.is_empty() && tcb.get_ack() == incoming_seq {
@@ -640,7 +639,7 @@ async fn tcp_main_logic_loop(
                     // If the timer expires, we send an ACK|FIN packet to the other side again and wait anthoer timeout
                     // till the retries reach the limit, and then close the session forcibly.
                     let up = up_packet_sender.clone();
-                    tokio::spawn(task_last_ack(tcb_clone.clone(), dummy_sender, network_packet, network_tuple, up));
+                    tokio::spawn(task_last_ack(tcb_clone.clone(), exit_notifier, network_tuple, up));
                 } else {
                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 }
@@ -648,7 +647,7 @@ async fn tcp_main_logic_loop(
             TcpState::LastAck => {
                 if flags & ACK == ACK {
                     tcb.change_state(TcpState::Closed);
-                    tokio::spawn(async move { dummy_sender.send(network_packet) });
+                    tokio::spawn(async move { exit_notifier.send(()).await.unwrap_or(()) });
                     let new_state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
                 }
@@ -660,7 +659,7 @@ async fn tcp_main_logic_loop(
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
                     tcb.change_state(TcpState::TimeWait);
 
-                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet, network_tuple));
+                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple));
                     let new_state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Final ACK|FIN received too early, transitioned to {new_state:?} directly");
                 } else if flags & ACK == ACK {
@@ -683,7 +682,7 @@ async fn tcp_main_logic_loop(
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
                     tcb.change_state(TcpState::TimeWait);
-                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet, network_tuple));
+                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple));
                     let new_state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
                 } else if flags & ACK == ACK && len == 0 {
@@ -699,7 +698,7 @@ async fn tcp_main_logic_loop(
                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     if flags & FIN == FIN {
                         tcb.change_state(TcpState::TimeWait);
-                        tokio::spawn(task_wait_to_close(tcb_clone.clone(), dummy_sender, network_packet, network_tuple));
+                        tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple));
                         let new_state = tcb.get_state();
                         log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
                     }
