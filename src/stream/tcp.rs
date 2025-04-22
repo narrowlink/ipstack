@@ -84,7 +84,7 @@ pub struct IpStackTcpStream {
     data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
-    force_exit_task_notifier: Option<tokio::sync::mpsc::Sender<()>>,
+    exit_notifier: Option<tokio::sync::mpsc::Sender<()>>,
     temp_read_buffer: Vec<u8>,
 }
 
@@ -130,7 +130,7 @@ impl IpStackTcpStream {
             data_rx,
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task_handle: None,
-            force_exit_task_notifier: None,
+            exit_notifier: None,
             temp_read_buffer: Vec::new(),
         };
 
@@ -318,7 +318,7 @@ impl Drop for IpStackTcpStream {
         log::trace!("{nt} {state:?}: [drop] session droping, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
-                if let Some(notifier) = self.force_exit_task_notifier.take() {
+                if let Some(notifier) = self.exit_notifier.take() {
                     _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(notifier.send(())));
                 }
                 // synchronously wait for the task to finish
@@ -342,13 +342,13 @@ impl IpStackTcpStream {
         let up_packet_sender = self.up_packet_sender.clone();
         let shutdown = self.shutdown.clone();
         let write_notify = self.write_notify.clone();
-        let read_notify_clone = self.read_notify.clone();
+        let read_notify = self.read_notify.clone();
         let data_tx = self.data_tx.clone();
         let destroy_messenger = self.destroy_messenger.take();
 
-        let (force_exit_task_notifier, force_exit_task_monitor) = tokio::sync::mpsc::channel::<()>(10);
-        let exit_notifier = force_exit_task_notifier.clone();
-        self.force_exit_task_notifier = Some(force_exit_task_notifier);
+        let (exit_task_notifier, exit_monitor) = tokio::sync::mpsc::channel::<()>(10);
+        let exit_notifier = exit_task_notifier.clone();
+        self.exit_notifier = Some(exit_task_notifier);
 
         let task_handle = tokio::spawn(async move {
             let v = tcp_main_logic_loop(
@@ -358,9 +358,9 @@ impl IpStackTcpStream {
                 exit_notifier,
                 network_tuple,
                 write_notify,
-                read_notify_clone,
+                read_notify,
                 data_tx,
-                force_exit_task_monitor,
+                exit_monitor,
             )
             .await;
             if let Err(e) = &v {
@@ -385,9 +385,9 @@ async fn tcp_main_logic_loop(
     exit_notifier: tokio::sync::mpsc::Sender<()>,
     network_tuple: NetworkTuple,
     write_notify: Arc<std::sync::Mutex<Option<Waker>>>,
-    read_notify_clone: Arc<std::sync::Mutex<Option<Waker>>>,
+    read_notify: Arc<std::sync::Mutex<Option<Waker>>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    mut force_exit_task_monitor: tokio::sync::mpsc::Receiver<()>,
+    mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
     {
         let mut tcb = tcb.lock().unwrap();
@@ -483,8 +483,8 @@ async fn tcp_main_logic_loop(
         let exit_notifier = exit_notifier.clone();
 
         let network_packet = tokio::select! {
-            _ = force_exit_task_monitor.recv() => {
-                log::debug!("{network_tuple} task exited due to force exit signal");
+            _ = exit_monitor.recv() => {
+                log::debug!("{network_tuple} task exited due to exit signal");
                 break;
             }
             network_packet = stream_receiver.recv() => network_packet,
@@ -495,7 +495,7 @@ async fn tcp_main_logic_loop(
             log::debug!("{network_tuple} {state:?}: session closed unexpectedly by pipe broken, exiting task");
             tcb.lock().unwrap().change_state(TcpState::Closed);
             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-            read_notify_clone.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
             break;
         };
 
@@ -547,7 +547,7 @@ async fn tcp_main_logic_loop(
                 if flags & ACK == ACK {
                     if len > 0 {
                         tcb.add_unordered_packet(incoming_seq, payload.to_vec());
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                     }
                     tcb.change_state(TcpState::Established);
                 }
@@ -574,7 +574,7 @@ async fn tcp_main_logic_loop(
                         PacketType::NewPacket => {
                             tcb.add_unordered_packet(incoming_seq, payload.clone());
                             let nt = network_tuple;
-                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify_clone)?;
+                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                         }
                         PacketType::Ack => {
@@ -620,7 +620,7 @@ async fn tcp_main_logic_loop(
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     if !payload.is_empty() && tcb.get_ack() == incoming_seq {
                         tcb.add_unordered_packet(incoming_seq, payload.clone());
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                     }
                 } else {
                     // unnormal case, we do nothing here
@@ -667,7 +667,7 @@ async fn tcp_main_logic_loop(
                     if len > 0 {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                         tcb.add_unordered_packet(incoming_seq, payload.clone());
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
                     let new_state = tcb.get_state();
@@ -694,7 +694,7 @@ async fn tcp_main_logic_loop(
                 } else if flags & ACK == ACK && len > 0 {
                     // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                     tcb.add_unordered_packet(incoming_seq, payload.clone());
-                    extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify_clone)?;
+                    extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     if flags & FIN == FIN {
                         tcb.change_state(TcpState::TimeWait);
@@ -760,7 +760,7 @@ pub(crate) fn write_packet_to_device(
     use std::io::Error;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
     let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window().max(tcb.get_mtu()));
-    let (src, dst) = (tuple.dst, tuple.src); // the address is reversed here
+    let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
     let packet = create_raw_packet(src, dst, calc, flags, TTL, seq, ack, window_size, payload.unwrap_or_default())?;
     let len = packet.payload.len();
