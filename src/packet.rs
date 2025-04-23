@@ -218,7 +218,7 @@ pub fn tcp_header_flags(inner: &TcpHeader) -> u8 {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use criterion::{black_box, Criterion};
+    use criterion::{Criterion, black_box};
     use rand::random;
     use std::time::Duration;
 

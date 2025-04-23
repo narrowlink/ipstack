@@ -1,12 +1,13 @@
 use super::seqnum::SeqNum;
 use crate::{
+    PacketReceiver, PacketSender, TTL,
     error::IpStackError,
     packet::{
+        IpHeader, NetworkPacket, NetworkTuple, TransportHeader,
         tcp_flags::{ACK, FIN, PSH, RST, SYN},
-        tcp_header_flags, tcp_header_fmt, IpHeader, NetworkPacket, NetworkTuple, TransportHeader,
+        tcp_header_flags, tcp_header_fmt,
     },
     stream::tcb::{PacketType, Tcb, TcpState},
-    PacketReceiver, PacketSender, TTL,
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader};
 use std::{

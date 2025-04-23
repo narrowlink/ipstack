@@ -1,6 +1,6 @@
 use crate::{
-    packet::{IpHeader, NetworkPacket, TransportHeader},
     IpStackError, PacketSender, TTL,
+    packet::{IpHeader, NetworkPacket, TransportHeader},
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header};
 use std::net::IpAddr;

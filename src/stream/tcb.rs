@@ -144,11 +144,7 @@ impl Tcb {
             }
         }
 
-        if data.is_empty() {
-            None
-        } else {
-            Some(data)
-        }
+        if data.is_empty() { None } else { Some(data) }
     }
 
     pub(super) fn increase_seq(&mut self) {
