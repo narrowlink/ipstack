@@ -648,7 +648,11 @@ async fn tcp_main_logic_loop(
             TcpState::LastAck => {
                 if flags & ACK == ACK {
                     tcb.change_state(TcpState::Closed);
-                    tokio::spawn(async move { exit_notifier.send(()).await.unwrap_or(()) });
+                    tokio::spawn(async move {
+                        if let Err(e) = exit_notifier.send(()).await {
+                            log::debug!("exit_notifier send failed: {e}");
+                        }
+                    });
                     let new_state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
                 }
