@@ -133,7 +133,7 @@ impl Tcb {
                     remaining_bytes -= payload_len;
                 } else {
                     // current packet can only be partially extracted
-                    data.extend(payload[..remaining_bytes].to_vec());
+                    data.extend_from_slice(&payload[..remaining_bytes]);
                     let remaining_payload = payload[remaining_bytes..].to_vec();
                     self.ack += remaining_bytes as u32;
                     self.unordered_packets.insert(self.ack, remaining_payload);

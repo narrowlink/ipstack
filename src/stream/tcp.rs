@@ -316,7 +316,7 @@ fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &P
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
-        log::trace!("{nt} {state:?}: [drop] session droping, ========================= ");
+        log::trace!("{nt} {state:?}: [drop] session dropping, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
                 if let Some(notifier) = self.exit_notifier.take() {
@@ -491,7 +491,7 @@ async fn tcp_main_logic_loop(
             network_packet = stream_receiver.recv() => network_packet,
         };
 
-        let Some(network_packet) = network_packet else {
+        let Some(mut network_packet) = network_packet else {
             let state = { tcb.lock().unwrap().get_state() };
             log::debug!("{network_tuple} {state:?}: session closed unexpectedly by pipe broken, exiting task");
             tcb.lock().unwrap().change_state(TcpState::Closed);
@@ -500,11 +500,11 @@ async fn tcp_main_logic_loop(
             break;
         };
 
+        let payload = network_packet.payload.take().unwrap_or_default();
         let TransportHeader::Tcp(tcp_header) = network_packet.transport_header() else {
             log::warn!("{network_tuple} Invalid TCP packet");
             continue;
         };
-        let payload = &network_packet.payload;
         let flags = tcp_header_flags(tcp_header);
         let incoming_ack: SeqNum = tcp_header.acknowledgment_number.into();
         let incoming_seq: SeqNum = tcp_header.sequence_number.into();
@@ -533,7 +533,7 @@ async fn tcp_main_logic_loop(
             write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | PSH, Some(seq), Some(packet.payload))?;
         }
 
-        let pkt_type = tcb.check_pkt_type(tcp_header, payload);
+        let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
         let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq(), tcb.get_ack()) };
         let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
@@ -547,7 +547,7 @@ async fn tcp_main_logic_loop(
             TcpState::SynReceived => {
                 if flags & ACK == ACK {
                     if len > 0 {
-                        tcb.add_unordered_packet(incoming_seq, payload.to_vec());
+                        tcb.add_unordered_packet(incoming_seq, payload);
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                     }
                     tcb.change_state(TcpState::Established);
@@ -573,7 +573,7 @@ async fn tcp_main_logic_loop(
                             }
                         }
                         PacketType::NewPacket => {
-                            tcb.add_unordered_packet(incoming_seq, payload.clone());
+                            tcb.add_unordered_packet(incoming_seq, payload);
                             let nt = network_tuple;
                             extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
@@ -620,7 +620,7 @@ async fn tcp_main_logic_loop(
                     }
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     if !payload.is_empty() && tcb.get_ack() == incoming_seq {
-                        tcb.add_unordered_packet(incoming_seq, payload.clone());
+                        tcb.add_unordered_packet(incoming_seq, payload);
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                     }
                 } else {
@@ -667,7 +667,7 @@ async fn tcp_main_logic_loop(
                     tcb.change_state(TcpState::FinWait2);
                     if len > 0 {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                        tcb.add_unordered_packet(incoming_seq, payload.clone());
+                        tcb.add_unordered_packet(incoming_seq, payload);
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
@@ -694,7 +694,7 @@ async fn tcp_main_logic_loop(
                     }
                 } else if flags & ACK == ACK && len > 0 {
                     // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                    tcb.add_unordered_packet(incoming_seq, payload.clone());
+                    tcb.add_unordered_packet(incoming_seq, payload);
                     extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     if flags & FIN == FIN {
@@ -764,7 +764,7 @@ pub(crate) fn write_packet_to_device(
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
     let packet = create_raw_packet(src, dst, calc, flags, TTL, seq, ack, window_size, payload.unwrap_or_default())?;
-    let len = packet.payload.len();
+    let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
     up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
     Ok(len)
 }
@@ -835,6 +835,6 @@ pub(crate) fn create_raw_packet(
     Ok(NetworkPacket {
         ip: ip_header,
         transport: TransportHeader::Tcp(tcp_header),
-        payload,
+        payload: Some(payload),
     })
 }
