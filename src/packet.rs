@@ -122,7 +122,10 @@ impl NetworkPacket {
             TransportHeader::Udp(ref h) => h.write(&mut buf)?,
             _ => {}
         };
-        buf.extend_from_slice(self.payload.as_ref().unwrap_or(&Vec::new()));
+
+        if let Some(payload) = &self.payload {
+            buf.extend_from_slice(payload);
+        }
         Ok(buf)
     }
     pub fn ttl(&self) -> u8 {

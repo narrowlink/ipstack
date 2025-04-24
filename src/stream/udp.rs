@@ -129,7 +129,9 @@ impl AsyncRead for IpStackUdpStream {
 
         match self.stream_receiver.poll_recv(cx) {
             std::task::Poll::Ready(Some(p)) => {
-                buf.put_slice(p.payload.as_ref().unwrap_or(&Vec::new()));
+                if let Some(payload) = p.payload {
+                    buf.put_slice(&payload);
+                }
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
