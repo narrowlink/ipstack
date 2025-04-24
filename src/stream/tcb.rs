@@ -123,7 +123,7 @@ impl Tcb {
                 }
 
                 // remove and get the first packet
-                let payload = self.unordered_packets.remove(&seq).unwrap();
+                let mut payload = self.unordered_packets.remove(&seq).unwrap();
                 let payload_len = payload.len();
 
                 if payload_len <= remaining_bytes {
@@ -133,8 +133,8 @@ impl Tcb {
                     remaining_bytes -= payload_len;
                 } else {
                     // current packet can only be partially extracted
-                    data.extend_from_slice(&payload[..remaining_bytes]);
-                    let remaining_payload = payload[remaining_bytes..].to_vec();
+                    let remaining_payload = payload.split_off(remaining_bytes);
+                    data.extend_from_slice(&payload);
                     self.ack += remaining_bytes as u32;
                     self.unordered_packets.insert(self.ack, remaining_payload);
                     break;
