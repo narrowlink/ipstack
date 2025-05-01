@@ -697,10 +697,14 @@ async fn tcp_main_logic_loop(
                         log::trace!("{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {l_ack}");
                     }
                 } else if flags & ACK == ACK && len > 0 {
-                    // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                    tcb.add_unordered_packet(incoming_seq, payload);
-                    extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
-                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    if pkt_type == PacketType::KeepAlive {
+                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
+                    } else {
+                        // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
+                        tcb.add_unordered_packet(incoming_seq, payload);
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    }
                     if flags & FIN == FIN {
                         tcb.change_state(TcpState::TimeWait);
                         tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple));

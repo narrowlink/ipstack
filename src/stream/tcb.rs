@@ -99,7 +99,8 @@ impl Tcb {
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
-            log::warn!("Received packet seq < ack: seq = {}, ack = {}, len = {}", seq, self.ack, buf.len());
+            #[rustfmt::skip]
+            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
             return;
         }
         self.unordered_packets.insert(seq, buf);
@@ -204,21 +205,21 @@ impl Tcb {
             match rcvd_ack.cmp(&self.get_last_received_ack()) {
                 std::cmp::Ordering::Less => PacketType::Invalid,
                 std::cmp::Ordering::Equal => {
-                    if !payload.is_empty() {
+                    if self.ack - 1 == rcvd_seq && payload.len() <= 1 {
+                        PacketType::KeepAlive
+                    } else if !payload.is_empty() {
                         PacketType::NewPacket
                     } else if self.get_send_window() == rcvd_window && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
                         PacketType::RetransmissionRequest
-                    } else if self.ack - 1 == rcvd_seq {
-                        PacketType::KeepAlive
                     } else {
                         PacketType::WindowUpdate
                     }
                 }
                 std::cmp::Ordering::Greater => {
-                    if !payload.is_empty() {
-                        PacketType::NewPacket
-                    } else {
+                    if payload.is_empty() {
                         PacketType::Ack
+                    } else {
+                        PacketType::NewPacket
                     }
                 }
             }
