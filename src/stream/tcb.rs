@@ -99,7 +99,8 @@ impl Tcb {
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
-            log::warn!("Received packet seq < ack: seq = {}, ack = {}, len = {}", seq, self.ack, buf.len());
+            #[rustfmt::skip]
+            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
             return;
         }
         self.unordered_packets.insert(seq, buf);
@@ -123,7 +124,7 @@ impl Tcb {
                 }
 
                 // remove and get the first packet
-                let payload = self.unordered_packets.remove(&seq).unwrap();
+                let mut payload = self.unordered_packets.remove(&seq).unwrap();
                 let payload_len = payload.len();
 
                 if payload_len <= remaining_bytes {
@@ -133,8 +134,8 @@ impl Tcb {
                     remaining_bytes -= payload_len;
                 } else {
                     // current packet can only be partially extracted
-                    data.extend(payload[..remaining_bytes].to_vec());
-                    let remaining_payload = payload[remaining_bytes..].to_vec();
+                    let remaining_payload = payload.split_off(remaining_bytes);
+                    data.extend_from_slice(&payload);
                     self.ack += remaining_bytes as u32;
                     self.unordered_packets.insert(self.ack, remaining_payload);
                     break;
@@ -144,11 +145,7 @@ impl Tcb {
             }
         }
 
-        if data.is_empty() {
-            None
-        } else {
-            Some(data)
-        }
+        if data.is_empty() { None } else { Some(data) }
     }
 
     pub(super) fn increase_seq(&mut self) {
@@ -208,21 +205,21 @@ impl Tcb {
             match rcvd_ack.cmp(&self.get_last_received_ack()) {
                 std::cmp::Ordering::Less => PacketType::Invalid,
                 std::cmp::Ordering::Equal => {
-                    if !payload.is_empty() {
+                    if self.ack - 1 == rcvd_seq && payload.len() <= 1 {
+                        PacketType::KeepAlive
+                    } else if !payload.is_empty() {
                         PacketType::NewPacket
                     } else if self.get_send_window() == rcvd_window && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
                         PacketType::RetransmissionRequest
-                    } else if self.ack - 1 == rcvd_seq {
-                        PacketType::KeepAlive
                     } else {
                         PacketType::WindowUpdate
                     }
                 }
                 std::cmp::Ordering::Greater => {
-                    if !payload.is_empty() {
-                        PacketType::NewPacket
-                    } else {
+                    if payload.is_empty() {
                         PacketType::Ack
+                    } else {
+                        PacketType::NewPacket
                     }
                 }
             }

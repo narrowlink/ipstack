@@ -1,6 +1,6 @@
 use crate::{
-    packet::{IpHeader, NetworkPacket, TransportHeader},
     IpStackError, PacketSender, TTL,
+    packet::{IpHeader, NetworkPacket, TransportHeader},
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header};
 use std::net::IpAddr;
@@ -68,7 +68,7 @@ impl IpStackUnknownTransport {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Unknown,
-                    payload: p,
+                    payload: Some(p),
                 })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
@@ -91,7 +91,7 @@ impl IpStackUnknownTransport {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Unknown,
-                    payload: p,
+                    payload: Some(p),
                 })
             }
             _ => unreachable!(),

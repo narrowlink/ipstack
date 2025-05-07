@@ -14,7 +14,7 @@ Unstable, under development.
 
 ```rust, no_run
 use etherparse::Icmpv4Header;
-use ipstack::{stream::IpStackStream, IpNumber};
+use ipstack::{IpNumber, IpStackStream};
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 use udp_stream::UdpStream;

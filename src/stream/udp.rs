@@ -1,6 +1,6 @@
 use crate::{
-    packet::{IpHeader, NetworkPacket, TransportHeader},
     IpStackError, PacketReceiver, PacketSender, TTL,
+    packet::{IpHeader, NetworkPacket, TransportHeader},
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
 use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
@@ -67,7 +67,7 @@ impl IpStackUdpStream {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Udp(udp_header),
-                    payload,
+                    payload: Some(payload),
                 })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
@@ -90,7 +90,7 @@ impl IpStackUdpStream {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Udp(udp_header),
-                    payload,
+                    payload: Some(payload),
                 })
             }
             _ => unreachable!(),
@@ -129,7 +129,9 @@ impl AsyncRead for IpStackUdpStream {
 
         match self.stream_receiver.poll_recv(cx) {
             std::task::Poll::Ready(Some(p)) => {
-                buf.put_slice(&p.payload);
+                if let Some(payload) = p.payload {
+                    buf.put_slice(&payload);
+                }
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
@@ -142,7 +144,7 @@ impl AsyncWrite for IpStackUdpStream {
     fn poll_write(mut self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
         self.reset_timeout();
         let packet = self.create_rev_packet(TTL, buf.to_vec())?;
-        let payload_len = packet.payload.len();
+        let payload_len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
         self.up_pkt_sender.send(packet).or(Err(std::io::ErrorKind::UnexpectedEof))?;
         std::task::Poll::Ready(Ok(payload_len))
     }

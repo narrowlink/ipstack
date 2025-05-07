@@ -50,7 +50,7 @@ pub(crate) enum TransportHeader {
 pub struct NetworkPacket {
     pub(crate) ip: IpHeader,
     pub(crate) transport: TransportHeader,
-    pub(crate) payload: Vec<u8>,
+    pub(crate) payload: Option<Vec<u8>>,
 }
 
 impl NetworkPacket {
@@ -68,7 +68,7 @@ impl NetworkPacket {
             Some(etherparse::TransportSlice::Udp(u)) => (TransportHeader::Udp(u.to_header()), u.payload()),
             _ => (TransportHeader::Unknown, ip_payload),
         };
-        let payload = payload.to_vec();
+        let payload = Some(payload.to_vec());
 
         Ok(NetworkPacket { ip, transport, payload })
     }
@@ -122,7 +122,10 @@ impl NetworkPacket {
             TransportHeader::Udp(ref h) => h.write(&mut buf)?,
             _ => {}
         };
-        buf.extend_from_slice(&self.payload);
+
+        if let Some(payload) = &self.payload {
+            buf.extend_from_slice(payload);
+        }
         Ok(buf)
     }
     pub fn ttl(&self) -> u8 {
@@ -218,7 +221,7 @@ pub fn tcp_header_flags(inner: &TcpHeader) -> u8 {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use criterion::{black_box, Criterion};
+    use criterion::{Criterion, black_box};
     use rand::random;
     use std::time::Duration;
 

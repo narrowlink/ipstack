@@ -1,6 +1,5 @@
 #![doc = include_str!("../README.md")]
 
-use crate::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 use ahash::AHashMap;
 use packet::{NetworkPacket, NetworkTuple, TransportHeader};
 use std::time::Duration;
@@ -17,9 +16,10 @@ pub(crate) type SessionCollection = std::sync::Arc<tokio::sync::Mutex<AHashMap<N
 
 mod error;
 mod packet;
-pub mod stream;
+mod stream;
 
 pub use self::error::{IpStackError, Result};
+pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 pub use ::etherparse::IpNumber;
 
 #[cfg(unix)]
@@ -80,7 +80,7 @@ impl IpStackConfig {
 
 pub struct IpStack {
     accept_receiver: UnboundedReceiver<IpStackStream>,
-    pub handle: JoinHandle<Result<()>>,
+    _handle: JoinHandle<Result<()>>, // Just hold the task handle
 }
 
 impl IpStack {
@@ -91,7 +91,7 @@ impl IpStack {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
         IpStack {
             accept_receiver,
-            handle: run(config, device, accept_sender),
+            _handle: run(config, device, accept_sender),
         }
     }
 
@@ -150,7 +150,7 @@ async fn process_device_read(
         let stream = IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
             packet.src_addr().ip(),
             packet.dst_addr().ip(),
-            packet.payload,
+            packet.payload.unwrap_or_default(),
             &packet.ip,
             config.mtu,
             up_pkt_sender,
@@ -163,7 +163,8 @@ async fn process_device_read(
     let network_tuple = packet.network_tuple();
     match sessions.lock().await.entry(network_tuple) {
         std::collections::hash_map::Entry::Occupied(entry) => {
-            log::trace!("packet sent to stream: {} len {}", network_tuple, packet.payload.len());
+            let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
+            log::trace!("packet sent to stream: {} len {}", network_tuple, len);
             use std::io::{Error, ErrorKind::Other};
             entry.get().send(packet).map_err(|e| Error::new(Other, e))?;
         }
@@ -197,7 +198,8 @@ fn create_stream(
             Ok((stream.stream_sender(), IpStackStream::Tcp(stream)))
         }
         TransportHeader::Udp(_) => {
-            let stream = IpStackUdpStream::new(src_addr, dst_addr, packet.payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, msgr);
+            let payload = packet.payload.unwrap_or_default();
+            let stream = IpStackUdpStream::new(src_addr, dst_addr, payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, msgr);
             Ok((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
         TransportHeader::Unknown => Err(IpStackError::UnsupportedTransportProtocol),

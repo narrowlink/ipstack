@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use clap::Parser;
 use etherparse::Icmpv4Header;
-use ipstack::{stream::IpStackStream, IpNumber};
+use ipstack::{IpNumber, IpStackStream};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 use udp_stream::UdpStream;
 
