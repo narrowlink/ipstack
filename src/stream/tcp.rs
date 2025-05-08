@@ -50,7 +50,7 @@ impl Shutdown {
     fn fake_clone(&self) -> Shutdown {
         match self {
             Shutdown::None => Shutdown::None,
-            Shutdown::Pending(_) => Shutdown::Pending(futures::task::noop_waker()),
+            Shutdown::Pending(_) => Shutdown::Pending(Waker::noop().clone()),
             Shutdown::Ready => Shutdown::Ready,
         }
     }
