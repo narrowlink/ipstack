@@ -15,7 +15,6 @@ use std::{
     io::ErrorKind::{BrokenPipe, ConnectionRefused, InvalidInput, UnexpectedEof},
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -68,6 +67,8 @@ impl std::fmt::Display for Shutdown {
 
 static SESSION_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+type TcbPtr = std::sync::Arc<std::sync::Mutex<Tcb>>;
+
 #[derive(Debug)]
 pub struct IpStackTcpStream {
     src_addr: SocketAddr,
@@ -75,7 +76,7 @@ pub struct IpStackTcpStream {
     stream_sender: PacketSender,
     stream_receiver: Option<PacketReceiver>,
     up_packet_sender: PacketSender,
-    tcb: std::sync::Arc<std::sync::Mutex<Tcb>>,
+    tcb: TcbPtr,
     shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
@@ -380,13 +381,13 @@ impl IpStackTcpStream {
 
 #[allow(clippy::too_many_arguments)]
 async fn tcp_main_logic_loop(
-    tcb: Arc<std::sync::Mutex<Tcb>>,
+    tcb: TcbPtr,
     mut stream_receiver: PacketReceiver,
     up_packet_sender: PacketSender,
     exit_notifier: tokio::sync::mpsc::Sender<()>,
     network_tuple: NetworkTuple,
-    write_notify: Arc<std::sync::Mutex<Option<Waker>>>,
-    read_notify: Arc<std::sync::Mutex<Option<Waker>>>,
+    write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
@@ -412,7 +413,7 @@ async fn tcp_main_logic_loop(
 
     let tcb_clone = tcb.clone();
 
-    async fn task_wait_to_close(tcb: Arc<std::sync::Mutex<Tcb>>, exit_notifier: tokio::sync::mpsc::Sender<()>, nt: NetworkTuple) {
+    async fn task_wait_to_close(tcb: TcbPtr, exit_notifier: tokio::sync::mpsc::Sender<()>, nt: NetworkTuple) {
         tokio::time::sleep(TWO_MSL).await;
         {
             let mut tcb = tcb.lock().unwrap();
@@ -423,7 +424,7 @@ async fn tcp_main_logic_loop(
         exit_notifier.send(()).await.unwrap_or(());
     }
 
-    async fn task_last_ack(tcb: Arc<Mutex<Tcb>>, exit_notifier: tokio::sync::mpsc::Sender<()>, nt: NetworkTuple, pkt_sdr: PacketSender) {
+    async fn task_last_ack(tcb: TcbPtr, exit_notifier: tokio::sync::mpsc::Sender<()>, nt: NetworkTuple, pkt_sdr: PacketSender) {
         let hint = "[task_last_ack]";
         for idx in 1..=LAST_ACK_MAX_RETRIES {
             let state = { tcb.lock().unwrap().get_state() };
@@ -455,7 +456,7 @@ async fn tcp_main_logic_loop(
     }
 
     async fn task_timed_out_for_close_wait(
-        tcb: Arc<Mutex<Tcb>>,
+        tcb: TcbPtr,
         exit_notifier: tokio::sync::mpsc::Sender<()>,
         nt: NetworkTuple,
         up_packet_sender: PacketSender,
