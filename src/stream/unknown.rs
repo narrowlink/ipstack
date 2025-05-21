@@ -46,7 +46,7 @@ impl IpStackUnknownTransport {
             let packet = self.create_rev_packet(&mut payload)?;
             self.packet_sender
                 .send(packet)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("send error: {}", e)))?;
+                .map_err(|e| std::io::Error::other(format!("send error: {}", e)))?;
             if payload.is_empty() {
                 return Ok(());
             }

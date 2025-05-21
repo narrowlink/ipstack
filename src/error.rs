@@ -22,7 +22,13 @@ pub enum IpStackError {
     AcceptError,
 
     #[error("Send Error {0}")]
-    SendError(#[from] tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>),
+    SendError(#[from] Box<tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>>),
+}
+
+impl From<tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>> for IpStackError {
+    fn from(e: tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>) -> Self {
+        IpStackError::SendError(Box::new(e))
+    }
 }
 
 // Safety: All variants of IpStackError either contain no data or wrap types that are `Send`.
@@ -37,7 +43,7 @@ impl From<IpStackError> for std::io::Error {
     fn from(e: IpStackError) -> Self {
         match e {
             IpStackError::IoError(e) => e,
-            _ => std::io::Error::new(std::io::ErrorKind::Other, e),
+            _ => std::io::Error::other(e),
         }
     }
 }

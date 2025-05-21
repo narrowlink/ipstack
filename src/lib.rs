@@ -165,8 +165,7 @@ async fn process_device_read(
         std::collections::hash_map::Entry::Occupied(entry) => {
             let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
             log::trace!("packet sent to stream: {} len {}", network_tuple, len);
-            use std::io::{Error, ErrorKind::Other};
-            entry.get().send(packet).map_err(|e| Error::new(Other, e))?;
+            entry.get().send(packet).map_err(std::io::Error::other)?;
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
