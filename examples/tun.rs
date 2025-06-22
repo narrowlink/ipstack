@@ -11,20 +11,13 @@
 //! ```
 //! iperf3 -s -p 5201
 //! ```
-//! To route traffic to the tun interface, run the following command with root or administrator privileges:
-//! ```
-//! sudo ip route add 1.2.3.4/32 dev tun0    # Linux
-//! route add 1.2.3.4 mask 255.255.255.255 10.0.0.1 metric 100  # Windows
-//! sudo route add 1.2.3.4/32 10.0.0.1  # macOS
-//! ```
-//!
-//! Now you can connect `1.2.3.4:any_port`, and the traffic will be routed to the tun interface then to the server `127.0.0.1:5201`.
+//! Now you can connect `10.3.0.1:any_port`, and the traffic will be routed to the tun interface then to the server `127.0.0.1:5201`.
 //! You can test it with `iperf3` as a client
 //! ```
-//! iperf3 -c 1.2.3.4       # TCP test
-//! iperf3 -c 1.2.3.4 -R    # TCP reverse test
-//! iperf3 -c 1.2.3.4 -u    # UDP test
-//! iperf3 -c 1.2.3.4 -u -R # UDP reverse test
+//! iperf3 -c 10.3.0.1       # TCP test
+//! iperf3 -c 10.3.0.1 -R    # TCP reverse test
+//! iperf3 -c 10.3.0.1 -u    # UDP test
+//! iperf3 -c 10.3.0.1 -u -R # UDP reverse test
 //! ```
 //!
 
@@ -78,10 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default = format!("{:?}", args.verbosity);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
 
-    let ipv4 = Ipv4Addr::new(10, 0, 0, 33);
+    let ipv4 = Ipv4Addr::new(10, 3, 0, 33);
     let netmask = Ipv4Addr::new(255, 255, 255, 0);
     #[cfg(not(target_os = "windows"))]
-    let gateway = Ipv4Addr::new(10, 0, 0, 1);
+    let gateway = Ipv4Addr::new(10, 3, 0, 1);
 
     let mut tun_config = tun::Configuration::default();
     tun_config.address(ipv4).netmask(netmask).mtu(MTU).up();

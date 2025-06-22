@@ -221,7 +221,7 @@ pub fn tcp_header_flags(inner: &TcpHeader) -> u8 {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use criterion::{Criterion, black_box};
+    use criterion::Criterion;
     use rand::random;
     use std::time::Duration;
 
@@ -252,7 +252,7 @@ pub mod tests {
             let buf = create_raw_packet(mtu);
             c.bench_function(format!("decode_mtu_{mtu}").as_str(), |b| {
                 b.iter(|| {
-                    let packet = black_box(&buf[..]);
+                    let packet = std::hint::black_box(&buf[..]);
                     let _packet = NetworkPacket::parse(packet).unwrap();
                 })
             });
@@ -262,7 +262,7 @@ pub mod tests {
             let packet = create_packet(mtu);
             c.bench_function(format!("encode_mtu_{mtu}").as_str(), |b| {
                 b.iter(|| {
-                    let packet = black_box(&packet);
+                    let packet = std::hint::black_box(&packet);
                     let _packet = packet.to_bytes();
                 })
             });
