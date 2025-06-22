@@ -40,4 +40,12 @@ impl IpStackStream {
             },
         }
     }
+
+    pub fn stream_sender(&self) -> Result<crate::PacketSender, std::io::Error> {
+        match self {
+            IpStackStream::Tcp(tcp) => Ok(tcp.stream_sender()),
+            IpStackStream::Udp(udp) => Ok(udp.stream_sender()),
+            _ => Err(std::io::Error::other("Unknown transport stream does not have a sender")),
+        }
+    }
 }

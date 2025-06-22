@@ -169,12 +169,13 @@ async fn process_device_read(
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            let (packet_sender, ip_stack_stream) = create_stream(packet, config, up_pkt_sender, Some(tx))?;
+            let ip_stack_stream = create_stream(packet, config, up_pkt_sender, Some(tx))?;
             tokio::spawn(async move {
                 rx.await.ok();
                 sessions_clone.lock().await.remove(&network_tuple);
                 log::debug!("session destroyed: {}", network_tuple);
             });
+            let packet_sender = ip_stack_stream.stream_sender()?;
             accept_sender.send(ip_stack_stream)?;
             entry.insert(packet_sender);
             log::debug!("session created: {}", network_tuple);
@@ -188,18 +189,18 @@ fn create_stream(
     cfg: &IpStackConfig,
     up_pkt_sender: PacketSender,
     msgr: Option<::tokio::sync::oneshot::Sender<()>>,
-) -> Result<(PacketSender, IpStackStream)> {
+) -> Result<IpStackStream> {
     let src_addr = packet.src_addr();
     let dst_addr = packet.dst_addr();
     match packet.transport_header() {
         TransportHeader::Tcp(h) => {
             let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, cfg.tcp_timeout, msgr)?;
-            Ok((stream.stream_sender(), IpStackStream::Tcp(stream)))
+            Ok(IpStackStream::Tcp(stream))
         }
         TransportHeader::Udp(_) => {
             let payload = packet.payload.unwrap_or_default();
             let stream = IpStackUdpStream::new(src_addr, dst_addr, payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, msgr);
-            Ok((stream.stream_sender(), IpStackStream::Udp(stream)))
+            Ok(IpStackStream::Udp(stream))
         }
         TransportHeader::Unknown => Err(IpStackError::UnsupportedTransportProtocol),
     }
