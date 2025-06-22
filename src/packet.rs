@@ -68,7 +68,7 @@ impl NetworkPacket {
             Some(etherparse::TransportSlice::Udp(u)) => (TransportHeader::Udp(u.to_header()), u.payload()),
             _ => (TransportHeader::Unknown, ip_payload),
         };
-        let payload = Some(payload.to_vec());
+        let payload = if payload.is_empty() { None } else { Some(payload.to_vec()) };
 
         Ok(NetworkPacket { ip, transport, payload })
     }
