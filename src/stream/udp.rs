@@ -17,7 +17,7 @@ pub struct IpStackUdpStream {
     stream_sender: PacketSender,
     stream_receiver: PacketReceiver,
     up_pkt_sender: PacketSender,
-    first_payload: Option<Vec<u8>>,
+    first_payload: Option<bytes::Bytes>,
     timeout: Pin<Box<Sleep>>,
     timeout_interval: Duration,
     mtu: u16,
@@ -28,7 +28,7 @@ impl IpStackUdpStream {
     pub fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
-        payload: Vec<u8>,
+        payload: bytes::Bytes,
         up_pkt_sender: PacketSender,
         mtu: u16,
         timeout_interval: Duration,
@@ -54,7 +54,7 @@ impl IpStackUdpStream {
         self.stream_sender.clone()
     }
 
-    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> std::io::Result<NetworkPacket> {
+    fn create_rev_packet(&self, ttl: u8, mut payload: bytes::Bytes) -> std::io::Result<NetworkPacket> {
         const UHS: usize = 8; // udp header size is 8
         match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
@@ -143,7 +143,7 @@ impl AsyncRead for IpStackUdpStream {
 impl AsyncWrite for IpStackUdpStream {
     fn poll_write(mut self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
         self.reset_timeout();
-        let packet = self.create_rev_packet(TTL, buf.to_vec())?;
+        let packet = self.create_rev_packet(TTL, buf.to_vec().into())?;
         let payload_len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
         self.up_pkt_sender.send(packet).or(Err(std::io::ErrorKind::UnexpectedEof))?;
         std::task::Poll::Ready(Ok(payload_len))

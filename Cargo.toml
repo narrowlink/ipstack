@@ -11,6 +11,7 @@ readme = "README.md"
 
 [dependencies]
 ahash = "0.8"
+bytes = "1"
 etherparse = { version = "0.18", default-features = false, features = ["std"] }
 log = { version = "0.4", default-features = false }
 rand = { version = "0.9", default-features = false, features = ["thread_rng"] }

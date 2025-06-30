@@ -82,12 +82,12 @@ pub struct IpStackTcpStream {
     destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     timeout: Pin<Box<tokio::time::Sleep>>,
     timeout_interval: Duration,
-    data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    data_tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+    data_rx: tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     exit_notifier: Option<tokio::sync::mpsc::Sender<()>>,
-    temp_read_buffer: Vec<u8>,
+    temp_read_buffer: bytes::BytesMut,
 }
 
 impl IpStackTcpStream {
@@ -113,7 +113,7 @@ impl IpStackTcpStream {
         }
 
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
-        let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
         let deadline = tokio::time::Instant::now() + timeout_interval;
 
         let mut stream = IpStackTcpStream {
@@ -133,7 +133,7 @@ impl IpStackTcpStream {
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             task_handle: None,
             exit_notifier: None,
-            temp_read_buffer: Vec::new(),
+            temp_read_buffer: bytes::BytesMut::new(),
         };
 
         let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
@@ -171,7 +171,7 @@ impl AsyncRead for IpStackTcpStream {
         if !self.temp_read_buffer.is_empty() {
             let len = std::cmp::min(buf.remaining(), self.temp_read_buffer.len());
             buf.put_slice(&self.temp_read_buffer[..len]);
-            self.temp_read_buffer.drain(..len); // remove the read data from the temp buffer
+            bytes::Buf::advance(&mut self.temp_read_buffer, len); // remove the read data from the temp buffer
             return Poll::Ready(Ok(()));
         }
 
@@ -251,8 +251,8 @@ impl AsyncWrite for IpStackTcpStream {
 
         let mut tcb = self.tcb.lock().unwrap();
         let sender = &self.up_packet_sender;
-        let payload_len = write_packet_to_device(sender, nt, &tcb, ACK | PSH, None, Some(buf.to_vec()))?;
-        tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
+        let payload_len = write_packet_to_device(sender, nt, &tcb, ACK | PSH, None, Some(buf.to_vec().into()))?;
+        tcb.add_inflight_packet(buf[..payload_len].to_vec().into())?;
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
@@ -388,7 +388,7 @@ async fn tcp_main_logic_loop(
     network_tuple: NetworkTuple,
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-    data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    data_tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
     {
@@ -737,7 +737,7 @@ fn extract_data_n_write_upstream(
     up_packet_sender: &PacketSender,
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
-    data_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    data_tx: &tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
     read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
 ) -> std::io::Result<()> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
@@ -765,7 +765,7 @@ pub(crate) fn write_packet_to_device(
     tcb: &Tcb,
     flags: u8,
     seq: Option<SeqNum>,
-    payload: Option<Vec<u8>>,
+    payload: Option<bytes::Bytes>,
 ) -> std::io::Result<usize> {
     use std::io::Error;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
@@ -788,7 +788,7 @@ pub(crate) fn create_raw_packet(
     seq: u32,
     ack: u32,
     win: u16,
-    mut payload: Vec<u8>,
+    mut payload: bytes::Bytes,
 ) -> std::io::Result<NetworkPacket> {
     let mut tcp_header = etherparse::TcpHeader::new(src_addr.port(), dst_addr.port(), seq, win);
     tcp_header.acknowledgment_number = ack;

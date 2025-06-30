@@ -8,14 +8,14 @@ use std::net::IpAddr;
 pub struct IpStackUnknownTransport {
     src_addr: IpAddr,
     dst_addr: IpAddr,
-    payload: Vec<u8>,
+    payload: bytes::Bytes,
     protocol: IpNumber,
     mtu: u16,
     packet_sender: PacketSender,
 }
 
 impl IpStackUnknownTransport {
-    pub(crate) fn new(src_addr: IpAddr, dst_addr: IpAddr, payload: Vec<u8>, ip: &IpHeader, mtu: u16, packet_sender: PacketSender) -> Self {
+    pub(crate) fn new(src_addr: IpAddr, dst_addr: IpAddr, payload: bytes::Bytes, ip: &IpHeader, mtu: u16, sender: PacketSender) -> Self {
         let protocol = match ip {
             IpHeader::Ipv4(ip) => ip.protocol,
             IpHeader::Ipv6(ip) => ip.next_header,
@@ -26,7 +26,7 @@ impl IpStackUnknownTransport {
             payload,
             protocol,
             mtu,
-            packet_sender,
+            packet_sender: sender,
         }
     }
     pub fn src_addr(&self) -> IpAddr {
@@ -68,7 +68,7 @@ impl IpStackUnknownTransport {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Unknown,
-                    payload: Some(p),
+                    payload: Some(p.into()),
                 })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
@@ -91,7 +91,7 @@ impl IpStackUnknownTransport {
                 Ok(NetworkPacket {
                     ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Unknown,
-                    payload: Some(p),
+                    payload: Some(p.into()),
                 })
             }
             _ => unreachable!(),

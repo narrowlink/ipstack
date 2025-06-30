@@ -50,7 +50,7 @@ pub(crate) enum TransportHeader {
 pub struct NetworkPacket {
     pub(crate) ip: IpHeader,
     pub(crate) transport: TransportHeader,
-    pub(crate) payload: Option<Vec<u8>>,
+    pub(crate) payload: Option<bytes::Bytes>,
 }
 
 impl NetworkPacket {
@@ -68,7 +68,7 @@ impl NetworkPacket {
             Some(etherparse::TransportSlice::Udp(u)) => (TransportHeader::Udp(u.to_header()), u.payload()),
             _ => (TransportHeader::Unknown, ip_payload),
         };
-        let payload = if payload.is_empty() { None } else { Some(payload.to_vec()) };
+        let payload = if payload.is_empty() { None } else { Some(payload.to_vec().into()) };
 
         Ok(NetworkPacket { ip, transport, payload })
     }
