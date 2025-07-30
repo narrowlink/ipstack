@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut s = match TcpStream::connect(server_addr).await {
                     Ok(s) => s,
                     Err(e) => {
-                        println!("connect TCP server failed \"{}\"", e);
+                        println!("connect TCP server failed \"{e}\"");
                         continue;
                     }
                 };
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut s = match UdpStream::connect(server_addr).await {
                     Ok(s) => s,
                     Err(e) => {
-                        println!("connect UDP server failed \"{}\"", e);
+                        println!("connect UDP server failed \"{e}\"");
                         continue;
                     }
                 };
