@@ -1,0 +1,54 @@
+name: Publish binary
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_n_publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Build
+      if: ${{ !cancelled() }}
+      run: cargo build --release --verbose --examples --all-features
+    - name: Prepare for publish
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: |
+        mkdir -p mypubdir4
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          powershell -Command "(Get-Item target/release/examples/wintun.dll).LastWriteTime = Get-Date"
+          powershell Compress-Archive -Path target/release/examples/tun.exe, README.md, target/release/examples/wintun.dll -DestinationPath mypubdir4/ipstack-${{ matrix.os }}.zip
+        else
+          zip -j mypubdir4/ipstack-${{ matrix.os }}.zip target/release/examples/tun README.md
+        fi
+    - name: Publish
+      if: ${{ !cancelled() }}
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        files: mypubdir4/*
+        tag_name: ${{ github.event.inputs.tag }}
+
+    - name: Abort on error
+      if: ${{ failure() }}
+      run: echo "Some of jobs failed" && false

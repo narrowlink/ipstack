@@ -119,9 +119,9 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     if let Err(e) = process_device_read(&buffer[offset..n], sessions.clone(), u, &config, &accept_sender).await {
                         let io_err: std::io::Error = e.into();
                         if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
-                            log::trace!("Received junk data: {}", io_err);
+                            log::trace!("Received junk data: {io_err}");
                         } else {
-                            log::warn!("process_device_read error: {}", io_err);
+                            log::warn!("process_device_read error: {io_err}");
                         }
                     }
                 }
@@ -164,7 +164,7 @@ async fn process_device_read(
     match sessions.lock().await.entry(network_tuple) {
         std::collections::hash_map::Entry::Occupied(entry) => {
             let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
-            log::trace!("packet sent to stream: {} len {}", network_tuple, len);
+            log::trace!("packet sent to stream: {network_tuple} len {len}");
             entry.get().send(packet).map_err(std::io::Error::other)?;
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
@@ -173,12 +173,12 @@ async fn process_device_read(
             tokio::spawn(async move {
                 rx.await.ok();
                 sessions_clone.lock().await.remove(&network_tuple);
-                log::debug!("session destroyed: {}", network_tuple);
+                log::debug!("session destroyed: {network_tuple}");
             });
             let packet_sender = ip_stack_stream.stream_sender()?;
             accept_sender.send(ip_stack_stream)?;
             entry.insert(packet_sender);
-            log::debug!("session created: {}", network_tuple);
+            log::debug!("session created: {network_tuple}");
         }
     }
     Ok(())

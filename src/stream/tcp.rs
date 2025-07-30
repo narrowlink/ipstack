@@ -105,10 +105,10 @@ impl IpStackTcpStream {
         if !tcp.syn {
             if !tcp.rst {
                 if let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, ACK | RST, None, None) {
-                    log::warn!("Error sending RST/ACK packet: {:?}", err);
+                    log::warn!("Error sending RST/ACK packet: {err}");
                 }
             }
-            let info = format!("Invalid TCP packet: {} {}", tuple, tcp_header_fmt(&tcp));
+            let info = format!("Invalid TCP packet: {tuple} {}", tcp_header_fmt(&tcp));
             return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
         }
 
@@ -538,7 +538,7 @@ async fn tcp_main_logic_loop(
 
         let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq(), tcb.get_ack()) };
         let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
-        let l_info = format!("local {{ seq: {}, ack: {} }}", seq, ack);
+        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
         log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
         if pkt_type == PacketType::Invalid {
             continue;

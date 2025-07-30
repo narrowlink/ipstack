@@ -429,7 +429,7 @@ mod tests {
         for i in 0..MAX_RETRANSMIT_COUNT {
             // Simulate a timeout for the first packet
             let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + std::time::Duration::from_millis(100);
-            println!("timeout: {:?}", timeout);
+            println!("timeout: {timeout:?}");
             std::thread::sleep(timeout);
 
             let packets = tcb.collect_timed_out_inflight_packets();

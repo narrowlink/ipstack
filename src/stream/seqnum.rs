@@ -37,7 +37,7 @@ impl TryFrom<usize> for SeqNum {
         if value > u32::MAX as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("value 0x{:X} is too large to convert to SeqNum", value),
+                format!("value 0x{value:X} is too large to convert to SeqNum"),
             ));
         }
         Ok(Self(value as u32))

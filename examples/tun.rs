@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut s = match TcpStream::connect(server_addr).await {
                     Ok(s) => s,
                     Err(e) => {
-                        log::info!("connect TCP server failed \"{}\"", e);
+                        log::info!("connect TCP server failed \"{e}\"");
                         continue;
                     }
                 };
@@ -120,13 +120,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::info!("#{number1} TCP connecting, session count {c}");
                 tokio::spawn(async move {
                     if let Err(err) = tokio::io::copy_bidirectional(&mut tcp, &mut s).await {
-                        log::info!("#{number1} TCP error: {}", err);
+                        log::info!("#{number1} TCP error: {err}");
                     }
                     if let Err(e) = s.shutdown().await {
-                        log::info!("#{number1} TCP upstream shutdown error: {}", e);
+                        log::info!("#{number1} TCP upstream shutdown error: {e}");
                     }
                     if let Err(e) = tcp.shutdown().await {
-                        log::info!("#{number1} TCP stack stream shutdown error: {}", e);
+                        log::info!("#{number1} TCP stack stream shutdown error: {e}");
                     }
                     let c = count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     log::info!("#{number1} TCP closed, session count {c}");
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut s = match UdpStream::connect(server_addr).await {
                     Ok(s) => s,
                     Err(e) => {
-                        log::info!("connect UDP server failed \"{}\"", e);
+                        log::info!("connect UDP server failed \"{e}\"");
                         continue;
                     }
                 };
@@ -145,11 +145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::info!("#{number2} UDP connecting, session count {c}");
                 tokio::spawn(async move {
                     if let Err(err) = tokio::io::copy_bidirectional(&mut udp, &mut s).await {
-                        log::info!("#{number2} UDP error: {}", err);
+                        log::info!("#{number2} UDP error: {err}");
                     }
                     s.shutdown();
                     if let Err(e) = udp.shutdown().await {
-                        log::info!("#{number2} UDP stack stream shutdown error: {}", e);
+                        log::info!("#{number2} UDP stack stream shutdown error: {e}");
                     }
                     let c = count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     log::info!("#{number2} UDP closed, session count {c}");
