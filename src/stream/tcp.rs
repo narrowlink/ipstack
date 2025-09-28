@@ -103,10 +103,10 @@ impl IpStackTcpStream {
         let tcb = Tcb::new(SeqNum(tcp.sequence_number), mtu);
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
-            if !tcp.rst {
-                if let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, ACK | RST, None, None) {
-                    log::warn!("Error sending RST/ACK packet: {err}");
-                }
+            if !tcp.rst
+                && let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, ACK | RST, None, None)
+            {
+                log::warn!("Error sending RST/ACK packet: {err}");
             }
             let info = format!("Invalid TCP packet: {tuple} {}", tcp_header_fmt(&tcp));
             return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
