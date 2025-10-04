@@ -80,7 +80,8 @@ impl IpStackConfig {
 
 pub struct IpStack {
     accept_receiver: UnboundedReceiver<IpStackStream>,
-    _handle: JoinHandle<Result<()>>, // Just hold the task handle
+    /// for aborting on disconnect
+    pub handle: JoinHandle<Result<()>>,
 }
 
 impl IpStack {
@@ -91,7 +92,7 @@ impl IpStack {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
         IpStack {
             accept_receiver,
-            _handle: run(config, device, accept_sender),
+            handle: run(config, device, accept_sender),
         }
     }
 
