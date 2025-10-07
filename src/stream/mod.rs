@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 pub use self::tcp::IpStackTcpStream;
+pub use self::tcp::TcpConfig;
 pub use self::udp::IpStackUdpStream;
 pub use self::unknown::IpStackUnknownTransport;
 

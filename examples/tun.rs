@@ -93,7 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
     ipstack_config.mtu(MTU);
-    ipstack_config.tcp_timeout(std::time::Duration::from_secs(args.tcp_timeout));
+    let mut tcp_config = ipstack::TcpConfig::default();
+    tcp_config.timeout = std::time::Duration::from_secs(args.tcp_timeout);
+    ipstack_config.with_tcp_config(tcp_config);
     ipstack_config.udp_timeout(std::time::Duration::from_secs(args.udp_timeout));
 
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun::create_as_async(&tun_config)?);
