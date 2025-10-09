@@ -179,7 +179,7 @@ impl Tcb {
         self.send_window
     }
     pub(super) fn get_recv_window(&self) -> u16 {
-        self.get_available_read_buffer_size() as u16
+        self.get_available_read_buffer_size().try_into().unwrap_or(u16::MAX)
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
