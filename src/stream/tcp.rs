@@ -50,7 +50,7 @@ pub struct TcpConfig {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum TcpOptions {
-    /// Maximum segment size (MSS) for TCP connections. Default is 1460 bytes.
+    /// Maximum segment size (MSS) for TCP connections.
     MaximumSegmentSize(u16),
 }
 
