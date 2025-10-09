@@ -2,7 +2,7 @@
 
 use ahash::AHashMap;
 use packet::{NetworkPacket, NetworkTuple, TransportHeader};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
@@ -20,7 +20,8 @@ mod stream;
 
 pub use self::error::{IpStackError, Result};
 pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
-pub use ::etherparse::IpNumber;
+pub use self::stream::{TcpConfig, TcpOptions};
+pub use etherparse::IpNumber;
 
 #[cfg(unix)]
 const TTL: u8 = 64;
@@ -41,10 +42,11 @@ const TUN_PROTO_IP6: [u8; 2] = [0x00, 0x0A];
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 
+#[non_exhaustive]
 pub struct IpStackConfig {
     pub mtu: u16,
     pub packet_information: bool,
-    pub tcp_timeout: Duration,
+    pub tcp_config: Arc<TcpConfig>,
     pub udp_timeout: Duration,
 }
 
@@ -53,15 +55,16 @@ impl Default for IpStackConfig {
         IpStackConfig {
             mtu: u16::MAX,
             packet_information: false,
-            tcp_timeout: Duration::from_secs(60),
+            tcp_config: Arc::new(TcpConfig::default()),
             udp_timeout: Duration::from_secs(30),
         }
     }
 }
 
 impl IpStackConfig {
-    pub fn tcp_timeout(&mut self, timeout: Duration) -> &mut Self {
-        self.tcp_timeout = timeout;
+    /// Set custom TCP configuration
+    pub fn with_tcp_config(&mut self, config: TcpConfig) -> &mut Self {
+        self.tcp_config = Arc::new(config);
         self
     }
     pub fn udp_timeout(&mut self, timeout: Duration) -> &mut Self {
@@ -194,7 +197,7 @@ fn create_stream(
     let dst_addr = packet.dst_addr();
     match packet.transport_header() {
         TransportHeader::Tcp(h) => {
-            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, cfg.tcp_timeout, msgr)?;
+            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, msgr, cfg.tcp_config.clone())?;
             Ok(IpStackStream::Tcp(stream))
         }
         TransportHeader::Udp(_) => {
