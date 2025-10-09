@@ -177,7 +177,9 @@ async fn process_device_read(
             let session_remove_tx = session_remove_tx.clone();
             tokio::spawn(async move {
                 rx.await.ok();
-                session_remove_tx.send(network_tuple).ok();
+                if let Err(e) = session_remove_tx.send(network_tuple) {
+                    log::error!("Failed to send session removal for {network_tuple}: {e}");
+                }
             });
             let packet_sender = ip_stack_stream.stream_sender()?;
             accept_sender.send(ip_stack_stream)?;
