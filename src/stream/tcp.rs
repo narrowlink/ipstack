@@ -28,6 +28,7 @@ const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAST_ACK_MAX_RETRIES: usize = 3;
 const LAST_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const TIMEOUT: Duration = Duration::from_secs(60);
+const TCP_HEADER_LEN: u16 = 20;
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -52,6 +53,9 @@ pub struct TcpConfig {
 pub enum TcpOptions {
     /// Maximum segment size (MSS) for TCP connections. Default is 1460 bytes.
     MaximumSegmentSize(u16),
+
+    /// MTU option，helps to set the MSS (Maximum Segment Size) option in the TCP header.
+    IpMtu(u16),
 }
 
 impl Default for TcpConfig {
@@ -913,7 +917,17 @@ pub(crate) fn create_raw_packet(
         let mut tcp_options = Vec::new();
         for opt in opts {
             match opt {
-                TcpOptions::MaximumSegmentSize(mss) => tcp_options.push(TcpOptionElement::MaximumSegmentSize(*mss)),
+                TcpOptions::MaximumSegmentSize(mss) => tcp_options.push(etherparse::TcpOptionElement::MaximumSegmentSize(*mss)),
+                TcpOptions::IpMtu(mtu) => {
+                    tcp_options.push(etherparse::TcpOptionElement::MaximumSegmentSize(
+                        mtu - TCP_HEADER_LEN
+                            - if src_addr.is_ipv6() || dst_addr.is_ipv6() {
+                                40
+                            } else {
+                                20 // minimum IPv4 header size
+                            },
+                    ));
+                }
             }
         }
         tcp_header
