@@ -9,7 +9,7 @@ use crate::{
     },
     stream::tcb::{PacketType, Tcb, TcpState},
 };
-use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader};
+use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
 use std::{
     future::Future,
     io::ErrorKind::{BrokenPipe, ConnectionRefused, InvalidInput, UnexpectedEof},
@@ -43,6 +43,15 @@ pub struct TcpConfig {
     pub timeout: Duration,
     /// Timeout for the TIME_WAIT state. Default is 2 seconds.
     pub two_msl: Duration,
+    /// TCP options
+    pub options: Option<Vec<TcpOptions>>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum TcpOptions {
+    /// Maximum segment size (MSS) for TCP connections. Default is 1460 bytes.
+    MaximumSegmentSize(u16),
 }
 
 impl Default for TcpConfig {
@@ -53,6 +62,7 @@ impl Default for TcpConfig {
             close_wait_timeout: CLOSE_WAIT_TIMEOUT,
             timeout: TIMEOUT,
             two_msl: TWO_MSL,
+            options: Default::default(),
         }
     }
 }
@@ -134,7 +144,7 @@ impl IpStackTcpStream {
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
             if !tcp.rst
-                && let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, ACK | RST, None, None)
+                && let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, None, ACK | RST, None, None)
             {
                 log::warn!("Error sending RST/ACK packet: {err}");
             }
@@ -222,7 +232,7 @@ impl AsyncRead for IpStackTcpStream {
                 let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
                 log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session timeout reached, closing forcefully...");
                 let sender = &self.up_packet_sender;
-                write_packet_to_device(sender, network_tuple, &tcb, ACK | RST, None, None)?;
+                write_packet_to_device(sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
                 tcb.change_state(TcpState::Closed);
                 let state = tcb.get_state();
                 log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
@@ -281,7 +291,7 @@ impl AsyncWrite for IpStackTcpStream {
 
         let mut tcb = self.tcb.lock().unwrap();
         let sender = &self.up_packet_sender;
-        let payload_len = write_packet_to_device(sender, nt, &tcb, ACK | PSH, None, Some(buf.to_vec()))?;
+        let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
@@ -335,7 +345,7 @@ fn send_fin_n_change_state_to_fin_wait1(hint: &str, nt: NetworkTuple, sender: &P
     }
 
     log::debug!("{nt} {state:?}: {hint} actively send a farewell packet to the other side...");
-    write_packet_to_device(sender, nt, tcb, ACK | FIN, None, None)?;
+    write_packet_to_device(sender, nt, tcb, None, ACK | FIN, None, None)?;
     tcb.increase_seq();
     tcb.change_state(TcpState::FinWait1);
     let state = tcb.get_state();
@@ -437,7 +447,15 @@ async fn tcp_main_logic_loop(
         let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
         log::trace!("{network_tuple} {state:?}: {l_info} session begins");
-        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | SYN, None, None)?;
+        write_packet_to_device(
+            &up_packet_sender,
+            network_tuple,
+            &tcb,
+            config.options.as_ref(),
+            ACK | SYN,
+            None,
+            None,
+        )?;
         tcb.increase_seq();
         tcb.change_state(TcpState::SynReceived);
         let state = tcb.get_state();
@@ -483,7 +501,7 @@ async fn tcp_main_logic_loop(
                     return;
                 }
                 log::debug!("{nt} {state:?}: {hint} timer expired, resending ACK|FIN (retry {idx}/{last_ack_max_retries})");
-                _ = write_packet_to_device(&pkt_sdr, nt, &tcb, ACK | FIN, None, None);
+                _ = write_packet_to_device(&pkt_sdr, nt, &tcb, None, ACK | FIN, None, None);
             }
         }
         {
@@ -512,7 +530,7 @@ async fn tcp_main_logic_loop(
             return Ok(());
         }
         log::warn!("{nt} {state:?}: Upstream timeout, forcing FIN");
-        write_packet_to_device(&up_packet_sender, nt, &tcb, ACK | FIN, None, None)?;
+        write_packet_to_device(&up_packet_sender, nt, &tcb, None, ACK | FIN, None, None)?;
         tcb.increase_seq();
         tcb.change_state(TcpState::LastAck);
         let new_state = tcb.get_state();
@@ -581,7 +599,15 @@ async fn tcp_main_logic_loop(
         for packet in tcb.collect_timed_out_inflight_packets() {
             let (seq, count) = (packet.seq, packet.retransmit_count);
             log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
-            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | PSH, Some(seq), Some(packet.payload))?;
+            write_packet_to_device(
+                &up_packet_sender,
+                network_tuple,
+                &tcb,
+                None,
+                ACK | PSH,
+                Some(seq),
+                Some(packet.payload),
+            )?;
         }
 
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
@@ -611,7 +637,7 @@ async fn tcp_main_logic_loop(
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                         }
                         PacketType::KeepAlive => {
-                            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
+                            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                         }
                         PacketType::RetransmissionRequest => {
                             if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
@@ -620,7 +646,7 @@ async fn tcp_main_logic_loop(
                                     "{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}",
                                     p.len()
                                 );
-                                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | PSH, Some(s), Some(p))?;
+                                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | PSH, Some(s), Some(p))?;
                             }
                         }
                         PacketType::NewPacket => {
@@ -637,7 +663,7 @@ async fn tcp_main_logic_loop(
                 } else if flags == (ACK | FIN) {
                     // The other side is closing the connection, we need to send an ACK and change state to CloseWait
                     tcb.increase_ack();
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     tcb.change_state(TcpState::CloseWait);
 
                     let s = tcb.get_state();
@@ -647,7 +673,7 @@ async fn tcp_main_logic_loop(
                         log::trace!("{network_tuple} {s:?}: {l_info}, {pkt_type:?}, closed by the other side, no upstream data");
 
                         // Here we don't wait, just send FIN to the other side and change state to LastAck directly,
-                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | FIN, None, None)?;
+                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, None, None)?;
                         tcb.increase_seq();
                         tcb.change_state(TcpState::LastAck);
 
@@ -696,7 +722,7 @@ async fn tcp_main_logic_loop(
             }
             TcpState::CloseWait => {
                 if flags & ACK == ACK && tcb.get_inflight_packets_total_len() == 0 {
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK | FIN, None, None)?;
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, None, None)?;
                     tcb.increase_seq();
                     tcb.change_state(TcpState::LastAck);
                     let new_state = tcb.get_state();
@@ -734,7 +760,7 @@ async fn tcp_main_logic_loop(
                 if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                     // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
                     tcb.increase_ack();
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     tcb.change_state(TcpState::TimeWait);
 
                     tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
@@ -758,7 +784,7 @@ async fn tcp_main_logic_loop(
             TcpState::FinWait2 => {
                 if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                     tcb.increase_ack();
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     tcb.change_state(TcpState::TimeWait);
                     tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
                     let new_state = tcb.get_state();
@@ -771,7 +797,7 @@ async fn tcp_main_logic_loop(
                     }
                 } else if flags & ACK == ACK && len > 0 {
                     if pkt_type == PacketType::KeepAlive {
-                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
+                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     } else {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                         tcb.add_unordered_packet(incoming_seq, payload);
@@ -791,7 +817,7 @@ async fn tcp_main_logic_loop(
             }
             TcpState::TimeWait => {
                 if flags & (ACK | FIN) == (ACK | FIN) {
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, ACK, None, None)?;
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     // wait to timeout, can't call `tcb.change_state(TcpState::Closed);` to change state here
                     // now we need to wait for the timeout to reach...
                 }
@@ -824,7 +850,7 @@ fn extract_data_n_write_upstream(
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-        write_packet_to_device(up_packet_sender, network_tuple, tcb, ACK, None, None)?;
+        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
     Ok(())
 }
@@ -835,6 +861,7 @@ pub(crate) fn write_packet_to_device(
     up_packet_sender: &PacketSender,
     tuple: NetworkTuple,
     tcb: &Tcb,
+    options: Option<&Vec<TcpOptions>>,
     flags: u8,
     seq: Option<SeqNum>,
     payload: Option<Vec<u8>>,
@@ -844,7 +871,18 @@ pub(crate) fn write_packet_to_device(
     let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window().max(tcb.get_mtu()));
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
-    let packet = create_raw_packet(src, dst, calc, flags, TTL, seq, ack, window_size, payload.unwrap_or_default())?;
+    let packet = create_raw_packet(
+        src,
+        dst,
+        calc,
+        flags,
+        TTL,
+        seq,
+        ack,
+        window_size,
+        payload.unwrap_or_default(),
+        options,
+    )?;
     let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
     up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
     Ok(len)
@@ -861,6 +899,7 @@ pub(crate) fn create_raw_packet(
     ack: u32,
     win: u16,
     mut payload: Vec<u8>,
+    options: Option<&Vec<TcpOptions>>,
 ) -> std::io::Result<NetworkPacket> {
     let mut tcp_header = etherparse::TcpHeader::new(src_addr.port(), dst_addr.port(), seq, win);
     tcp_header.acknowledgment_number = ack;
@@ -870,6 +909,17 @@ pub(crate) fn create_raw_packet(
     tcp_header.fin = flags & FIN != 0;
     tcp_header.psh = flags & PSH != 0;
 
+    if let Some(opts) = options {
+        let mut tcp_options = Vec::new();
+        for opt in opts {
+            match opt {
+                TcpOptions::MaximumSegmentSize(mss) => tcp_options.push(TcpOptionElement::MaximumSegmentSize(*mss)),
+            }
+        }
+        tcp_header
+            .set_options(&tcp_options)
+            .map_err(|e| std::io::Error::new(InvalidInput, e))?;
+    }
     let ip_header = match (src_addr.ip(), dst_addr.ip()) {
         (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
             let mut ip_h =

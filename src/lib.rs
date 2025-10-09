@@ -19,8 +19,8 @@ mod packet;
 mod stream;
 
 pub use self::error::{IpStackError, Result};
-pub use self::stream::TcpConfig;
 pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
+pub use self::stream::{TcpConfig, TcpOptions};
 pub use etherparse::IpNumber;
 
 #[cfg(unix)]
