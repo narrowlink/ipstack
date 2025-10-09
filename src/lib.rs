@@ -63,8 +63,9 @@ impl Default for IpStackConfig {
 
 impl IpStackConfig {
     /// Set custom TCP configuration
-    pub fn with_tcp_config(&mut self, config: TcpConfig) {
+    pub fn with_tcp_config(&mut self, config: TcpConfig) -> &mut Self {
         self.tcp_config = Arc::new(config);
+        self
     }
     pub fn udp_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.udp_timeout = timeout;
