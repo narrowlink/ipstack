@@ -9,7 +9,7 @@ use crate::{
     },
     stream::tcb::{PacketType, Tcb, TcpState},
 };
-use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
+use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader};
 use std::{
     future::Future,
     io::ErrorKind::{BrokenPipe, ConnectionRefused, InvalidInput, UnexpectedEof},
@@ -452,7 +452,7 @@ async fn tcp_main_logic_loop(
             &up_packet_sender,
             network_tuple,
             &tcb,
-            config.options.as_ref().as_deref().map(|o| {
+            config.options.as_ref().map(|o| {
                 (
                     o,
                     if network_tuple.src.is_ipv4() && network_tuple.dst.is_ipv4() {
