@@ -116,7 +116,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         loop {
             select! {
                 Ok(n) = device.read(&mut buffer) => {
-                    if let Err(e) = process_device_read(&buffer[offset..n], &mut sessions,&session_remove_tx, &up_pkt_sender, &config, &accept_sender).await {
+                    if let Err(e) = process_device_read(&buffer[offset..n], &mut sessions, &session_remove_tx, &up_pkt_sender, &config, &accept_sender).await {
                         let io_err: std::io::Error = e.into();
                         if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
                             log::trace!("Received junk data: {io_err}");
@@ -125,11 +125,9 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                         }
                     }
                 }
-                network_tuple = session_remove_rx.recv() => {
-                    if let Some(network_tuple) = network_tuple {
-                        sessions.remove(&network_tuple);
-                        log::debug!("session destroyed: {network_tuple}");
-                    }
+                Some(network_tuple) = session_remove_rx.recv() => {
+                    sessions.remove(&network_tuple);
+                    log::debug!("session destroyed: {network_tuple}");
                 }
                 Some(packet) = up_pkt_receiver.recv() => {
                     process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
