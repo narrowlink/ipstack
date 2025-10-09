@@ -452,7 +452,16 @@ async fn tcp_main_logic_loop(
             &up_packet_sender,
             network_tuple,
             &tcb,
-            config.options.as_ref(),
+            config.options.as_ref().as_deref().map(|o| {
+                (
+                    o,
+                    if network_tuple.src.is_ipv4() && network_tuple.dst.is_ipv4() {
+                        tcb.get_mtu() - 20 - TCP_HEADER_LEN
+                    } else {
+                        tcb.get_mtu() - 40 - TCP_HEADER_LEN
+                    },
+                )
+            }),
             ACK | SYN,
             None,
             None,
@@ -862,7 +871,7 @@ pub(crate) fn write_packet_to_device(
     up_packet_sender: &PacketSender,
     tuple: NetworkTuple,
     tcb: &Tcb,
-    options: Option<&Vec<TcpOptions>>,
+    options: Option<(&Vec<TcpOptions>, u16)>,
     flags: u8,
     seq: Option<SeqNum>,
     payload: Option<Vec<u8>>,
@@ -881,7 +890,6 @@ pub(crate) fn write_packet_to_device(
         seq,
         ack,
         window_size,
-        tcb.get_mtu(),
         payload.unwrap_or_default(),
         options,
     )?;
@@ -900,9 +908,8 @@ pub(crate) fn create_raw_packet(
     seq: u32,
     ack: u32,
     win: u16,
-    mtu: u16,
     mut payload: Vec<u8>,
-    options: Option<&Vec<TcpOptions>>,
+    options: Option<(&Vec<TcpOptions>, u16)>,
 ) -> std::io::Result<NetworkPacket> {
     let mut tcp_header = etherparse::TcpHeader::new(src_addr.port(), dst_addr.port(), seq, win);
     tcp_header.acknowledgment_number = ack;
@@ -911,23 +918,19 @@ pub(crate) fn create_raw_packet(
     tcp_header.rst = flags & RST != 0;
     tcp_header.fin = flags & FIN != 0;
     tcp_header.psh = flags & PSH != 0;
-    let mut actual_mss = if src_addr.is_ipv6() || dst_addr.is_ipv6() {
-        mtu - 40 - TCP_HEADER_LEN
-    } else {
-        mtu - 20 - TCP_HEADER_LEN
-    };
-    let mut tcp_options = Vec::new();
-    if let Some(opts) = options {
+
+    if let Some((opts, mut mss)) = options {
+        let mut tcp_options = Vec::new();
         for opt in opts {
             match opt {
-                TcpOptions::MaximumSegmentSize(mss) => actual_mss = *mss,
+                TcpOptions::MaximumSegmentSize(fixed_mss) => mss = *fixed_mss,
             }
         }
+        tcp_options.push(etherparse::TcpOptionElement::MaximumSegmentSize(mss));
+        tcp_header
+            .set_options(&tcp_options)
+            .map_err(|e| std::io::Error::new(InvalidInput, e))?;
     }
-    tcp_options.push(etherparse::TcpOptionElement::MaximumSegmentSize(actual_mss));
-    tcp_header
-        .set_options(&tcp_options)
-        .map_err(|e| std::io::Error::new(InvalidInput, e))?;
 
     let ip_header = match (src_addr.ip(), dst_addr.ip()) {
         (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
