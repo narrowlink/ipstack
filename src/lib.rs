@@ -46,8 +46,8 @@ const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 pub struct IpStackConfig {
     pub mtu: u16,
     pub packet_information: bool,
-    pub udp_timeout: Duration,
     pub tcp_config: Arc<TcpConfig>,
+    pub udp_timeout: Duration,
 }
 
 impl Default for IpStackConfig {
