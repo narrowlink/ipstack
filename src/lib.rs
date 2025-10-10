@@ -83,7 +83,7 @@ impl IpStackConfig {
 
 pub struct IpStack {
     accept_receiver: UnboundedReceiver<IpStackStream>,
-    handle: JoinHandle<Result<()>>, // Just hold the task handle
+    handle: JoinHandle<Result<()>>,
 }
 
 impl IpStack {
