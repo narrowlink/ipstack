@@ -83,7 +83,7 @@ impl IpStackConfig {
 
 pub struct IpStack {
     accept_receiver: UnboundedReceiver<IpStackStream>,
-    _handle: JoinHandle<Result<()>>, // Just hold the task handle
+    handle: JoinHandle<Result<()>>,
 }
 
 impl IpStack {
@@ -94,12 +94,18 @@ impl IpStack {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
         IpStack {
             accept_receiver,
-            _handle: run(config, device, accept_sender),
+            handle: run(config, device, accept_sender),
         }
     }
 
     pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
         self.accept_receiver.recv().await.ok_or(IpStackError::AcceptError)
+    }
+}
+
+impl Drop for IpStack {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 
