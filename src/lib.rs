@@ -102,6 +102,11 @@ impl IpStack {
         self.accept_receiver.recv().await.ok_or(IpStackError::AcceptError)
     }
 
+    /// Aborts the background network stack task.
+    ///
+    /// This method should be used when you want to immediately stop the network stack.
+    /// Any pending operations, such as accepted streams or in-flight packets, will be dropped
+    /// and may not complete. Use this when you need to forcefully shut down the stack.
     pub fn abort(&self) {
         self.handle.abort();
     }
