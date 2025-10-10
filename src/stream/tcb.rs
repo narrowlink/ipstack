@@ -300,7 +300,9 @@ impl Tcb {
     }
 
     pub fn is_send_buffer_full(&self) -> bool {
-        self.seq.distance(self.get_last_received_ack()) >= MAX_UNACK
+        // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
+        // Simplified version: min(cwnd, rwnd)
+        self.seq.distance(self.get_last_received_ack()) >= MAX_UNACK.min(self.get_send_window() as u32)
     }
 }
 
