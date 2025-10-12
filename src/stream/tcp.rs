@@ -270,11 +270,10 @@ impl AsyncWrite for IpStackTcpStream {
         let nt = self.network_tuple();
         self.reset_timeout();
 
-        let (state, send_window, is_full) = {
-            let tcb = self.tcb.lock().unwrap();
-            let state = tcb.get_state();
-            (state, tcb.get_send_window(), tcb.is_send_buffer_full())
-        };
+        let mut tcb = self.tcb.lock().unwrap();
+        let state = tcb.get_state();
+        let send_window = tcb.get_send_window();
+        let is_full = tcb.is_send_buffer_full();
 
         if state == TcpState::Closed {
             self.shutdown.lock().unwrap().ready();
@@ -289,7 +288,6 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Pending;
         }
 
-        let mut tcb = self.tcb.lock().unwrap();
         let sender = &self.up_packet_sender;
         let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
