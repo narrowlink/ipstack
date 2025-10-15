@@ -151,17 +151,18 @@ impl IpStackUnknownTransport {
 
     /// Create a reverse packet for sending a response.
     ///
-    /// This method creates packets with swapped source and destination addresses,
-    /// suitable for sending responses to received packets. The payload is automatically
-    /// fragmented if it exceeds the MTU.
+    /// This method creates a packet with swapped source and destination addresses,
+    /// suitable for sending responses to received packets. If the payload exceeds
+    /// the MTU, only a portion of the payload is consumed and included in the packet.
     ///
     /// # Arguments
     ///
-    /// * `payload` - A mutable reference to the payload. Data will be drained from this vector.
+    /// * `payload` - A mutable reference to the payload vector. If the payload exceeds
+    ///   the MTU, data is drained from the front. Otherwise, the entire vector is taken.
     ///
     /// # Returns
     ///
-    /// Returns a `NetworkPacket` with the reversed addresses and the payload.
+    /// Returns a `NetworkPacket` with the reversed addresses and up to MTU bytes of payload.
     ///
     /// # Errors
     ///
