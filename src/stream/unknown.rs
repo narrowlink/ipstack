@@ -151,8 +151,21 @@ impl IpStackUnknownTransport {
 
     /// Create a reverse packet for sending a response.
     ///
-    /// This is an internal method used by `send()` to create packets with swapped
-    /// source and destination addresses.
+    /// This method creates packets with swapped source and destination addresses,
+    /// suitable for sending responses to received packets. The payload is automatically
+    /// fragmented if it exceeds the MTU.
+    ///
+    /// # Arguments
+    ///
+    /// * `payload` - A mutable reference to the payload. Data will be drained from this vector.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `NetworkPacket` with the reversed addresses and the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the packet cannot be constructed.
     pub fn create_rev_packet(&self, payload: &mut Vec<u8>) -> std::io::Result<NetworkPacket> {
         match (self.dst_addr, self.src_addr) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
