@@ -86,14 +86,6 @@ impl IpStackStream {
         }
     }
 
-    /// Returns a packet sender for this stream.
-    ///
-    /// This is an internal method used to send packets back to the stream.
-    /// Only available for TCP and UDP streams.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if called on `UnknownTransport` or `UnknownNetwork` variants.
     pub(crate) fn stream_sender(&self) -> Result<crate::PacketSender, std::io::Error> {
         match self {
             IpStackStream::Tcp(tcp) => Ok(tcp.stream_sender()),
