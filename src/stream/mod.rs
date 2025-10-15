@@ -94,7 +94,7 @@ impl IpStackStream {
     /// # Errors
     ///
     /// Returns an error if called on `UnknownTransport` or `UnknownNetwork` variants.
-    pub fn stream_sender(&self) -> Result<crate::PacketSender, std::io::Error> {
+    pub(crate) fn stream_sender(&self) -> Result<crate::PacketSender, std::io::Error> {
         match self {
             IpStackStream::Tcp(tcp) => Ok(tcp.stream_sender()),
             IpStackStream::Udp(udp) => Ok(udp.stream_sender()),
