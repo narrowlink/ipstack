@@ -59,7 +59,7 @@ impl IpStackStream {
             },
         }
     }
-    
+
     /// Returns the remote socket address for this stream.
     ///
     /// For TCP and UDP streams, this returns the destination address of the connection.

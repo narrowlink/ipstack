@@ -237,7 +237,7 @@ impl IpStackTcpStream {
     pub fn local_addr(&self) -> SocketAddr {
         self.src_addr
     }
-    
+
     /// Returns the remote socket address of the TCP connection.
     ///
     /// # Examples
@@ -252,7 +252,7 @@ impl IpStackTcpStream {
     pub fn peer_addr(&self) -> SocketAddr {
         self.dst_addr
     }
-    
+
     pub fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }

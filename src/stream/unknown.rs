@@ -53,7 +53,7 @@ impl IpStackUnknownTransport {
             packet_sender,
         }
     }
-    
+
     /// Returns the source IP address of the packet.
     ///
     /// # Examples
@@ -68,7 +68,7 @@ impl IpStackUnknownTransport {
     pub fn src_addr(&self) -> IpAddr {
         self.src_addr
     }
-    
+
     /// Returns the destination IP address of the packet.
     ///
     /// # Examples
@@ -83,7 +83,7 @@ impl IpStackUnknownTransport {
     pub fn dst_addr(&self) -> IpAddr {
         self.dst_addr
     }
-    
+
     /// Returns the payload of the packet.
     ///
     /// # Examples
@@ -98,7 +98,7 @@ impl IpStackUnknownTransport {
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
-    
+
     /// Returns the IP protocol number of the packet.
     ///
     /// # Examples
@@ -113,7 +113,7 @@ impl IpStackUnknownTransport {
     pub fn ip_protocol(&self) -> IpNumber {
         self.protocol
     }
-    
+
     /// Send a response packet.
     ///
     /// This method sends one or more packets with the given payload, automatically

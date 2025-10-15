@@ -103,7 +103,7 @@ impl IpStackConfig {
         self.tcp_config = Arc::new(config);
         self
     }
-    
+
     /// Set the UDP connection timeout.
     ///
     /// # Arguments
@@ -123,7 +123,7 @@ impl IpStackConfig {
         self.udp_timeout = timeout;
         self
     }
-    
+
     /// Set the Maximum Transmission Unit (MTU) size.
     ///
     /// # Arguments
@@ -142,7 +142,7 @@ impl IpStackConfig {
         self.mtu = mtu;
         self
     }
-    
+
     /// Enable or disable packet information headers (Unix platforms only).
     ///
     /// When enabled on Unix platforms, the TUN device will include 4-byte packet
