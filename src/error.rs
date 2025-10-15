@@ -1,26 +1,37 @@
+/// Error types for the IP stack.
+///
+/// This enum represents all possible errors that can occur when working with the IP stack.
 #[derive(thiserror::Error, Debug)]
 pub enum IpStackError {
+    /// The transport protocol is not supported.
     #[error("The transport protocol is not supported")]
     UnsupportedTransportProtocol,
 
+    /// The packet is invalid or malformed.
     #[error("The packet is invalid")]
     InvalidPacket,
 
+    /// A value is too large to fit in a u16.
     #[error("ValueTooBigError<u16> {0}")]
     ValueTooBigErrorU16(#[from] etherparse::err::ValueTooBigError<u16>),
 
+    /// A value is too large to fit in a usize.
     #[error("ValueTooBigError<usize> {0}")]
     ValueTooBigErrorUsize(#[from] etherparse::err::ValueTooBigError<usize>),
 
+    /// The TCP packet is invalid.
     #[error("Invalid Tcp packet")]
     InvalidTcpPacket,
 
+    /// An I/O error occurred.
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
+    /// Error accepting a new stream.
     #[error("Accept Error")]
     AcceptError,
 
+    /// Error sending data through a channel.
     #[error("Send Error {0}")]
     SendError(#[from] Box<tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>>),
 }
@@ -48,4 +59,9 @@ impl From<IpStackError> for std::io::Error {
     }
 }
 
+/// A specialized [`Result`] type for IP stack operations.
+///
+/// This type is used throughout the IP stack for any operation which may produce an error.
+///
+/// [`Result`]: std::result::Result
 pub type Result<T, E = IpStackError> = std::result::Result<T, E>;
