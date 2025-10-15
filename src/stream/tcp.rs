@@ -623,7 +623,7 @@ async fn tcp_main_logic_loop(
                 if flags & ACK == ACK {
                     if len > 0 {
                         tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &read_notify)?;
                     }
                     tcb.change_state(TcpState::Established);
                 }
@@ -650,7 +650,7 @@ async fn tcp_main_logic_loop(
                         PacketType::NewPacket => {
                             tcb.add_unordered_packet(incoming_seq, payload);
                             let nt = network_tuple;
-                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
+                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &read_notify)?;
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                         }
                         PacketType::Ack => {
@@ -711,7 +711,7 @@ async fn tcp_main_logic_loop(
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     if !payload.is_empty() && tcb.get_ack() == incoming_seq {
                         tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &read_notify)?;
                     }
                 } else {
                     // unnormal case, we do nothing here
@@ -769,7 +769,7 @@ async fn tcp_main_logic_loop(
                     if len > 0 {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                         tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &read_notify)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
                     let new_state = tcb.get_state();
@@ -799,7 +799,7 @@ async fn tcp_main_logic_loop(
                     } else {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
                         tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &read_notify)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
                     if flags & FIN == FIN {
@@ -833,7 +833,6 @@ fn extract_data_n_write_upstream(
     up_packet_sender: &PacketSender,
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
-    data_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
 ) -> std::io::Result<()> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
@@ -843,10 +842,13 @@ fn extract_data_n_write_upstream(
         return Ok(());
     }
 
-    if let Some(data) = tcb.consume_unordered_packets(8192) {
+    let before_len = tcb.get_ordered_packets_total_len();
+    tcb.consume_unordered_packets();
+    let after_len = tcb.get_ordered_packets_total_len();
+    
+    if after_len > before_len {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
-        log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
-        data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
+        log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, new ordered bytes = {}", after_len - before_len);
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }

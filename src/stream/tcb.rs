@@ -43,6 +43,7 @@ pub(super) enum PacketType {
 /// - `unordered_packets` is the bytes stream received from the lower device,
 ///   which can be acknowledged and extracted by `consume_unordered_packets` method
 ///   then can be read by upstream application via `Tcp::poll_read` method.
+/// - `ordered_packets` is the list of contiguous packets ready to be read by the application.
 #[derive(Debug, Clone)]
 pub(crate) struct Tcb {
     seq: SeqNum,
@@ -53,6 +54,7 @@ pub(crate) struct Tcb {
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
+    ordered_packets: Vec<Vec<u8>>,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
 }
@@ -72,6 +74,7 @@ impl Tcb {
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
+            ordered_packets: Vec::new(),
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
         }
@@ -106,46 +109,40 @@ impl Tcb {
         self.unordered_packets.insert(seq, buf);
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        READ_BUFFER_SIZE.saturating_sub(self.get_unordered_packets_total_len())
+        let total_buffered = self.get_unordered_packets_total_len() + self.get_ordered_packets_total_len();
+        READ_BUFFER_SIZE.saturating_sub(total_buffered)
     }
     #[inline]
     pub(crate) fn get_unordered_packets_total_len(&self) -> usize {
         self.unordered_packets.values().map(|p| p.len()).sum()
     }
+    #[inline]
+    pub(crate) fn get_ordered_packets_total_len(&self) -> usize {
+        self.ordered_packets.iter().map(|p| p.len()).sum()
+    }
 
-    pub(super) fn consume_unordered_packets(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
-        let mut data = Vec::new();
-        let mut remaining_bytes = max_bytes;
-
-        while remaining_bytes > 0 {
-            if let Some(seq) = self.unordered_packets.keys().next().copied() {
-                if seq != self.ack {
-                    break; // sequence number is not continuous, stop extracting
-                }
-
-                // remove and get the first packet
-                let mut payload = self.unordered_packets.remove(&seq).unwrap();
-                let payload_len = payload.len();
-
-                if payload_len <= remaining_bytes {
-                    // current packet can be fully extracted
-                    data.extend(payload);
-                    self.ack += payload_len as u32;
-                    remaining_bytes -= payload_len;
-                } else {
-                    // current packet can only be partially extracted
-                    let remaining_payload = payload.split_off(remaining_bytes);
-                    data.extend_from_slice(&payload);
-                    self.ack += remaining_bytes as u32;
-                    self.unordered_packets.insert(self.ack, remaining_payload);
-                    break;
-                }
-            } else {
-                break; // no more packets to extract
+    pub(super) fn consume_unordered_packets(&mut self) {
+        while let Some(seq) = self.unordered_packets.keys().next().copied() {
+            if seq != self.ack {
+                break; // sequence number is not continuous, stop extracting
             }
-        }
 
-        if data.is_empty() { None } else { Some(data) }
+            // remove and get the first packet
+            let payload = self.unordered_packets.remove(&seq).unwrap();
+            let payload_len = payload.len();
+            
+            // Move the packet to ordered_packets
+            self.ordered_packets.push(payload);
+            self.ack += payload_len as u32;
+        }
+    }
+
+    pub(super) fn pop_ordered_packet(&mut self) -> Option<Vec<u8>> {
+        if self.ordered_packets.is_empty() {
+            None
+        } else {
+            Some(self.ordered_packets.remove(0))
+        }
     }
 
     pub(super) fn increase_seq(&mut self) {
@@ -359,26 +356,32 @@ mod tests {
         tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]); // seq=1500, len=500
         tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]); // seq=2000, len=500
 
-        // test 1: extract up to 700 bytes
-        let data = tcb.consume_unordered_packets(700).unwrap();
-        assert_eq!(data.len(), 700); // extract 500 + 200
-        assert_eq!(data[..500], vec![1; 500]); // the first packet
-        assert_eq!(data[500..700], vec![2; 200]); // the first 200 bytes of the second packet
-        assert_eq!(tcb.ack, SeqNum(1700)); // ack increased by 700
-        assert_eq!(tcb.unordered_packets.len(), 2); // remaining two packets
-        assert_eq!(tcb.unordered_packets.get(&SeqNum(1700)).unwrap().len(), 300); // the second packet remaining 300 bytes
-        assert_eq!(tcb.unordered_packets.get(&SeqNum(2000)).unwrap().len(), 500); // the third packet unchanged
+        // test 1: consume contiguous packets
+        tcb.consume_unordered_packets();
+        assert_eq!(tcb.ack, SeqNum(2500)); // ack increased by 1500
+        assert_eq!(tcb.unordered_packets.len(), 0); // all packets consumed
+        assert_eq!(tcb.ordered_packets.len(), 3); // three packets in ordered list
+        
+        // test 2: pop first ordered packet
+        let data = tcb.pop_ordered_packet().unwrap();
+        assert_eq!(data.len(), 500);
+        assert_eq!(data, vec![1; 500]);
+        assert_eq!(tcb.ordered_packets.len(), 2);
+        
+        // test 3: pop second ordered packet
+        let data = tcb.pop_ordered_packet().unwrap();
+        assert_eq!(data.len(), 500);
+        assert_eq!(data, vec![2; 500]);
+        assert_eq!(tcb.ordered_packets.len(), 1);
+        
+        // test 4: pop third ordered packet
+        let data = tcb.pop_ordered_packet().unwrap();
+        assert_eq!(data.len(), 500);
+        assert_eq!(data, vec![3; 500]);
+        assert_eq!(tcb.ordered_packets.len(), 0);
 
-        // test 2: extract up to 800 bytes
-        let data = tcb.consume_unordered_packets(800).unwrap();
-        assert_eq!(data.len(), 800); // extract 300 bytes of the second packet and the third packet
-        assert_eq!(data[..300], vec![2; 300]); // the remaining 300 bytes of the second packet
-        assert_eq!(data[300..800], vec![3; 500]); // the third packet
-        assert_eq!(tcb.ack, SeqNum(2500)); // ack increased by 800
-        assert_eq!(tcb.unordered_packets.len(), 0); // no remaining packets
-
-        // test 3: no data to extract
-        let data = tcb.consume_unordered_packets(1000);
+        // test 5: no more data to extract
+        let data = tcb.pop_ordered_packet();
         assert!(data.is_none());
     }
 
