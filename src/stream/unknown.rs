@@ -5,6 +5,30 @@ use crate::{
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header};
 use std::net::IpAddr;
 
+/// A stream for unknown transport layer protocols.
+///
+/// This type handles network packets with transport protocols that are not TCP or UDP
+/// (e.g., ICMP, IGMP, ESP, etc.). It provides methods to inspect the packet details
+/// and send responses.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ipstack::{IpStack, IpStackConfig, IpStackStream};
+///
+/// # async fn example(mut ip_stack: IpStack) -> Result<(), Box<dyn std::error::Error>> {
+/// if let IpStackStream::UnknownTransport(unknown) = ip_stack.accept().await? {
+///     println!("Unknown transport protocol: {:?}", unknown.ip_protocol());
+///     println!("Source: {}", unknown.src_addr());
+///     println!("Destination: {}", unknown.dst_addr());
+///     println!("Payload: {} bytes", unknown.payload().len());
+///     
+///     // Send a response
+///     unknown.send(vec![0x08, 0x00, 0x00, 0x00])?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct IpStackUnknownTransport {
     src_addr: IpAddr,
     dst_addr: IpAddr,
@@ -29,18 +53,90 @@ impl IpStackUnknownTransport {
             packet_sender,
         }
     }
+
+    /// Returns the source IP address of the packet.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::IpStackUnknownTransport;
+    /// # fn example(unknown: &IpStackUnknownTransport) {
+    /// let src = unknown.src_addr();
+    /// println!("Source: {}", src);
+    /// # }
+    /// ```
     pub fn src_addr(&self) -> IpAddr {
         self.src_addr
     }
+
+    /// Returns the destination IP address of the packet.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::IpStackUnknownTransport;
+    /// # fn example(unknown: &IpStackUnknownTransport) {
+    /// let dst = unknown.dst_addr();
+    /// println!("Destination: {}", dst);
+    /// # }
+    /// ```
     pub fn dst_addr(&self) -> IpAddr {
         self.dst_addr
     }
+
+    /// Returns the payload of the packet.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::IpStackUnknownTransport;
+    /// # fn example(unknown: &IpStackUnknownTransport) {
+    /// let payload = unknown.payload();
+    /// println!("Payload: {} bytes", payload.len());
+    /// # }
+    /// ```
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
+
+    /// Returns the IP protocol number of the packet.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::IpStackUnknownTransport;
+    /// # fn example(unknown: &IpStackUnknownTransport) {
+    /// let protocol = unknown.ip_protocol();
+    /// println!("Protocol: {:?}", protocol);
+    /// # }
+    /// ```
     pub fn ip_protocol(&self) -> IpNumber {
         self.protocol
     }
+
+    /// Send a response packet.
+    ///
+    /// This method sends one or more packets with the given payload, automatically
+    /// fragmenting the data if it exceeds the MTU.
+    ///
+    /// # Arguments
+    ///
+    /// * `payload` - The payload to send
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the packet cannot be sent.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::IpStackUnknownTransport;
+    /// # fn example(unknown: &IpStackUnknownTransport) -> std::io::Result<()> {
+    /// // Send an ICMP echo reply
+    /// unknown.send(vec![0x08, 0x00, 0x00, 0x00])?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn send(&self, mut payload: Vec<u8>) -> std::io::Result<()> {
         loop {
             let packet = self.create_rev_packet(&mut payload)?;
@@ -53,6 +149,24 @@ impl IpStackUnknownTransport {
         }
     }
 
+    /// Create a reverse packet for sending a response.
+    ///
+    /// This method creates a packet with swapped source and destination addresses,
+    /// suitable for sending responses to received packets. If the payload exceeds
+    /// the MTU, only a portion of the payload is consumed and included in the packet.
+    ///
+    /// # Arguments
+    ///
+    /// * `payload` - A mutable reference to the payload vector. If the payload exceeds
+    ///   the MTU, data is drained from the front. Otherwise, the entire vector is taken.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `NetworkPacket` with the reversed addresses and up to MTU bytes of payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the packet cannot be constructed.
     pub fn create_rev_packet(&self, payload: &mut Vec<u8>) -> std::io::Result<NetworkPacket> {
         match (self.dst_addr, self.src_addr) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {

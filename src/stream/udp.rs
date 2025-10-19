@@ -10,6 +10,32 @@ use tokio::{
     time::Sleep,
 };
 
+/// A UDP stream in the IP stack.
+///
+/// This type represents a UDP connection and implements `AsyncRead` and `AsyncWrite`
+/// for bidirectional data transfer. UDP streams have a configurable timeout and
+/// automatically handle packet fragmentation based on MTU.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ipstack::{IpStack, IpStackConfig, IpStackStream};
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// # async fn example(mut ip_stack: IpStack) -> Result<(), Box<dyn std::error::Error>> {
+/// if let IpStackStream::Udp(mut udp_stream) = ip_stack.accept().await? {
+///     println!("New UDP stream from {}", udp_stream.peer_addr());
+///     
+///     // Read data
+///     let mut buffer = [0u8; 1024];
+///     let n = udp_stream.read(&mut buffer).await?;
+///     
+///     // Write data
+///     udp_stream.write_all(b"Response").await?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
@@ -97,10 +123,32 @@ impl IpStackUdpStream {
         }
     }
 
+    /// Returns the local socket address of the UDP stream.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::IpStackUdpStream;
+    /// # fn example(udp_stream: &IpStackUdpStream) {
+    /// let local_addr = udp_stream.local_addr();
+    /// println!("Local address: {}", local_addr);
+    /// # }
+    /// ```
     pub fn local_addr(&self) -> SocketAddr {
         self.src_addr
     }
 
+    /// Returns the remote socket address of the UDP stream.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::IpStackUdpStream;
+    /// # fn example(udp_stream: &IpStackUdpStream) {
+    /// let peer_addr = udp_stream.peer_addr();
+    /// println!("Peer address: {}", peer_addr);
+    /// # }
+    /// ```
     pub fn peer_addr(&self) -> SocketAddr {
         self.dst_addr
     }

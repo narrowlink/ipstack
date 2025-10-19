@@ -11,14 +11,43 @@ mod tcp;
 mod udp;
 mod unknown;
 
+/// A network stream accepted by the IP stack.
+///
+/// This enum represents different types of network streams that can be accepted from the TUN device.
+/// Each variant provides appropriate abstractions for handling specific protocol types.
+///
+/// # Variants
+///
+/// * `Tcp` - A TCP connection stream implementing `AsyncRead` + `AsyncWrite`
+/// * `Udp` - A UDP stream implementing `AsyncRead` + `AsyncWrite`
+/// * `UnknownTransport` - A stream for unknown transport layer protocols (e.g., ICMP, IGMP)
+/// * `UnknownNetwork` - Raw network layer packets that couldn't be parsed
 pub enum IpStackStream {
+    /// A TCP connection stream.
     Tcp(IpStackTcpStream),
+    /// A UDP stream.
     Udp(IpStackUdpStream),
+    /// A stream for unknown transport protocols.
     UnknownTransport(IpStackUnknownTransport),
+    /// Raw network packets that couldn't be parsed.
     UnknownNetwork(Vec<u8>),
 }
 
 impl IpStackStream {
+    /// Returns the local socket address for this stream.
+    ///
+    /// For TCP and UDP streams, this returns the source address of the connection.
+    /// For unknown transport and network streams, this returns an unspecified address.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::{IpStack, IpStackStream};
+    /// # async fn example(stream: IpStackStream) {
+    /// let local_addr = stream.local_addr();
+    /// println!("Local address: {}", local_addr);
+    /// # }
+    /// ```
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             IpStackStream::Tcp(tcp) => tcp.local_addr(),
@@ -30,6 +59,21 @@ impl IpStackStream {
             },
         }
     }
+
+    /// Returns the remote socket address for this stream.
+    ///
+    /// For TCP and UDP streams, this returns the destination address of the connection.
+    /// For unknown transport and network streams, this returns an unspecified address.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::{IpStack, IpStackStream};
+    /// # async fn example(stream: IpStackStream) {
+    /// let peer_addr = stream.peer_addr();
+    /// println!("Peer address: {}", peer_addr);
+    /// # }
+    /// ```
     pub fn peer_addr(&self) -> SocketAddr {
         match self {
             IpStackStream::Tcp(tcp) => tcp.peer_addr(),
@@ -42,7 +86,7 @@ impl IpStackStream {
         }
     }
 
-    pub fn stream_sender(&self) -> Result<crate::PacketSender, std::io::Error> {
+    pub(crate) fn stream_sender(&self) -> Result<crate::PacketSender, std::io::Error> {
         match self {
             IpStackStream::Tcp(tcp) => Ok(tcp.stream_sender()),
             IpStackStream::Udp(udp) => Ok(udp.stream_sender()),

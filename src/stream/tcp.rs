@@ -109,6 +109,35 @@ static SESSION_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 
 type TcbPtr = std::sync::Arc<std::sync::Mutex<Tcb>>;
 
+/// A TCP stream in the IP stack.
+///
+/// This type represents a TCP connection and implements `AsyncRead` and `AsyncWrite`
+/// for bidirectional data transfer. It handles TCP state management, flow control,
+/// and retransmission automatically.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ipstack::{IpStack, IpStackConfig, IpStackStream};
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// # async fn example(mut ip_stack: IpStack) -> Result<(), Box<dyn std::error::Error>> {
+/// if let IpStackStream::Tcp(mut tcp_stream) = ip_stack.accept().await? {
+///     println!("New TCP connection from {}", tcp_stream.peer_addr());
+///     
+///     // Read data
+///     let mut buffer = [0u8; 1024];
+///     let n = tcp_stream.read(&mut buffer).await?;
+///     
+///     // Write data
+///     tcp_stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
+///     
+///     // Shutdown the stream
+///     tcp_stream.shutdown().await?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct IpStackTcpStream {
     src_addr: SocketAddr,
@@ -194,12 +223,36 @@ impl IpStackTcpStream {
         NetworkTuple::new(self.src_addr, self.dst_addr, true)
     }
 
+    /// Returns the local socket address of the TCP connection.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::IpStackTcpStream;
+    /// # fn example(tcp_stream: &IpStackTcpStream) {
+    /// let local_addr = tcp_stream.local_addr();
+    /// println!("Local address: {}", local_addr);
+    /// # }
+    /// ```
     pub fn local_addr(&self) -> SocketAddr {
         self.src_addr
     }
+
+    /// Returns the remote socket address of the TCP connection.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ipstack::IpStackTcpStream;
+    /// # fn example(tcp_stream: &IpStackTcpStream) {
+    /// let peer_addr = tcp_stream.peer_addr();
+    /// println!("Peer address: {}", peer_addr);
+    /// # }
+    /// ```
     pub fn peer_addr(&self) -> SocketAddr {
         self.dst_addr
     }
+
     pub fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }

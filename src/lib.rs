@@ -42,11 +42,34 @@ const TUN_PROTO_IP6: [u8; 2] = [0x00, 0x0A];
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 
+/// Configuration for the IP stack.
+///
+/// This structure holds configuration parameters that control the behavior of the IP stack,
+/// including network settings and protocol-specific timeouts.
+///
+/// # Examples
+///
+/// ```
+/// use ipstack::IpStackConfig;
+/// use std::time::Duration;
+///
+/// let mut config = IpStackConfig::default();
+/// config.mtu(1500)
+///       .udp_timeout(Duration::from_secs(60))
+///       .packet_information(false);
+/// ```
 #[non_exhaustive]
 pub struct IpStackConfig {
+    /// Maximum Transmission Unit (MTU) size in bytes.
+    /// Default is `u16::MAX` (65535).
     pub mtu: u16,
+    /// Whether to include packet information headers (Unix platforms only).
+    /// Default is `false`.
     pub packet_information: bool,
+    /// TCP-specific configuration parameters.
     pub tcp_config: Arc<TcpConfig>,
+    /// Timeout for UDP connections.
+    /// Default is 30 seconds.
     pub udp_timeout: Duration,
 }
 
@@ -62,31 +85,157 @@ impl Default for IpStackConfig {
 }
 
 impl IpStackConfig {
-    /// Set custom TCP configuration
+    /// Set custom TCP configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The TCP configuration to use
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ipstack::{IpStackConfig, TcpConfig};
+    ///
+    /// let mut config = IpStackConfig::default();
+    /// config.with_tcp_config(TcpConfig::default());
+    /// ```
     pub fn with_tcp_config(&mut self, config: TcpConfig) -> &mut Self {
         self.tcp_config = Arc::new(config);
         self
     }
+
+    /// Set the UDP connection timeout.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - The timeout duration for UDP connections
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ipstack::IpStackConfig;
+    /// use std::time::Duration;
+    ///
+    /// let mut config = IpStackConfig::default();
+    /// config.udp_timeout(Duration::from_secs(60));
+    /// ```
     pub fn udp_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.udp_timeout = timeout;
         self
     }
+
+    /// Set the Maximum Transmission Unit (MTU) size.
+    ///
+    /// # Arguments
+    ///
+    /// * `mtu` - The MTU size in bytes
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ipstack::IpStackConfig;
+    ///
+    /// let mut config = IpStackConfig::default();
+    /// config.mtu(1500);
+    /// ```
     pub fn mtu(&mut self, mtu: u16) -> &mut Self {
         self.mtu = mtu;
         self
     }
+
+    /// Enable or disable packet information headers (Unix platforms only).
+    ///
+    /// When enabled on Unix platforms, the TUN device will include 4-byte packet
+    /// information headers.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet_information` - Whether to include packet information headers
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ipstack::IpStackConfig;
+    ///
+    /// let mut config = IpStackConfig::default();
+    /// config.packet_information(true);
+    /// ```
     pub fn packet_information(&mut self, packet_information: bool) -> &mut Self {
         self.packet_information = packet_information;
         self
     }
 }
 
+/// The main IP stack instance.
+///
+/// `IpStack` provides a userspace TCP/IP stack implementation for TUN devices.
+/// It processes network packets and creates stream abstractions for TCP, UDP, and
+/// unknown transport protocols.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ipstack::{IpStack, IpStackConfig, IpStackStream};
+/// use std::net::Ipv4Addr;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     // Configure TUN device
+///     let mut config = tun::Configuration::default();
+///     config
+///         .address(Ipv4Addr::new(10, 0, 0, 1))
+///         .netmask(Ipv4Addr::new(255, 255, 255, 0))
+///         .up();
+///
+///     // Create IP stack
+///     let ipstack_config = IpStackConfig::default();
+///     let mut ip_stack = IpStack::new(ipstack_config, tun::create_as_async(&config)?);
+///
+///     // Accept incoming streams
+///     while let Ok(stream) = ip_stack.accept().await {
+///         match stream {
+///             IpStackStream::Tcp(tcp) => {
+///                 // Handle TCP connection
+///             }
+///             IpStackStream::Udp(udp) => {
+///                 // Handle UDP connection
+///             }
+///             _ => {}
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
 pub struct IpStack {
     accept_receiver: UnboundedReceiver<IpStackStream>,
     handle: JoinHandle<Result<()>>,
 }
 
 impl IpStack {
+    /// Create a new IP stack instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration for the IP stack
+    /// * `device` - An async TUN device implementing `AsyncRead` + `AsyncWrite`
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ipstack::{IpStack, IpStackConfig};
+    /// use std::net::Ipv4Addr;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut tun_config = tun::Configuration::default();
+    /// tun_config.address(Ipv4Addr::new(10, 0, 0, 1))
+    ///           .netmask(Ipv4Addr::new(255, 255, 255, 0))
+    ///           .up();
+    ///
+    /// let ipstack_config = IpStackConfig::default();
+    /// let ip_stack = IpStack::new(ipstack_config, tun::create_as_async(&tun_config)?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new<Device>(config: IpStackConfig, device: Device) -> IpStack
     where
         Device: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -98,6 +247,39 @@ impl IpStack {
         }
     }
 
+    /// Accept an incoming network stream.
+    ///
+    /// This method waits for and returns the next incoming network connection or packet.
+    /// The returned `IpStackStream` enum indicates the type of stream (TCP, UDP, or unknown).
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(IpStackStream)` - The next incoming stream
+    /// * `Err(IpStackError::AcceptError)` - If the IP stack has been shut down
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ipstack::{IpStack, IpStackConfig, IpStackStream};
+    ///
+    /// # async fn example(mut ip_stack: IpStack) -> Result<(), Box<dyn std::error::Error>> {
+    /// match ip_stack.accept().await? {
+    ///     IpStackStream::Tcp(tcp) => {
+    ///         println!("New TCP connection from {}", tcp.peer_addr());
+    ///     }
+    ///     IpStackStream::Udp(udp) => {
+    ///         println!("New UDP stream from {}", udp.peer_addr());
+    ///     }
+    ///     IpStackStream::UnknownTransport(unknown) => {
+    ///         println!("Unknown transport protocol: {:?}", unknown.ip_protocol());
+    ///     }
+    ///     IpStackStream::UnknownNetwork(data) => {
+    ///         println!("Unknown network packet: {} bytes", data.len());
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
         self.accept_receiver.recv().await.ok_or(IpStackError::AcceptError)
     }
