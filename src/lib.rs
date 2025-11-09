@@ -42,6 +42,10 @@ const TUN_PROTO_IP6: [u8; 2] = [0x00, 0x0A];
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 
+/// Minimum IP packet length (per RFC 8200 §5: IPv6 requires MTU ≥ 1280).
+/// Also satisfies IPv4 minimum (RFC 791 §3.1: 68 bytes).
+const MIN_IP_PACKET_LEN: u16 = 1280;
+
 /// Configuration for the IP stack.
 ///
 /// This structure holds configuration parameters that control the behavior of the IP stack,
@@ -300,7 +304,8 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (session_remove_tx, mut session_remove_rx) = mpsc::unbounded_channel::<NetworkTuple>();
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
-    let mut buffer = vec![0_u8; u16::MAX as usize + offset];
+    let mtu = usize::from(config.mtu.max(MIN_IP_PACKET_LEN));
+    let mut buffer = vec![0_u8; mtu + offset];
     let (up_pkt_sender, mut up_pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
     tokio::spawn(async move {
