@@ -42,9 +42,9 @@ const TUN_PROTO_IP6: [u8; 2] = [0x00, 0x0A];
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 
-/// Minimum IP packet length (per RFC 8200 §5: IPv6 requires MTU ≥ 1280).
-/// Also satisfies IPv4 minimum (RFC 791 §3.1: 68 bytes).
-const MIN_IP_PACKET_LEN: u16 = 1280;
+/// Minimum MTU required for IPv6 (per RFC 8200 §5: MTU ≥ 1280).
+/// Also satisfies IPv4 minimum MTU (RFC 791 §3.1: 68 bytes).
+const MIN_MTU: u16 = 1280;
 
 /// Configuration for the IP stack.
 ///
@@ -65,7 +65,7 @@ const MIN_IP_PACKET_LEN: u16 = 1280;
 #[non_exhaustive]
 pub struct IpStackConfig {
     /// Maximum Transmission Unit (MTU) size in bytes.
-    /// Default is `u16::MAX` (65535).
+    /// Default is `MIN_MTU` (1280).
     pub mtu: u16,
     /// Whether to include packet information headers (Unix platforms only).
     /// Default is `false`.
@@ -80,7 +80,7 @@ pub struct IpStackConfig {
 impl Default for IpStackConfig {
     fn default() -> Self {
         IpStackConfig {
-            mtu: u16::MAX,
+            mtu: MIN_MTU,
             packet_information: false,
             tcp_config: Arc::new(TcpConfig::default()),
             udp_timeout: Duration::from_secs(30),
@@ -304,9 +304,15 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (session_remove_tx, mut session_remove_rx) = mpsc::unbounded_channel::<NetworkTuple>();
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
-    let mtu = usize::from(config.mtu.max(MIN_IP_PACKET_LEN));
-    let mut buffer = vec![0_u8; mtu + offset];
+    let mut buffer = vec![0_u8; config.mtu as usize + offset];
     let (up_pkt_sender, mut up_pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
+
+    if config.mtu < MIN_MTU {
+        log::warn!(
+            "the MTU in the configuration ({}) below the MIN_MTU (1280) can cause problems.",
+            config.mtu
+        );
+    }
 
     tokio::spawn(async move {
         loop {
