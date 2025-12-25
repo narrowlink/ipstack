@@ -2,8 +2,11 @@ use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
 use std::collections::BTreeMap;
 
-const MAX_UNACK: u32 = 1024 * 16; // 16KB
-const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+// Increase the default in-flight and receive buffer sizes to support high-throughput links.
+// These were previously 16KB which can severely limit upload throughput (throughput ~= window / RTT).
+// Make them 1MiB by default so the stack can utilize higher bandwidth-delay products.
+const MAX_UNACK: u32 = 1024 * 1024; // 1MiB
+const READ_BUFFER_SIZE: usize = 1024 * 1024; // 1MiB
 const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 /// Retransmission timeout
