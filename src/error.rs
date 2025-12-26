@@ -34,6 +34,10 @@ pub enum IpStackError {
     /// Error sending data through a channel.
     #[error("Send Error {0}")]
     SendError(#[from] Box<tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>>),
+
+    /// Invalid MTU size. The minimum MTU is 1280 bytes to comply with IPv6 standards.
+    #[error("Invalid MTU size: {0} (bytes). Minimum MTU is 1280 bytes.")]
+    InvalidMtuSize(u16),
 }
 
 impl From<tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>> for IpStackError {

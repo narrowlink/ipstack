@@ -7,7 +7,7 @@ use crate::{
         tcp_flags::{ACK, FIN, PSH, RST, SYN},
         tcp_header_flags, tcp_header_fmt,
     },
-    stream::tcb::{PacketType, Tcb, TcpState},
+    stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, RTO, Tcb, TcpState},
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
 use std::{
@@ -43,6 +43,16 @@ pub struct TcpConfig {
     pub timeout: Duration,
     /// Timeout for the TIME_WAIT state. Default is 2 seconds.
     pub two_msl: Duration,
+    /// Maximum number of unacknowledged bytes allowed in the send buffer.
+    pub max_unacked_bytes: u32,
+    /// Size of the read buffer for incoming data.
+    pub read_buffer_size: usize,
+    /// Maximum number of duplicate ACKs before triggering fast retransmission.
+    pub max_count_for_dup_ack: usize,
+    /// Retransmission timeout duration.
+    pub rto: std::time::Duration,
+    /// Maximum number of retransmissions before giving up.
+    pub max_retransmit_count: usize,
     /// TCP options
     pub options: Option<Vec<TcpOptions>>,
 }
@@ -62,6 +72,11 @@ impl Default for TcpConfig {
             close_wait_timeout: CLOSE_WAIT_TIMEOUT,
             timeout: TIMEOUT,
             two_msl: TWO_MSL,
+            max_unacked_bytes: MAX_UNACK,
+            read_buffer_size: READ_BUFFER_SIZE,
+            max_count_for_dup_ack: MAX_COUNT_FOR_DUP_ACK,
+            rto: RTO,
+            max_retransmit_count: MAX_RETRANSMIT_COUNT,
             options: Default::default(),
         }
     }
@@ -169,7 +184,15 @@ impl IpStackTcpStream {
         destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
         config: Arc<TcpConfig>,
     ) -> Result<IpStackTcpStream, IpStackError> {
-        let tcb = Tcb::new(SeqNum(tcp.sequence_number), mtu);
+        let tcb = Tcb::new(
+            SeqNum(tcp.sequence_number),
+            mtu,
+            config.max_unacked_bytes,
+            config.read_buffer_size,
+            config.max_count_for_dup_ack,
+            config.rto,
+            config.max_retransmit_count,
+        );
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
             if !tcp.rst

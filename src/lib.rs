@@ -58,7 +58,7 @@ const MIN_MTU: u16 = 1280;
 /// use std::time::Duration;
 ///
 /// let mut config = IpStackConfig::default();
-/// config.mtu(1500)
+/// config.mtu(1500).expect("Failed to set MTU")
 ///       .udp_timeout(Duration::from_secs(60))
 ///       .packet_information(false);
 /// ```
@@ -140,9 +140,18 @@ impl IpStackConfig {
     /// use ipstack::IpStackConfig;
     ///
     /// let mut config = IpStackConfig::default();
-    /// config.mtu(1500);
+    /// config.mtu(1500).expect("Failed to set MTU");
     /// ```
-    pub fn mtu(&mut self, mtu: u16) -> &mut Self {
+    pub fn mtu(&mut self, mtu: u16) -> Result<&mut Self, IpStackError> {
+        if mtu < MIN_MTU {
+            return Err(IpStackError::InvalidMtuSize(mtu));
+        }
+        self.mtu = mtu;
+        Ok(self)
+    }
+
+    /// Set the Maximum Transmission Unit (MTU) size without validation.
+    pub fn mtu_unchecked(&mut self, mtu: u16) -> &mut Self {
         self.mtu = mtu;
         self
     }
@@ -306,13 +315,6 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
     let mut buffer = vec![0_u8; config.mtu as usize + offset];
     let (up_pkt_sender, mut up_pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
-
-    if config.mtu < MIN_MTU {
-        log::warn!(
-            "the MTU in the configuration ({}) below the MIN_MTU (1280) can cause problems.",
-            config.mtu
-        );
-    }
 
     tokio::spawn(async move {
         loop {

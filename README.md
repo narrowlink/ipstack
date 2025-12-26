@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
-    ipstack_config.mtu(MTU);
+    ipstack_config.mtu(MTU)?;
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, tun::create_as_async(&config)?);
 
     while let Ok(stream) = ip_stack.accept().await {

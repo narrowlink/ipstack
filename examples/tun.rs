@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
-    ipstack_config.mtu(MTU);
+    ipstack_config.mtu(MTU)?;
     let mut tcp_config = ipstack::TcpConfig::default();
     tcp_config.timeout = std::time::Duration::from_secs(args.tcp_timeout);
     tcp_config.options = Some(vec![ipstack::TcpOptions::MaximumSegmentSize(1460)]);
