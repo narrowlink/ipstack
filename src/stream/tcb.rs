@@ -1,16 +1,16 @@
 use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
-const MAX_UNACK: u32 = 1024 * 16; // 16KB
-const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
-const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
+pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
+pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 /// Retransmission timeout
-const RTO: std::time::Duration = std::time::Duration::from_secs(1);
+pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Maximum count of retransmissions before dropping the packet
-pub(crate) const MAX_RETRANSMIT_COUNT: usize = 3;
+pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
@@ -55,10 +55,23 @@ pub(crate) struct Tcb {
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
+    max_unacked_bytes: u32,
+    read_buffer_size: usize,
+    max_count_for_dup_ack: usize,
+    rto: std::time::Duration,
+    max_retransmit_count: usize,
 }
 
 impl Tcb {
-    pub(super) fn new(ack: SeqNum, mtu: u16) -> Tcb {
+    pub(super) fn new(
+        ack: SeqNum,
+        mtu: u16,
+        max_unacked_bytes: u32,
+        read_buffer_size: usize,
+        max_count_for_dup_ack: usize,
+        rto: std::time::Duration,
+        max_retransmit_count: usize,
+    ) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
@@ -74,6 +87,11 @@ impl Tcb {
             unordered_packets: BTreeMap::new(),
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
+            max_unacked_bytes,
+            read_buffer_size,
+            max_count_for_dup_ack,
+            rto,
+            max_retransmit_count,
         }
     }
 
@@ -94,7 +112,7 @@ impl Tcb {
     }
 
     pub fn is_duplicate_ack_count_exceeded(&self) -> bool {
-        self.duplicate_ack_count >= MAX_COUNT_FOR_DUP_ACK
+        self.duplicate_ack_count >= self.max_count_for_dup_ack
     }
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
@@ -106,7 +124,7 @@ impl Tcb {
         self.unordered_packets.insert(seq, buf);
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        READ_BUFFER_SIZE.saturating_sub(self.get_unordered_packets_total_len())
+        self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
     }
     #[inline]
     pub(crate) fn get_unordered_packets_total_len(&self) -> usize {
@@ -234,7 +252,7 @@ impl Tcb {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty payload"));
         }
         let buf_len = buf.len() as u32;
-        self.inflight_packets.insert(self.seq, InflightPacket::new(self.seq, buf));
+        self.inflight_packets.insert(self.seq, InflightPacket::new(self.seq, buf, self.rto));
         self.seq += buf_len;
         Ok(())
     }
@@ -275,7 +293,7 @@ impl Tcb {
         let mut retransmit_list = Vec::new();
 
         self.inflight_packets.retain(|_, packet| {
-            if packet.retransmit_count >= MAX_RETRANSMIT_COUNT {
+            if packet.retransmit_count >= self.max_retransmit_count {
                 log::warn!("Packet with seq {:?} reached max retransmit count, dropping packet", packet.seq);
                 return false; // remove this packet
             }
@@ -302,7 +320,7 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
         // Simplified version: min(cwnd, rwnd)
-        self.seq.distance(self.get_last_received_ack()) >= MAX_UNACK.min(self.get_send_window() as u32)
+        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window() as u32)
     }
 }
 
@@ -316,13 +334,13 @@ pub struct InflightPacket {
 }
 
 impl InflightPacket {
-    fn new(seq: SeqNum, payload: Vec<u8>) -> Self {
+    fn new(seq: SeqNum, payload: Vec<u8>, rto: Duration) -> Self {
         Self {
             seq,
             payload,
             send_time: std::time::Instant::now(),
             retransmit_count: 0,
-            retransmit_timeout: RTO,
+            retransmit_timeout: rto,
         }
     }
     pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
@@ -339,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_in_flight_packet() {
-        let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50]);
+        let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50], RTO);
 
         assert!(p.contains_seq_num((u32::MAX - 1).into()));
         assert!(p.contains_seq_num(u32::MAX.into()));
@@ -352,7 +370,15 @@ mod tests {
 
     #[test]
     fn test_get_unordered_packets_with_max_bytes() {
-        let mut tcb = Tcb::new(SeqNum(1000), 1500);
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
 
         // insert 3 consecutive packets
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]); // seq=1000, len=500
@@ -384,7 +410,15 @@ mod tests {
 
     #[test]
     fn test_update_inflight_packet_queue() {
-        let mut tcb = Tcb::new(SeqNum(1000), 1500);
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
         tcb.seq = SeqNum(100); // setting the initial seq
 
         // insert 3 consecutive packets
@@ -408,7 +442,15 @@ mod tests {
 
     #[test]
     fn test_update_inflight_packet_queue_cumulative_ack() {
-        let mut tcb = Tcb::new(SeqNum(1000), 1500);
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
         tcb.seq = SeqNum(1000);
 
         // Insert 3 consecutive packets
@@ -423,7 +465,15 @@ mod tests {
 
     #[test]
     fn test_retransmit_with_exponential_backoff() {
-        let mut tcb = Tcb::new(SeqNum(1000), 1500);
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
