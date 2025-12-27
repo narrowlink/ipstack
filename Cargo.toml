@@ -26,7 +26,7 @@ tokio = { version = "1.48", default-features = false, features = [
 
 [dev-dependencies]
 clap = { version = "4.5", default-features = false, features = ["derive"] }
-criterion = { version = "0.7" } # Benchmarks
+criterion = { version = "0.8" } # Benchmarks
 dotenvy = "0.15"
 env_logger = "0.11"
 tokio = { version = "1.48", default-features = false, features = [
