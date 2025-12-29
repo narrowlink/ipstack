@@ -96,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tcp_config = ipstack::TcpConfig::default();
     tcp_config.timeout = std::time::Duration::from_secs(args.tcp_timeout);
     tcp_config.options = Some(vec![ipstack::TcpOptions::MaximumSegmentSize(1460)]);
+    tcp_config.max_unacked_bytes = 256 * 1024;
     ipstack_config.with_tcp_config(tcp_config);
     ipstack_config.udp_timeout(std::time::Duration::from_secs(args.udp_timeout));
 
