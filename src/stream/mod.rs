@@ -4,7 +4,7 @@ pub use self::tcp::IpStackTcpStream;
 pub use self::tcp::{TcpConfig, TcpOptions};
 pub use self::udp::IpStackUdpStream;
 pub use self::unknown::IpStackUnknownTransport;
-
+pub use self::udp::IpStackUdpPacketEndpoint;
 mod seqnum;
 mod tcb;
 mod tcp;
@@ -27,6 +27,8 @@ pub enum IpStackStream {
     Tcp(IpStackTcpStream),
     /// A UDP stream.
     Udp(IpStackUdpStream),
+    /// UDP PACKET. 
+    UdpEdp(IpStackUdpPacketEndpoint),
     /// A stream for unknown transport protocols.
     UnknownTransport(IpStackUnknownTransport),
     /// Raw network packets that couldn't be parsed.
@@ -52,6 +54,7 @@ impl IpStackStream {
         match self {
             IpStackStream::Tcp(tcp) => tcp.local_addr(),
             IpStackStream::Udp(udp) => udp.local_addr(),
+            IpStackStream::UdpEdp(udp_edp) => udp_edp.local_addr(),
             IpStackStream::UnknownNetwork(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             IpStackStream::UnknownTransport(unknown) => match unknown.src_addr() {
                 IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, 0)),
@@ -78,6 +81,7 @@ impl IpStackStream {
         match self {
             IpStackStream::Tcp(tcp) => tcp.peer_addr(),
             IpStackStream::Udp(udp) => udp.peer_addr(),
+            IpStackStream::UdpEdp(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             IpStackStream::UnknownNetwork(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             IpStackStream::UnknownTransport(unknown) => match unknown.dst_addr() {
                 IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, 0)),
