@@ -2,9 +2,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 pub use self::tcp::IpStackTcpStream;
 pub use self::tcp::{TcpConfig, TcpOptions};
+pub use self::udp::IpStackUdpPacketEndpoint;
 pub use self::udp::IpStackUdpStream;
 pub use self::unknown::IpStackUnknownTransport;
-pub use self::udp::IpStackUdpPacketEndpoint;
 mod seqnum;
 mod tcb;
 mod tcp;
@@ -27,7 +27,7 @@ pub enum IpStackStream {
     Tcp(IpStackTcpStream),
     /// A UDP stream.
     Udp(IpStackUdpStream),
-    /// UDP PACKET. 
+    /// UDP PACKET.
     UdpEdp(IpStackUdpPacketEndpoint),
     /// A stream for unknown transport protocols.
     UnknownTransport(IpStackUnknownTransport),

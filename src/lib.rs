@@ -2,6 +2,7 @@
 
 use ahash::AHashMap;
 use packet::{NetworkPacket, NetworkTuple, TransportHeader};
+use std::net::SocketAddr;
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -9,7 +10,6 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
 };
-use std::net::SocketAddr;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,10 +23,9 @@ mod packet;
 mod stream;
 
 pub use self::error::{IpStackError, Result};
-pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport, IpStackUdpPacketEndpoint};
+pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpPacketEndpoint, IpStackUdpStream, IpStackUnknownTransport};
 pub use self::stream::{TcpConfig, TcpOptions};
-pub use etherparse::IpNumber;   
-
+pub use etherparse::IpNumber;
 
 #[cfg(unix)]
 const TTL: u8 = 64;
@@ -325,10 +324,8 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 ) -> JoinHandle<Result<()>> {
     let mut sessions: SessionCollection = AHashMap::new();
     //UDPendpoints
-    let mut packet_endpoints: AHashMap<
-        SocketAddr, 
-        (mpsc::UnboundedSender<(SocketAddr, SocketAddr, Vec<u8>)>, Arc<AtomicU64>)
-    > = AHashMap::new();
+    let mut packet_endpoints: AHashMap<SocketAddr, (mpsc::UnboundedSender<(SocketAddr, SocketAddr, Vec<u8>)>, Arc<AtomicU64>)> =
+        AHashMap::new();
     let (session_remove_tx, mut session_remove_rx) = mpsc::unbounded_channel::<NetworkTuple>();
     //udp endpoints rm channel
     let (edp_remove_tx, mut edp_remove_rx) = mpsc::unbounded_channel::<SocketAddr>();
@@ -396,16 +393,14 @@ async fn process_device_read(
         return Ok(());
     }
 
-    
-        //UDP packet
+    //UDP packet
     if let TransportHeader::Udp(_udp_header) = packet.transport_header() {
         if config.udp_packet_mode {
-            let src_addr = packet.src_addr(); 
-            let dst_addr = packet.dst_addr(); 
+            let src_addr = packet.src_addr();
+            let dst_addr = packet.dst_addr();
             let payload = packet.payload.unwrap_or_default();
 
             match packet_endpoints.entry(src_addr) {
-                
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let (tx, last_activity) = entry.get();
                     last_activity.store(now_secs(), Ordering::Relaxed);
@@ -414,31 +409,26 @@ async fn process_device_read(
                         log::warn!("Failed to send to packet endpoint: {}", e);
                     }
                 }
-                
 
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                     
                     //announce to destroy the channel when timeout or application layer take out
                     let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel::<()>();
-         
-                  
+
                     let last_activity = Arc::new(AtomicU64::new(now_secs()));
                     let last_activity_clone = last_activity.clone();
-                    
-                    let timeout_secs = config.udp_timeout.as_secs(); 
-                    
+
+                    let timeout_secs = config.udp_timeout.as_secs();
+
                     let edp_remove_tx_clone = edp_remove_tx.clone();
                     let src_addr_clone = src_addr;
 
-                   
                     tokio::spawn(async move {
                         loop {
                             let elapsed = now_secs() - last_activity_clone.load(Ordering::Relaxed);
                             if elapsed >= timeout_secs {
                                 log::info!("remove the channel of {} because not data in {} ", src_addr_clone, elapsed);
-                                break; 
+                                break;
                             }
-                            
 
                             let sleep_duration = std::time::Duration::from_secs(timeout_secs - elapsed);
 
@@ -446,7 +436,7 @@ async fn process_device_read(
 
                                  //sleep until timeout
                                 _ = tokio::time::sleep(sleep_duration) => {}
-                                
+
                                 // application layer take out
                                 _ = &mut destroy_rx => {
                                     log::debug!("application layer Endpoint:{} removed the channel", src_addr_clone);
@@ -454,24 +444,21 @@ async fn process_device_read(
                                 }
                             }
                         }
-                        
-                        
+
                         let _ = edp_remove_tx_clone.send(src_addr_clone);
                     });
                     //ipstack to application layer channel
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                    
-                    let endpoint = IpStackUdpPacketEndpoint::new(
-                        rx, up_pkt_sender.clone(), src_addr, config.mtu, destroy_tx
-                    );
-                    
+
+                    let endpoint = IpStackUdpPacketEndpoint::new(rx, up_pkt_sender.clone(), src_addr, config.mtu, destroy_tx);
+
                     accept_sender.send(IpStackStream::UdpEdp(endpoint)).unwrap();
-                    
+
                     entry.insert((tx.clone(), last_activity));
                     tx.send((src_addr, dst_addr, payload)).unwrap();
                 }
             }
-            return Ok(()); 
+            return Ok(());
         }
     }
 
@@ -546,7 +533,6 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
 
     Ok(())
 }
-
 
 //time
 fn now_secs() -> u64 {

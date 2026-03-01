@@ -171,12 +171,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             res = endpoint.recv() => {
                                 match res {
                                     Some((_src_addr, _dst_addr, _payload)) => {
-                                        
+
 
                                     }
                                     None => {
                                         log::info!("#{number2} UDP Packet Endpoint 底层通道已关闭");
-                                        break; 
+                                        break;
                                     }
                                 }
                             }
@@ -184,15 +184,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             //     match res {
                             //         Ok(Some((remote_player_addr, my_local_addr, payload))) => {
                             //             log::trace!("#{number2} [down] {} -> {} ({} bytes)", remote_player_addr, my_local_addr, payload.len());
-                                        
-                            //             
+
+                            //
                             //             if let Err(e) = endpoint.send(remote_player_addr, my_local_addr, payload) {
                             //                 log::warn!("#{number2} faild to send packet: {}", e);
                             //             }
                             //         }
                             //         Ok(None) | Err(_) => {
-                            //  
-                            //             break; 
+                            //
+                            //             break;
                             //         }
                             //     }
                             // }
