@@ -543,5 +543,8 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
 
 //time
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
 }
