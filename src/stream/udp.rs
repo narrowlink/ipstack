@@ -79,7 +79,6 @@ impl IpStackUdpStream {
     pub(crate) fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
-
     fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> std::io::Result<NetworkPacket> {
         const UHS: usize = 8; // udp header size is 8
         match (self.dst_addr.ip(), self.src_addr.ip()) {
@@ -213,7 +212,7 @@ impl Drop for IpStackUdpStream {
         }
     }
 }
-
+#[cfg(feature = "udp_packet")]
 pub struct IpStackUdpPacketEndpoint {
     //receive from TUN: (src, dst, payload)
     receiver: mpsc::UnboundedReceiver<(SocketAddr, SocketAddr, Vec<u8>)>,
@@ -227,7 +226,7 @@ pub struct IpStackUdpPacketEndpoint {
 
     _destroy_messenger: tokio::sync::oneshot::Sender<()>,
 }
-
+#[cfg(feature = "udp_packet")]
 impl IpStackUdpPacketEndpoint {
     pub fn new(
         receiver: mpsc::UnboundedReceiver<(SocketAddr, SocketAddr, Vec<u8>)>,
@@ -263,7 +262,7 @@ impl IpStackUdpPacketEndpoint {
         self.local_addr
     }
 }
-
+#[cfg(feature = "udp_packet")]
 pub fn build_raw_udp_packet(src_addr: SocketAddr, dst_addr: SocketAddr, mut payload: Vec<u8>, mtu: u16) -> std::io::Result<NetworkPacket> {
     const UHS: usize = 8;
     let ttl = 64;

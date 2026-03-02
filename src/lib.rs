@@ -2,7 +2,7 @@
 
 use ahash::AHashMap;
 use packet::{NetworkPacket, NetworkTuple, TransportHeader};
-use std::net::SocketAddr;
+
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -10,9 +10,6 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
 };
-
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) type PacketSender = UnboundedSender<NetworkPacket>;
 pub(crate) type PacketReceiver = UnboundedReceiver<NetworkPacket>;
@@ -23,9 +20,18 @@ mod packet;
 mod stream;
 
 pub use self::error::{IpStackError, Result};
-pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpPacketEndpoint, IpStackUdpStream, IpStackUnknownTransport};
+pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 pub use self::stream::{TcpConfig, TcpOptions};
 pub use etherparse::IpNumber;
+
+#[cfg(feature = "udp_packet")]
+pub use self::stream::IpStackUdpPacketEndpoint;
+#[cfg(feature = "udp_packet")]
+use std::net::SocketAddr;
+#[cfg(feature = "udp_packet")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "udp_packet")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 const TTL: u8 = 64;
@@ -79,11 +85,6 @@ pub struct IpStackConfig {
     /// Timeout for UDP connections.
     /// Default is 30 seconds.
     pub udp_timeout: Duration,
-
-    /// When enabled, UDP datagrams are accepted as packet endpoints
-    /// (`IpStackUdpPacketEndpoint`) instead of `IpStackUdpStream` connections.
-    /// Default is `false`.
-    pub udp_packet_mode: bool,
 }
 
 impl Default for IpStackConfig {
@@ -93,7 +94,6 @@ impl Default for IpStackConfig {
             packet_information: false,
             tcp_config: Arc::new(TcpConfig::default()),
             udp_timeout: Duration::from_secs(30),
-            udp_packet_mode: false,
         }
     }
 }
@@ -185,12 +185,6 @@ impl IpStackConfig {
     /// ```
     pub fn packet_information(&mut self, packet_information: bool) -> &mut Self {
         self.packet_information = packet_information;
-        self
-    }
-
-    /// Enable or disable UDP packet mode.
-    pub fn udp_packet_mode(&mut self, udp_packet_mode: bool) -> &mut Self {
-        self.udp_packet_mode = udp_packet_mode;
         self
     }
 }
@@ -327,21 +321,23 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 ) -> JoinHandle<Result<()>> {
     let mut sessions: SessionCollection = AHashMap::new();
     //UDPendpoints
+    #[cfg(feature = "udp_packet")]
     let mut packet_endpoints: AHashMap<SocketAddr, (mpsc::UnboundedSender<(SocketAddr, SocketAddr, Vec<u8>)>, Arc<AtomicU64>)> =
         AHashMap::new();
     let (session_remove_tx, mut session_remove_rx) = mpsc::unbounded_channel::<NetworkTuple>();
     //udp endpoints rm channel
+    #[cfg(feature = "udp_packet")]
     let (edp_remove_tx, mut edp_remove_rx) = mpsc::unbounded_channel::<SocketAddr>();
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
     let mut buffer = vec![0_u8; config.mtu as usize + offset];
     let (up_pkt_sender, mut up_pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
-
-    tokio::spawn(async move {
+    #[cfg(feature = "udp_packet")]
+    return tokio::spawn(async move {
         loop {
             select! {
                 Ok(n) = device.read(&mut buffer) => {
-                    if let Err(e) = process_device_read(&buffer[offset..n], &mut sessions, &session_remove_tx,&edp_remove_tx, &up_pkt_sender, &config, &accept_sender, &mut packet_endpoints).await {
+                    if let Err(e) = process_device_read(&buffer[offset..n], &mut sessions, &session_remove_tx, &edp_remove_tx, &up_pkt_sender, &config, &accept_sender, &mut packet_endpoints).await {
                         let io_err: std::io::Error = e.into();
                         if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
                             log::trace!("Received junk data: {io_err}");
@@ -349,33 +345,59 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             log::warn!("process_device_read error: {io_err}");
                         }
                     }
-                }
-                //udp endpoint remove
+                },
                 Some(src_addr) = edp_remove_rx.recv() => {
                     packet_endpoints.remove(&src_addr);
                     log::debug!("Packet endpoint destroyed and removed: {}", src_addr);
-                }
+                },
                 Some(network_tuple) = session_remove_rx.recv() => {
                     sessions.remove(&network_tuple);
                     log::debug!("session destroyed: {network_tuple}");
-                }
+                },
                 Some(packet) = up_pkt_receiver.recv() => {
                     process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
                 }
             }
         }
-    })
+    });
+    #[cfg(not(feature = "udp_packet"))]
+    return tokio::spawn(async move {
+        loop {
+            select! {
+                Ok(n) = device.read(&mut buffer) => {
+                    if let Err(e) = process_device_read(&buffer[offset..n], &mut sessions, &session_remove_tx, &up_pkt_sender, &config, &accept_sender).await {
+                        let io_err: std::io::Error = e.into();
+                        if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
+                            log::trace!("Received junk data: {io_err}");
+                        } else {
+                            log::warn!("process_device_read error: {io_err}");
+                        }
+                    }
+                },
+                Some(network_tuple) = session_remove_rx.recv() => {
+                    sessions.remove(&network_tuple);
+                    log::debug!("session destroyed: {network_tuple}");
+                },
+                Some(packet) = up_pkt_receiver.recv() => {
+                    process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
+                }
+            }
+        }
+    });
 }
 
 async fn process_device_read(
     data: &[u8],
     sessions: &mut SessionCollection,
     session_remove_tx: &UnboundedSender<NetworkTuple>,
-    edp_remove_tx: &tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+    #[cfg(feature = "udp_packet")] edp_remove_tx: &tokio::sync::mpsc::UnboundedSender<SocketAddr>,
     up_pkt_sender: &PacketSender,
     config: &IpStackConfig,
     accept_sender: &UnboundedSender<IpStackStream>,
-    packet_endpoints: &mut AHashMap<SocketAddr, (mpsc::UnboundedSender<(SocketAddr, SocketAddr, Vec<u8>)>, Arc<AtomicU64>)>,
+    #[cfg(feature = "udp_packet")] packet_endpoints: &mut AHashMap<
+        SocketAddr,
+        (mpsc::UnboundedSender<(SocketAddr, SocketAddr, Vec<u8>)>, Arc<AtomicU64>),
+    >,
 ) -> Result<()> {
     let Ok(packet) = NetworkPacket::parse(data) else {
         let stream = IpStackStream::UnknownNetwork(data.to_owned());
@@ -397,79 +419,76 @@ async fn process_device_read(
     }
 
     //UDP packet
+    #[cfg(feature = "udp_packet")]
     if let TransportHeader::Udp(_udp_header) = packet.transport_header() {
-        if config.udp_packet_mode {
-            let src_addr = packet.src_addr();
-            let dst_addr = packet.dst_addr();
-            let payload = packet.payload.unwrap_or_default();
+        let src_addr = packet.src_addr();
+        let dst_addr = packet.dst_addr();
+        let payload = packet.payload.unwrap_or_default();
 
-            match packet_endpoints.entry(src_addr) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let (tx, last_activity) = entry.get();
+        match packet_endpoints.entry(src_addr) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let (tx, last_activity) = entry.get();
 
-                    if let Err(e) = tx.send((src_addr, dst_addr, payload)) {
-                        log::warn!("Failed to send to packet endpoint for {}: {}", src_addr, e);
-                        // Receiver was dropped; remove stale endpoint so a new one can be created.
-                        entry.remove();
-                    } else {
-                        last_activity.store(now_secs(), Ordering::Relaxed);
-                    }
-                }
-
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    //announce to destroy the channel when timeout or application layer take out
-                    let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel::<()>();
-
-                    let last_activity = Arc::new(AtomicU64::new(now_secs()));
-                    let last_activity_clone = last_activity.clone();
-
-                    let timeout_secs = config.udp_timeout.as_secs();
-
-                    let edp_remove_tx_clone = edp_remove_tx.clone();
-                    let src_addr_clone = src_addr;
-
-                    tokio::spawn(async move {
-                        loop {
-                            let elapsed = now_secs() - last_activity_clone.load(Ordering::Relaxed);
-                            if elapsed >= timeout_secs {
-                                log::info!("removing channel for {} because no data for {}s", src_addr_clone, elapsed);
-                                break;
-                            }
-
-                            let sleep_duration = std::time::Duration::from_secs(timeout_secs - elapsed);
-
-                            tokio::select! {
-
-                                 //sleep until timeout
-                                _ = tokio::time::sleep(sleep_duration) => {}
-
-                                // application layer take out
-                                _ = &mut destroy_rx => {
-                                    log::debug!("application layer Endpoint:{} removed the channel", src_addr_clone);
-                                    break;
-                                }
-                            }
-                        }
-
-                        let _ = edp_remove_tx_clone.send(src_addr_clone);
-                    });
-                    //ipstack to application layer channel
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-                    let endpoint = IpStackUdpPacketEndpoint::new(rx, up_pkt_sender.clone(), src_addr, config.mtu, destroy_tx);
-
-                    accept_sender
-                        .send(IpStackStream::UdpEdp(endpoint))
-                        .map_err(std::io::Error::other)?;
-
-                    entry.insert((tx.clone(), last_activity));
-                    if let Err(e) = tx.send((src_addr, dst_addr, payload)) {
-                        log::warn!("Failed to send to packet endpoint: {}", e);
-                    }
+                if let Err(e) = tx.send((src_addr, dst_addr, payload)) {
+                    log::warn!("Failed to send to packet endpoint for {}: {}", src_addr, e);
+                    // Receiver was dropped; remove stale endpoint so a new one can be created.
+                    entry.remove();
+                } else {
+                    last_activity.store(now_secs(), Ordering::Relaxed);
                 }
             }
-            return Ok(());
+
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                //announce to destroy the channel when timeout or application layer take out
+                let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel::<()>();
+
+                let last_activity = Arc::new(AtomicU64::new(now_secs()));
+                let last_activity_clone = last_activity.clone();
+
+                let timeout_secs = config.udp_timeout.as_secs();
+
+                let edp_remove_tx_clone = edp_remove_tx.clone();
+                let src_addr_clone = src_addr;
+
+                tokio::spawn(async move {
+                    loop {
+                        let elapsed = now_secs() - last_activity_clone.load(Ordering::Relaxed);
+                        if elapsed >= timeout_secs {
+                            log::info!("removing channel for {} because no data for {}s", src_addr_clone, elapsed);
+                            break;
+                        }
+
+                        let sleep_duration = std::time::Duration::from_secs(timeout_secs - elapsed);
+
+                        tokio::select! {
+
+                             //sleep until timeout
+                            _ = tokio::time::sleep(sleep_duration) => {}
+
+                            // application layer take out
+                            _ = &mut destroy_rx => {
+                                log::debug!("application layer Endpoint:{} removed the channel", src_addr_clone);
+                                break;
+                            }
+                        }
+                    }
+
+                    let _ = edp_remove_tx_clone.send(src_addr_clone);
+                });
+                //ipstack to application layer channel
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+                let endpoint = IpStackUdpPacketEndpoint::new(rx, up_pkt_sender.clone(), src_addr, config.mtu, destroy_tx);
+
+                accept_sender.send(IpStackStream::Udp(endpoint)).map_err(std::io::Error::other)?;
+
+                entry.insert((tx.clone(), last_activity));
+                if let Err(e) = tx.send((src_addr, dst_addr, payload)) {
+                    log::warn!("Failed to send to packet endpoint: {}", e);
+                }
+            }
         }
+        return Ok(());
     }
 
     let network_tuple = packet.network_tuple();
@@ -511,11 +530,14 @@ fn create_stream(
             let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, msgr, cfg.tcp_config.clone())?;
             Ok(IpStackStream::Tcp(stream))
         }
+        #[cfg(not(feature = "udp_packet"))]
         TransportHeader::Udp(_) => {
             let payload = packet.payload.unwrap_or_default();
             let stream = IpStackUdpStream::new(src_addr, dst_addr, payload, up_pkt_sender, cfg.mtu, cfg.udp_timeout, msgr);
             Ok(IpStackStream::Udp(stream))
         }
+        #[cfg(feature = "udp_packet")]
+        TransportHeader::Udp(_) => Err(IpStackError::UnsupportedTransportProtocol),
         TransportHeader::Unknown => Err(IpStackError::UnsupportedTransportProtocol),
     }
 }
@@ -545,6 +567,7 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
 }
 
 //time
+#[cfg(feature = "udp_packet")]
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

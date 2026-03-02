@@ -41,6 +41,9 @@ wintun = { version = "0.5", default-features = false }
 [build-dependencies]
 serde_json = "1"
 
+[features]
+udp_packet = []
+
 [profile.release]
 opt-level = 's'          # Optimize for size (with loop vectorization enabled).
 lto = true               # Enable Link Time Optimization
