@@ -40,6 +40,7 @@ use tokio::{
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
+    #[allow(dead_code)]
     stream_sender: PacketSender,
     stream_receiver: PacketReceiver,
     up_pkt_sender: PacketSender,
@@ -75,7 +76,7 @@ impl IpStackUdpStream {
             destroy_messenger,
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }

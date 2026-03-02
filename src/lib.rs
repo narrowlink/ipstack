@@ -314,6 +314,12 @@ impl Drop for IpStack {
     }
 }
 
+#[cfg(feature = "udp_packet")]
+type UdpEdpSender = tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, std::net::SocketAddr, Vec<u8>)>;
+
+#[cfg(feature = "udp_packet")]
+type UdpEdpInfo = (UdpEdpSender, std::sync::Arc<std::sync::atomic::AtomicU64>);
+
 fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     config: IpStackConfig,
     mut device: Device,
@@ -322,8 +328,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut sessions: SessionCollection = AHashMap::new();
     //UDPendpoints
     #[cfg(feature = "udp_packet")]
-    let mut packet_endpoints: AHashMap<SocketAddr, (mpsc::UnboundedSender<(SocketAddr, SocketAddr, Vec<u8>)>, Arc<AtomicU64>)> =
-        AHashMap::new();
+    let mut packet_endpoints: AHashMap<SocketAddr, UdpEdpInfo> = AHashMap::new();
     let (session_remove_tx, mut session_remove_rx) = mpsc::unbounded_channel::<NetworkTuple>();
     //udp endpoints rm channel
     #[cfg(feature = "udp_packet")]
@@ -385,7 +390,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
     });
 }
-
+#[allow(clippy::too_many_arguments)]
 async fn process_device_read(
     data: &[u8],
     sessions: &mut SessionCollection,
@@ -394,10 +399,7 @@ async fn process_device_read(
     up_pkt_sender: &PacketSender,
     config: &IpStackConfig,
     accept_sender: &UnboundedSender<IpStackStream>,
-    #[cfg(feature = "udp_packet")] packet_endpoints: &mut AHashMap<
-        SocketAddr,
-        (mpsc::UnboundedSender<(SocketAddr, SocketAddr, Vec<u8>)>, Arc<AtomicU64>),
-    >,
+    #[cfg(feature = "udp_packet")] packet_endpoints: &mut AHashMap<SocketAddr, UdpEdpInfo>,
 ) -> Result<()> {
     let Ok(packet) = NetworkPacket::parse(data) else {
         let stream = IpStackStream::UnknownNetwork(data.to_owned());
