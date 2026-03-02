@@ -85,43 +85,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("==== end UDP connection ====");
                 });
             }
-            IpStackStream::UdpEdp(mut endpoint) => {
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            res = endpoint.recv() => {
-                                match res {
-                                    Some((_src_addr, _dst_addr, _payload)) => {
-                                        //your logic to process the packet
-                                    }
-                                    None => {
-                                        log::info!("UDP packet endpoint: the channel has been shut down");
-                                        break;
-                                    }
-                                }
-                            }
-                            // res = app.readpacket() => {
-                            //     match res {
-                            //         Ok(Some((remote_player_addr, my_local_addr, payload))) => {
-                            //             log::trace!("#{number2} [down] {} -> {} ({} bytes)", remote_player_addr, my_local_addr, payload.len());
-
-                            //
-                            //             if let Err(e) = endpoint.send(remote_player_addr, my_local_addr, payload) {
-                            //                 log::warn!("#{number2} faild to send packet: {}", e);
-                            //             }
-                            //         }
-                            //         Ok(None) | Err(_) => {
-                            //
-                            //             break;
-                            //         }
-                            //     }
-                            // }
-
-                        }
-                    }
-                });
-            }
-
             IpStackStream::UnknownTransport(u) => {
                 if u.src_addr().is_ipv4() && u.ip_protocol() == IpNumber::ICMP {
                     let (icmp_header, req_payload) = Icmpv4Header::from_slice(u.payload())?;
