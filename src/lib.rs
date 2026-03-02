@@ -429,7 +429,7 @@ async fn process_device_read(
                         loop {
                             let elapsed = now_secs() - last_activity_clone.load(Ordering::Relaxed);
                             if elapsed >= timeout_secs {
-                                log::info!("remove the channel of {} because not data in {} ", src_addr_clone, elapsed);
+                                log::info!("removing channel for {} because no data for {}s", src_addr_clone, elapsed);
                                 break;
                             }
 
