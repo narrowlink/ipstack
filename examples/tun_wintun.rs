@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         //your logic to process the packet
                                     }
                                     None => {
-                                        log::info!(" UDP Packet Endpoint the channel have been shutdown");
+                                        log::info!("UDP packet endpoint: the channel has been shut down");
                                         break;
                                     }
                                 }
