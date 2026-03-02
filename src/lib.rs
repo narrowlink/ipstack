@@ -452,10 +452,14 @@ async fn process_device_read(
 
                     let endpoint = IpStackUdpPacketEndpoint::new(rx, up_pkt_sender.clone(), src_addr, config.mtu, destroy_tx);
 
-                    accept_sender.send(IpStackStream::UdpEdp(endpoint)).unwrap();
+                    accept_sender
+                        .send(IpStackStream::UdpEdp(endpoint))
+                        .map_err(std::io::Error::other)?;
 
                     entry.insert((tx.clone(), last_activity));
-                    tx.send((src_addr, dst_addr, payload)).unwrap();
+                    if let Err(e) = tx.send((src_addr, dst_addr, payload)) {
+                        log::warn!("Failed to send to packet endpoint: {}", e);
+                    }
                 }
             }
             return Ok(());
