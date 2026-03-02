@@ -401,12 +401,15 @@ async fn process_device_read(
             let payload = packet.payload.unwrap_or_default();
 
             match packet_endpoints.entry(src_addr) {
-                std::collections::hash_map::Entry::Occupied(entry) => {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let (tx, last_activity) = entry.get();
-                    last_activity.store(now_secs(), Ordering::Relaxed);
 
                     if let Err(e) = tx.send((src_addr, dst_addr, payload)) {
-                        log::warn!("Failed to send to packet endpoint: {}", e);
+                        log::warn!("Failed to send to packet endpoint for {}: {}", src_addr, e);
+                        // Receiver was dropped; remove stale endpoint so a new one can be created.
+                        entry.remove();
+                    } else {
+                        last_activity.store(now_secs(), Ordering::Relaxed);
                     }
                 }
 
