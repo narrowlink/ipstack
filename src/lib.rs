@@ -80,6 +80,9 @@ pub struct IpStackConfig {
     /// Default is 30 seconds.
     pub udp_timeout: Duration,
 
+    /// When enabled, UDP datagrams are accepted as packet endpoints
+    /// (`IpStackUdpPacketEndpoint`) instead of `IpStackUdpStream` connections.
+    /// Default is `false`.
     pub udp_packet_mode: bool,
 }
 
