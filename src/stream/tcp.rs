@@ -695,14 +695,12 @@ async fn tcp_main_logic_loop(
         }
 
         match state {
-            TcpState::SynReceived => {
-                if flags & ACK == ACK {
-                    if len > 0 {
-                        tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
-                    }
-                    tcb.change_state(TcpState::Established);
+            TcpState::SynReceived if flags & ACK == ACK => {
+                if len > 0 {
+                    tcb.add_unordered_packet(incoming_seq, payload);
+                    extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                 }
+                tcb.change_state(TcpState::Established);
             }
             TcpState::Established => {
                 if flags == ACK {
@@ -818,17 +816,15 @@ async fn tcp_main_logic_loop(
                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 }
             }
-            TcpState::LastAck => {
-                if flags & ACK == ACK {
-                    tcb.change_state(TcpState::Closed);
-                    tokio::spawn(async move {
-                        if let Err(e) = exit_notifier.send(()).await {
-                            log::debug!("exit_notifier send failed: {e}");
-                        }
-                    });
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
-                }
+            TcpState::LastAck if flags & ACK == ACK => {
+                tcb.change_state(TcpState::Closed);
+                tokio::spawn(async move {
+                    if let Err(e) = exit_notifier.send(()).await {
+                        log::debug!("exit_notifier send failed: {e}");
+                    }
+                });
+                let new_state = tcb.get_state();
+                log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
             }
             TcpState::FinWait1 => {
                 if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
@@ -889,12 +885,10 @@ async fn tcp_main_logic_loop(
                     log::trace!("{network_tuple} {state:?}: Some unnormal case, we do nothing here");
                 }
             }
-            TcpState::TimeWait => {
-                if flags & (ACK | FIN) == (ACK | FIN) {
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    // wait to timeout, can't call `tcb.change_state(TcpState::Closed);` to change state here
-                    // now we need to wait for the timeout to reach...
-                }
+            TcpState::TimeWait if flags & (ACK | FIN) == (ACK | FIN) => {
+                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                // wait to timeout, can't call `tcb.change_state(TcpState::Closed);` to change state here
+                // now we need to wait for the timeout to reach...
             }
             _ => {}
         } // end of match state
