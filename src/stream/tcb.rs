@@ -75,7 +75,7 @@ impl Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
-        let seq = rand::Rng::random::<u32>(&mut rand::rng());
+        let seq = rand::RngExt::random::<u32>(&mut rand::rng());
         Tcb {
             seq: seq.into(),
             ack,
