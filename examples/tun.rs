@@ -136,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::info!("#{number1} TCP closed, session count {c}");
                 });
             }
+            #[cfg(not(feature = "udp_packet"))]
             IpStackStream::Udp(mut udp) => {
                 let mut s = match UdpStream::connect(server_addr).await {
                     Ok(s) => s,
@@ -157,6 +158,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let c = count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
                     log::info!("#{number2} UDP closed, session count {c}");
+                });
+            }
+            #[cfg(feature = "udp_packet")]
+            IpStackStream::Udp(mut endpoint) => {
+                let c = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let number2 = number;
+                log::info!("#{number2} UDP Packet Endpoint starting, session count {c}");
+
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            res = endpoint.recv() => {
+                                match res {
+                                    Some((_src_addr, _dst_addr, _payload)) => {
+
+
+                                    }
+                                    None => {
+                                        log::info!("#{number2} UDP Packet Endpoint 底层通道已关闭");
+                                        break;
+                                    }
+                                }
+                            }
+                            // res = app.readpacket() => {
+                            //     match res {
+                            //         Ok(Some((remote_player_addr, my_local_addr, payload))) => {
+                            //             log::trace!("#{number2} [down] {} -> {} ({} bytes)", remote_player_addr, my_local_addr, payload.len());
+
+                            //
+                            //             if let Err(e) = endpoint.send(remote_player_addr, my_local_addr, payload) {
+                            //                 log::warn!("#{number2} faild to send packet: {}", e);
+                            //             }
+                            //         }
+                            //         Ok(None) | Err(_) => {
+                            //
+                            //             break;
+                            //         }
+                            //     }
+                            // }
+
+                        }
+                    }
+                    let c = count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+                    log::info!("#{number2} UDP Packet Endpoint closed, session count {c}");
                 });
             }
             IpStackStream::UnknownTransport(u) => {

@@ -40,6 +40,7 @@ use tokio::{
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
+    #[allow(dead_code)]
     stream_sender: PacketSender,
     stream_receiver: PacketReceiver,
     up_pkt_sender: PacketSender,
@@ -75,11 +76,10 @@ impl IpStackUdpStream {
             destroy_messenger,
         }
     }
-
+    #[allow(dead_code)]
     pub(crate) fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
-
     fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> std::io::Result<NetworkPacket> {
         const UHS: usize = 8; // udp header size is 8
         match (self.dst_addr.ip(), self.src_addr.ip()) {
@@ -211,5 +211,103 @@ impl Drop for IpStackUdpStream {
         if let Some(messenger) = self.destroy_messenger.take() {
             let _ = messenger.send(());
         }
+    }
+}
+#[cfg(feature = "udp_packet")]
+pub struct IpStackUdpPacketEndpoint {
+    //receive from TUN: (src, dst, payload)
+    receiver: mpsc::UnboundedReceiver<(SocketAddr, SocketAddr, Vec<u8>)>,
+
+    //send to TUN: raw packet
+    up_pkt_sender: crate::PacketSender,
+
+    local_addr: SocketAddr,
+
+    mtu: u16,
+
+    _destroy_messenger: tokio::sync::oneshot::Sender<()>,
+}
+#[cfg(feature = "udp_packet")]
+impl IpStackUdpPacketEndpoint {
+    pub fn new(
+        receiver: mpsc::UnboundedReceiver<(SocketAddr, SocketAddr, Vec<u8>)>,
+        up_pkt_sender: crate::PacketSender,
+        local_addr: SocketAddr,
+        mtu: u16,
+        _destroy_messenger: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            receiver,
+            up_pkt_sender,
+            local_addr,
+            mtu,
+            _destroy_messenger,
+        }
+    }
+
+    /// recv from TUN: (src, dst, payload)
+    pub async fn recv(&mut self) -> Option<(SocketAddr, SocketAddr, Vec<u8>)> {
+        self.receiver.recv().await
+    }
+
+    /// send to TUN: raw packet
+    pub fn send(&self, src: SocketAddr, dst: SocketAddr, payload: Vec<u8>) -> std::io::Result<()> {
+        let raw_packet = build_raw_udp_packet(src, dst, payload, self.mtu)?;
+
+        self.up_pkt_sender
+            .send(raw_packet)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "ipstack up_pkt_sender closed"))
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+#[cfg(feature = "udp_packet")]
+pub fn build_raw_udp_packet(src_addr: SocketAddr, dst_addr: SocketAddr, mut payload: Vec<u8>, mtu: u16) -> std::io::Result<NetworkPacket> {
+    const UHS: usize = 8;
+    let ttl = 64;
+
+    match (src_addr.ip(), dst_addr.ip()) {
+        (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
+            let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, src.octets(), dst.octets()).map_err(IpStackError::from)?;
+
+            let line_buffer = mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
+            payload.truncate(line_buffer as usize);
+
+            ip_h.set_payload_len(payload.len() + UHS).map_err(IpStackError::from)?;
+
+            let udp_header =
+                UdpHeader::with_ipv4_checksum(src_addr.port(), dst_addr.port(), &ip_h, &payload).map_err(IpStackError::from)?;
+
+            Ok(NetworkPacket {
+                ip: IpHeader::Ipv4(ip_h),
+                transport: TransportHeader::Udp(udp_header),
+                payload: Some(payload),
+            })
+        }
+        (std::net::IpAddr::V6(src), std::net::IpAddr::V6(dst)) => {
+            let mut ip_h = Ipv6Header {
+                traffic_class: 0,
+                flow_label: Ipv6FlowLabel::ZERO,
+                payload_length: 0,
+                next_header: IpNumber::UDP,
+                hop_limit: ttl,
+                source: src.octets(),
+                destination: dst.octets(),
+            };
+            let line_buffer = mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
+            payload.truncate(line_buffer as usize);
+            ip_h.payload_length = (payload.len() + UHS) as u16;
+            let udp_header =
+                UdpHeader::with_ipv6_checksum(src_addr.port(), dst_addr.port(), &ip_h, &payload).map_err(IpStackError::from)?;
+
+            Ok(NetworkPacket {
+                ip: IpHeader::Ipv6(ip_h),
+                transport: TransportHeader::Udp(udp_header),
+                payload: Some(payload),
+            })
+        }
+        _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "IP version mismatch")),
     }
 }

@@ -2,9 +2,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 pub use self::tcp::IpStackTcpStream;
 pub use self::tcp::{TcpConfig, TcpOptions};
+#[cfg(feature = "udp_packet")]
+pub use self::udp::IpStackUdpPacketEndpoint;
+
 pub use self::udp::IpStackUdpStream;
 pub use self::unknown::IpStackUnknownTransport;
-
 mod seqnum;
 mod tcb;
 mod tcp;
@@ -26,7 +28,11 @@ pub enum IpStackStream {
     /// A TCP connection stream.
     Tcp(IpStackTcpStream),
     /// A UDP stream.
+    #[cfg(not(feature = "udp_packet"))]
     Udp(IpStackUdpStream),
+    /// UDP PACKET.
+    #[cfg(feature = "udp_packet")]
+    Udp(IpStackUdpPacketEndpoint),
     /// A stream for unknown transport protocols.
     UnknownTransport(IpStackUnknownTransport),
     /// Raw network packets that couldn't be parsed.
@@ -51,7 +57,10 @@ impl IpStackStream {
     pub fn local_addr(&self) -> SocketAddr {
         match self {
             IpStackStream::Tcp(tcp) => tcp.local_addr(),
+            #[cfg(not(feature = "udp_packet"))]
             IpStackStream::Udp(udp) => udp.local_addr(),
+            #[cfg(feature = "udp_packet")]
+            IpStackStream::Udp(udp_edp) => udp_edp.local_addr(),
             IpStackStream::UnknownNetwork(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             IpStackStream::UnknownTransport(unknown) => match unknown.src_addr() {
                 IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, 0)),
@@ -77,7 +86,10 @@ impl IpStackStream {
     pub fn peer_addr(&self) -> SocketAddr {
         match self {
             IpStackStream::Tcp(tcp) => tcp.peer_addr(),
+            #[cfg(not(feature = "udp_packet"))]
             IpStackStream::Udp(udp) => udp.peer_addr(),
+            #[cfg(feature = "udp_packet")]
+            IpStackStream::Udp(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             IpStackStream::UnknownNetwork(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             IpStackStream::UnknownTransport(unknown) => match unknown.dst_addr() {
                 IpAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(addr, 0)),
@@ -89,6 +101,7 @@ impl IpStackStream {
     pub(crate) fn stream_sender(&self) -> Result<crate::PacketSender, std::io::Error> {
         match self {
             IpStackStream::Tcp(tcp) => Ok(tcp.stream_sender()),
+            #[cfg(not(feature = "udp_packet"))]
             IpStackStream::Udp(udp) => Ok(udp.stream_sender()),
             _ => Err(std::io::Error::other("Unknown transport stream does not have a sender")),
         }
