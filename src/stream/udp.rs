@@ -166,7 +166,11 @@ impl AsyncRead for IpStackUdpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         if let Some(p) = self.first_payload.take() {
-            buf.put_slice(&p);
+            // Clamp to `buf.remaining()`: an oversized datagram would otherwise
+            // panic `put_slice` (hit under `copy_bidirectional` write
+            // backpressure). Unlike the TCP path the remainder is DROPPED, not buffered matches `recvfrom` without MSG_WAITALL.
+            let n = p.len().min(buf.remaining());
+            buf.put_slice(&p[..n]);
             return std::task::Poll::Ready(Ok(()));
         }
         if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
@@ -178,7 +182,9 @@ impl AsyncRead for IpStackUdpStream {
         match self.stream_receiver.poll_recv(cx) {
             std::task::Poll::Ready(Some(p)) => {
                 if let Some(payload) = p.payload {
-                    buf.put_slice(&payload);
+                    // Clamp like the first_payload branch above (drop the tail).
+                    let n = payload.len().min(buf.remaining());
+                    buf.put_slice(&payload[..n]);
                 }
                 std::task::Poll::Ready(Ok(()))
             }
@@ -211,5 +217,45 @@ impl Drop for IpStackUdpStream {
         if let Some(messenger) = self.destroy_messenger.take() {
             let _ = messenger.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn stream(first_payload: Vec<u8>) -> IpStackUdpStream {
+        let (up_tx, _up_rx) = mpsc::unbounded_channel();
+        IpStackUdpStream::new(
+            "127.0.0.1:1234".parse().unwrap(),
+            "127.0.0.1:53".parse().unwrap(),
+            first_payload,
+            up_tx,
+            1500,
+            Duration::from_secs(30),
+            None,
+        )
+    }
+
+    // A datagram larger than the caller's buffer used to panic `put_slice`; it
+    // must now truncate to the buffer instead. Covers both branches of poll_read.
+
+    #[tokio::test]
+    async fn poll_read_truncates_oversized_first_payload() {
+        let mut s = stream(vec![7u8; 1250]);
+        let mut small = [0u8; 502];
+        assert_eq!(s.read(&mut small).await.unwrap(), 502);
+        assert!(small.iter().all(|&b| b == 7));
+    }
+
+    #[tokio::test]
+    async fn poll_read_truncates_oversized_relayed_datagram() {
+        let mut s = stream(Vec::new());
+        s.first_payload = None; // skip to the stream_receiver branch
+        let pkt = s.create_rev_packet(64, vec![9u8; 1250]).unwrap();
+        s.stream_sender().send(pkt).unwrap();
+        let mut small = [0u8; 502];
+        assert_eq!(s.read(&mut small).await.unwrap(), 502);
     }
 }
