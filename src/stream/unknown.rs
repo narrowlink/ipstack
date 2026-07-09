@@ -190,7 +190,7 @@ impl IpStackUnknownTransport {
                     traffic_class: 0,
                     flow_label: Ipv6FlowLabel::ZERO,
                     payload_length: 0,
-                    next_header: IpNumber::UDP,
+                    next_header: self.protocol,
                     hop_limit: TTL,
                     source: dst.octets(),
                     destination: src.octets(),
