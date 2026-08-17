@@ -319,8 +319,12 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     tokio::spawn(async move {
         loop {
             select! {
-                Ok(n) = device.read(&mut buffer) => {
-                    if let Err(e) = process_device_read(&buffer[offset..n], &mut sessions, &session_remove_tx, &up_pkt_sender, &config, &accept_sender).await {
+                read_result = device.read(&mut buffer) => {
+                    let num_read = read_result?;
+                    if num_read == 0 {
+                        return Ok(());
+                    }
+                    if let Err(e) = process_device_read(&buffer[offset..num_read], &mut sessions, &session_remove_tx, &up_pkt_sender, &config, &accept_sender).await {
                         let io_err: std::io::Error = e.into();
                         if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
                             log::trace!("Received junk data: {io_err}");
@@ -438,4 +442,26 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
     // device.flush().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{io::duplex, time::timeout};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn device_eof_closes_accept_channel() {
+        let (device, peer) = duplex(64);
+        let mut ip_stack = IpStack::new(IpStackConfig::default(), device);
+
+        drop(peer);
+
+        let accept_result = timeout(Duration::from_secs(1), ip_stack.accept())
+            .await
+            .expect("accept should not hang after device EOF");
+        assert!(matches!(accept_result, Err(IpStackError::AcceptError)));
+    }
 }
