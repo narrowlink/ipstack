@@ -434,11 +434,22 @@ impl Drop for IpStackTcpStream {
         log::trace!("{nt} {state:?}: [drop] session dropping, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
-                if let Some(notifier) = self.exit_notifier.take() {
-                    _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(notifier.send(())));
+                // The farewell packet reaches the device through an unbounded channel, so it
+                // is sent here rather than left to the task.
+                {
+                    let mut tcb = self.tcb.lock().unwrap();
+                    if let Err(e) = send_fin_n_change_state_to_fin_wait1("[drop]", nt, &self.up_packet_sender, &mut tcb) {
+                        log::debug!("{nt} {state:?}: [drop] cannot send the farewell packet: {e}");
+                    }
                 }
-                // synchronously wait for the task to finish
-                _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(task_handle));
+                if let Some(notifier) = self.exit_notifier.take() {
+                    // The channel holds ten slots and one signal ends the task, so the send
+                    // needs no runtime of its own.
+                    _ = notifier.try_send(());
+                }
+                // Dropping the task drops its `destroy_messenger`, which wakes the watcher
+                // that removes this session from the stack.
+                task_handle.abort();
             } else {
                 log::trace!("{nt} {state:?}: [drop] task already finished, no need to wait exiting");
             }
