@@ -306,12 +306,12 @@ impl AsyncRead for IpStackTcpStream {
                 let mut tcb = self.tcb.lock().unwrap();
                 let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
                 let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-                log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session timeout reached, closing forcefully...");
+                log::debug!("{network_tuple} {state:?}: [poll_read] {l_info}, session timeout reached, closing forcefully...");
                 let sender = &self.up_packet_sender;
                 write_packet_to_device(sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
                 tcb.change_state(TcpState::Closed);
                 let state = tcb.get_state();
-                log::warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
+                log::debug!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
             }
             self.shutdown.lock().unwrap().ready();
 
