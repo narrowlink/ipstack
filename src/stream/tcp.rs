@@ -7,7 +7,7 @@ use crate::{
         tcp_flags::{ACK, FIN, PSH, RST, SYN},
         tcp_header_flags, tcp_header_fmt,
     },
-    stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, RTO, Tcb, TcpState},
+    stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, READ_CHUNK, RTO, Tcb, TcpState},
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
 use std::{
@@ -165,9 +165,10 @@ pub struct IpStackTcpStream {
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     timeout: Pin<Box<tokio::time::Sleep>>,
-    data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    data_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    drain_notify: Arc<tokio::sync::Notify>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     exit_notifier: Option<tokio::sync::mpsc::Sender<()>>,
     temp_read_buffer: Vec<u8>,
@@ -205,7 +206,8 @@ impl IpStackTcpStream {
         }
 
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
-        let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let data_channel_len = config.read_buffer_size.div_ceil(READ_CHUNK).max(1);
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(data_channel_len);
         let deadline = tokio::time::Instant::now() + config.timeout;
 
         let mut stream = IpStackTcpStream {
@@ -222,6 +224,7 @@ impl IpStackTcpStream {
             data_tx,
             data_rx,
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
             task_handle: None,
             exit_notifier: None,
             temp_read_buffer: Vec::new(),
@@ -330,6 +333,8 @@ impl AsyncRead for IpStackTcpStream {
                     buf.put_slice(&data[..capacity]);
                     self.temp_read_buffer.extend_from_slice(&data[capacity..]);
                 }
+                // A channel slot just freed, so wake the loop to flush more and reopen the window.
+                self.drain_notify.notify_one();
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
@@ -471,6 +476,7 @@ impl IpStackTcpStream {
         let write_notify = self.write_notify.clone();
         let read_notify = self.read_notify.clone();
         let data_tx = self.data_tx.clone();
+        let drain_notify = self.drain_notify.clone();
         let destroy_messenger = self.destroy_messenger.take();
 
         let (exit_task_notifier, exit_monitor) = tokio::sync::mpsc::channel::<()>(10);
@@ -489,6 +495,7 @@ impl IpStackTcpStream {
                 write_notify,
                 read_notify,
                 data_tx,
+                drain_notify,
                 exit_monitor,
             )
             .await;
@@ -516,7 +523,8 @@ async fn tcp_main_logic_loop(
     network_tuple: NetworkTuple,
     write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-    data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    drain_notify: Arc<tokio::sync::Notify>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
     {
@@ -642,6 +650,13 @@ async fn tcp_main_logic_loop(
                 log::debug!("{network_tuple} task exited due to exit signal");
                 break;
             }
+            _ = drain_notify.notified() => {
+                // The upstream reader freed channel space, so flush whatever is buffered and
+                // let the follow-up ACK carry the reopened window.
+                let mut tcb = tcb.lock().unwrap();
+                extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                continue;
+            }
             network_packet = stream_receiver.recv() => network_packet,
         };
 
@@ -743,7 +758,7 @@ async fn tcp_main_logic_loop(
                         }
                         PacketType::Invalid => {}
                     }
-                } else if flags == (ACK | FIN) {
+                } else if flags == (ACK | FIN) && tcb.get_ack() == incoming_seq {
                     // The other side is closing the connection, we need to send an ACK and change state to CloseWait
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
@@ -838,7 +853,7 @@ async fn tcp_main_logic_loop(
                 log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
             }
             TcpState::FinWait1 => {
-                if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
+                if flags & (ACK | FIN) == (ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
                     // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
@@ -863,7 +878,7 @@ async fn tcp_main_logic_loop(
                 }
             }
             TcpState::FinWait2 => {
-                if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
+                if flags & (ACK | FIN) == (ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     tcb.change_state(TcpState::TimeWait);
@@ -914,7 +929,7 @@ fn extract_data_n_write_upstream(
     up_packet_sender: &PacketSender,
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
-    data_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
 ) -> std::io::Result<()> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
@@ -924,10 +939,23 @@ fn extract_data_n_write_upstream(
         return Ok(());
     }
 
-    if let Some(data) = tcb.consume_unordered_packets(8192) {
+    // Reserve the handoff slot before consuming, so buffered data is removed only once it has a
+    // guaranteed home; the reserved permit shrinks the advertised window until the reader drains it.
+    let permit = match data_tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+            write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
+            return Ok(());
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+            return Err(std::io::Error::new(BrokenPipe, "data channel closed"));
+        }
+    };
+
+    if let Some(data) = tcb.consume_unordered_packets(READ_CHUNK) {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
-        data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
+        permit.send(data);
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
@@ -947,7 +975,11 @@ pub(crate) fn write_packet_to_device(
 ) -> std::io::Result<usize> {
     use std::io::Error;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
-    let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window().max(tcb.get_mtu()));
+    // Silly-window-syndrome avoidance: advertise a real window only when a full segment fits,
+    // otherwise advertise zero so the peer enters persist mode until the reader frees space.
+    let recv_window = tcb.get_recv_window();
+    let window_size = if recv_window >= tcb.get_mtu() { recv_window } else { 0 };
+    let ack = tcb.get_ack().0;
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
     let packet = create_raw_packet(
@@ -1047,4 +1079,48 @@ pub(crate) fn create_raw_packet(
         transport: TransportHeader::Tcp(tcp_header),
         payload: Some(payload),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, READ_BUFFER_SIZE, RTO};
+
+    #[tokio::test]
+    async fn extract_reserves_before_consuming() {
+        let (up_tx, _up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let read_notify = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let nt = NetworkTuple::new("1.1.1.1:1".parse().unwrap(), "2.2.2.2:2".parse().unwrap(), true);
+
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+        tcb.change_state(TcpState::Established);
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]);
+        tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]);
+
+        // first extract fills the single channel slot and advances ack over the first chunk
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_ack(), SeqNum(2000));
+
+        // channel is full: extract leaves the remaining data in the map and does not advance ack
+        tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_ack(), SeqNum(2000));
+        assert_eq!(tcb.get_unordered_packets_total_len(), 500);
+
+        // draining the reader frees a slot, and the next extract flushes the tail
+        let first = data_rx.recv().await.unwrap();
+        assert_eq!(first.len(), 1000);
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_ack(), SeqNum(2500));
+        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+    }
 }

@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
 pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+pub(super) const READ_CHUNK: usize = 8192; // 8KB, bytes drained from the reassembly buffer per handoff
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 /// Retransmission timeout
@@ -121,6 +122,13 @@ impl Tcb {
             log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
             return;
         }
+        // The head-of-line segment always advances the stream, so it is admitted even at the limit;
+        // any other segment beyond the receive window is dropped for the peer's RTO to resend.
+        if seq != self.ack && self.get_unordered_packets_total_len() >= self.read_buffer_size {
+            #[rustfmt::skip]
+            log::warn!("{:?}: Receive window full, dropping packet seq {seq}, len = {}", self.state, buf.len());
+            return;
+        }
         self.unordered_packets.insert(seq, buf);
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
@@ -137,8 +145,19 @@ impl Tcb {
 
         while remaining_bytes > 0 {
             if let Some(seq) = self.unordered_packets.keys().next().copied() {
-                if seq != self.ack {
+                if seq > self.ack {
                     break; // sequence number is not continuous, stop extracting
+                }
+
+                if seq < self.ack {
+                    // A retransmission re-segmented across `ack` left a stale head entry; trim the
+                    // part already delivered so consumption can continue from `ack`.
+                    let payload = self.unordered_packets.remove(&seq).unwrap();
+                    let consumed = self.ack.distance(seq) as usize;
+                    if consumed < payload.len() {
+                        self.unordered_packets.insert(self.ack, payload[consumed..].to_vec());
+                    }
+                    continue;
                 }
 
                 // remove and get the first packet
@@ -406,6 +425,55 @@ mod tests {
         // test 3: no data to extract
         let data = tcb.consume_unordered_packets(1000);
         assert!(data.is_none());
+    }
+
+    #[test]
+    fn test_add_unordered_packet_enforces_read_buffer() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        // fill the receive buffer to its limit with an out-of-order gap held open
+        tcb.add_unordered_packet(SeqNum(1000 + READ_BUFFER_SIZE as u32), vec![7; READ_BUFFER_SIZE]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
+
+        // a further out-of-order segment is dropped, keeping the buffer bounded
+        tcb.add_unordered_packet(SeqNum(1000 + 2 * READ_BUFFER_SIZE as u32), vec![8; 500]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
+
+        // the head-of-line segment is admitted even at the limit, so the stream advances
+        tcb.add_unordered_packet(SeqNum(1000), vec![9; 500]);
+        assert_eq!(tcb.unordered_packets.get(&SeqNum(1000)).unwrap().len(), 500);
+    }
+
+    #[test]
+    fn test_consume_trims_overlapping_head_entry() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        // an out-of-order segment stored ahead of ack
+        tcb.add_unordered_packet(SeqNum(1200), vec![2; 300]);
+        // the gap-filler that a retransmission re-segmented to overlap the stored one
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 400]);
+
+        // consuming pulls [1000..1400), advancing ack into the stored entry keyed at 1200
+        let data = tcb.consume_unordered_packets(10_000).unwrap();
+        assert_eq!(data.len(), 500); // 400 + the 100 bytes of the stored entry past ack
+        assert_eq!(tcb.ack, SeqNum(1500));
+        assert_eq!(tcb.unordered_packets.len(), 0);
     }
 
     #[test]
