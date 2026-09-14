@@ -51,7 +51,7 @@ pub struct TcpConfig {
     pub max_count_for_dup_ack: usize,
     /// Retransmission timeout duration.
     pub rto: std::time::Duration,
-    /// Maximum number of retransmissions before giving up.
+    /// R2, the transmission count of one segment at which the connection closes.
     pub max_retransmit_count: usize,
     /// TCP options
     pub options: Option<Vec<TcpOptions>>,
@@ -169,6 +169,7 @@ pub struct IpStackTcpStream {
     data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     drain_notify: Arc<tokio::sync::Notify>,
+    arm_notify: Arc<tokio::sync::Notify>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     exit_notifier: Option<tokio::sync::mpsc::Sender<()>>,
     temp_read_buffer: Vec<u8>,
@@ -237,6 +238,7 @@ impl IpStackTcpStream {
             data_rx,
             read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
+            arm_notify: Arc::new(tokio::sync::Notify::new()),
             task_handle: None,
             exit_notifier: None,
             temp_read_buffer: Vec::new(),
@@ -383,7 +385,13 @@ impl AsyncWrite for IpStackTcpStream {
 
         let sender = &self.up_packet_sender;
         let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
+        let was_empty = tcb.is_inflight_queue_empty();
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
+        if was_empty {
+            // The loop reads the deadline when it enters `select!`, so the segment that reopens an
+            // empty queue has to wake it; a later one sits behind a deadline it already waits on.
+            self.arm_notify.notify_one();
+        }
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
@@ -489,6 +497,7 @@ impl IpStackTcpStream {
         let read_notify = self.read_notify.clone();
         let data_tx = self.data_tx.clone();
         let drain_notify = self.drain_notify.clone();
+        let arm_notify = self.arm_notify.clone();
         let destroy_messenger = self.destroy_messenger.take();
 
         let (exit_task_notifier, exit_monitor) = tokio::sync::mpsc::channel::<()>(10);
@@ -508,6 +517,7 @@ impl IpStackTcpStream {
                 read_notify,
                 data_tx,
                 drain_notify,
+                arm_notify,
                 exit_monitor,
             )
             .await;
@@ -537,6 +547,7 @@ async fn tcp_main_logic_loop(
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     drain_notify: Arc<tokio::sync::Notify>,
+    arm_notify: Arc<tokio::sync::Notify>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
 ) -> std::io::Result<()> {
     {
@@ -669,6 +680,34 @@ async fn tcp_main_logic_loop(
                 extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                 continue;
             }
+            _ = wait_retransmission_deadline(&tcb, &arm_notify) => {
+                // Either a deadline passed or the queue just reopened, so ask once who is overdue.
+                let mut tcb = tcb.lock().unwrap();
+                let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+                for packet in packets {
+                    let (seq, count) = (packet.seq, packet.retransmit_count);
+                    log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
+                    write_packet_to_device(
+                        &up_packet_sender,
+                        network_tuple,
+                        &tcb,
+                        None,
+                        ACK | PSH,
+                        Some(seq),
+                        Some(packet.payload),
+                    )?;
+                }
+                if exhausted {
+                    // RFC 9293 §3.8.3: R2 transmissions of the same segment close the connection.
+                    log::warn!("{network_tuple} segment reached R2 transmissions, closing session");
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
+                    tcb.change_state(TcpState::Closed);
+                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    break;
+                }
+                continue;
+            }
             network_packet = stream_receiver.recv() => network_packet,
         };
 
@@ -706,20 +745,6 @@ async fn tcp_main_logic_loop(
         tcb.update_duplicate_ack_count(incoming_ack);
 
         tcb.update_inflight_packet_queue(incoming_ack);
-
-        for packet in tcb.collect_timed_out_inflight_packets() {
-            let (seq, count) = (packet.seq, packet.retransmit_count);
-            log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
-            write_packet_to_device(
-                &up_packet_sender,
-                network_tuple,
-                &tcb,
-                None,
-                ACK | PSH,
-                Some(seq),
-                Some(packet.payload),
-            )?;
-        }
 
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
@@ -938,6 +963,18 @@ async fn tcp_main_logic_loop(
     Ok::<(), std::io::Error>(())
 }
 
+/// Wait for the connection's retransmission deadline, which RFC 6298 §5.6 sets after every
+/// backoff and §5.4 acts on by retransmitting the earliest unacknowledged segment. A connection with nothing
+/// outstanding has no deadline, so it waits for `arm_notify` to say a segment reopened the inflight
+/// queue; the caller re-enters `select!` afterwards and reads the deadline that segment created.
+async fn wait_retransmission_deadline(tcb: &TcbPtr, arm_notify: &tokio::sync::Notify) {
+    let deadline = { tcb.lock().unwrap().get_retransmission_deadline() };
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => arm_notify.notified().await,
+    }
+}
+
 fn extract_data_n_write_upstream(
     up_packet_sender: &PacketSender,
     tcb: &mut Tcb,
@@ -1120,6 +1157,132 @@ mod tests {
         }
         let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
         (woken.clone(), Waker::from(Arc::new(Recording(woken))))
+    }
+
+    use tokio::io::AsyncWriteExt;
+
+    const PEER: &str = "10.0.0.2:12345";
+    const LOCAL: &str = "10.0.0.1:80";
+
+    /// Takes the TCP header of a packet the stack wrote to the device.
+    fn tcp_header_of(packet: &NetworkPacket) -> &TcpHeader {
+        match packet.transport_header() {
+            TransportHeader::Tcp(header) => header,
+            _ => panic!("the stack wrote a packet that is not TCP"),
+        }
+    }
+
+    /// Opens a connection and completes its handshake, returning the stream, the device receiver,
+    /// and the sequence number the stack sends its first data byte at.
+    async fn established() -> (IpStackTcpStream, PacketReceiver, u32) {
+        let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+
+        let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
+        syn.syn = true;
+        let stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+
+        let syn_ack = up_rx.recv().await.unwrap();
+        let local_seq = tcp_header_of(&syn_ack).sequence_number + 1;
+        stream.stream_sender().send(peer_ack(1001, local_seq)).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+
+        (stream, up_rx, local_seq)
+    }
+
+    /// An acknowledgement from the peer, carrying no data.
+    fn peer_ack(seq: u32, ack: u32) -> NetworkPacket {
+        let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        create_raw_packet(src, dst, |_, _| usize::MAX, ACK, TTL, seq, ack, u16::MAX, Vec::new(), &[]).unwrap()
+    }
+
+    /// The intervals RFC 6298 §5.5 produces from a one-second timeout doubling to the §2.5 ceiling.
+    const BACKOFF: [u64; MAX_RETRANSMIT_COUNT] = [1, 2, 4, 8, 16, 32, 60];
+
+    /// Advances the clock by `seconds` and returns what the stack wrote to the device.
+    async fn advance(seconds: u64, up_rx: &mut PacketReceiver) -> Option<NetworkPacket> {
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        tokio::task::yield_now().await;
+        up_rx.try_recv().ok()
+    }
+
+    /// RFC 6298 §5.4: a segment with nothing behind it is retransmitted once its deadline passes,
+    /// with no packet arriving to prompt it.
+    #[tokio::test(start_paused = true)]
+    async fn lost_segment_is_retransmitted_without_an_arrival() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream.write_all(b"hello").await.unwrap();
+        let sent = up_rx.recv().await.unwrap();
+        assert_eq!(tcp_header_of(&sent).sequence_number, local_seq);
+
+        let again = advance(BACKOFF[0], &mut up_rx).await.expect("no retransmission");
+        assert_eq!(tcp_header_of(&again).sequence_number, local_seq);
+        assert_eq!(again.payload.as_deref(), Some(&b"hello"[..]));
+    }
+
+    /// RFC 9293 §3.8.3: R2 transmissions of the same segment close the connection, after the at
+    /// least 100 seconds SHLD-11 asks for.
+    #[tokio::test(start_paused = true)]
+    async fn unacknowledged_segment_closes_the_connection_at_r2() {
+        let (mut stream, mut up_rx, _) = established().await;
+        let opened = tokio::time::Instant::now();
+
+        stream.write_all(b"hello").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        // every interval but the last carries a retransmission; the last carries the reset
+        for seconds in BACKOFF.iter().take(MAX_RETRANSMIT_COUNT - 1) {
+            let packet = advance(*seconds, &mut up_rx).await.expect("no retransmission");
+            assert!(!tcp_header_of(&packet).rst);
+        }
+        // the last expiry retransmits once more and then resets
+        let last = advance(BACKOFF[MAX_RETRANSMIT_COUNT - 1], &mut up_rx).await;
+        assert!(!tcp_header_of(&last.expect("no retransmission")).rst);
+        assert!(tcp_header_of(&up_rx.try_recv().expect("no reset")).rst);
+
+        assert!((tokio::time::Instant::now() - opened).as_secs() > 100);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+    }
+
+    /// RFC 6298 §5.4 retransmits the earliest unacknowledged segment, so every attempt carries the
+    /// sequence number and payload of the first.
+    #[tokio::test(start_paused = true)]
+    async fn retransmissions_carry_the_original_segment() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream.write_all(b"hello").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        for seconds in BACKOFF.iter().take(4) {
+            let packet = advance(*seconds, &mut up_rx).await.expect("no retransmission");
+            assert_eq!(tcp_header_of(&packet).sequence_number, local_seq);
+            assert_eq!(packet.payload.as_deref(), Some(&b"hello"[..]));
+        }
+    }
+
+    /// An acknowledgement retires the segment, so no deadline remains, the connection stays open,
+    /// and a further segment flows.
+    #[tokio::test(start_paused = true)]
+    async fn an_acknowledgement_stops_retransmission() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream.write_all(b"hello").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        for seconds in BACKOFF.iter().take(5) {
+            advance(*seconds, &mut up_rx).await.expect("no retransmission");
+        }
+
+        stream.stream_sender().send(peer_ack(1001, local_seq + 5)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(stream.tcb.lock().unwrap().get_retransmission_deadline().is_none());
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+
+        stream.write_all(b"more").await.unwrap();
+        let sent = up_rx.recv().await.unwrap();
+        assert_eq!(sent.payload.as_deref(), Some(&b"more"[..]));
     }
 
     #[tokio::test]
