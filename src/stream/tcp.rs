@@ -683,7 +683,21 @@ async fn tcp_main_logic_loop(
             _ = wait_retransmission_deadline(&tcb, &arm_notify) => {
                 // Either a deadline passed or the queue just reopened, so ask once who is overdue.
                 let mut tcb = tcb.lock().unwrap();
+                let state = tcb.get_state();
+                if state == TcpState::Closed {
+                    log::debug!("{network_tuple} {state:?}: session finished, exiting task...");
+                    break;
+                }
                 let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+                if exhausted {
+                    // RFC 9293 §3.8.3: R2 transmissions of the same segment close the connection.
+                    log::warn!("{network_tuple} segment reached R2 transmissions, closing session");
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
+                    tcb.change_state(TcpState::Closed);
+                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    break;
+                }
                 for packet in packets {
                     let (seq, count) = (packet.seq, packet.retransmit_count);
                     log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
@@ -696,15 +710,6 @@ async fn tcp_main_logic_loop(
                         Some(seq),
                         Some(packet.payload),
                     )?;
-                }
-                if exhausted {
-                    // RFC 9293 §3.8.3: R2 transmissions of the same segment close the connection.
-                    log::warn!("{network_tuple} segment reached R2 transmissions, closing session");
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
-                    tcb.change_state(TcpState::Closed);
-                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                    read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                    break;
                 }
                 continue;
             }
@@ -1200,9 +1205,9 @@ mod tests {
     /// The intervals RFC 6298 §5.5 produces from a one-second timeout doubling to the §2.5 ceiling.
     const BACKOFF: [u64; MAX_RETRANSMIT_COUNT] = [1, 2, 4, 8, 16, 32, 60];
 
-    /// Advances the clock by `seconds` and returns what the stack wrote to the device.
-    async fn advance(seconds: u64, up_rx: &mut PacketReceiver) -> Option<NetworkPacket> {
-        tokio::time::advance(Duration::from_secs(seconds)).await;
+    /// Advances the clock by `by` and returns what the stack wrote to the device.
+    async fn advance(by: Duration, up_rx: &mut PacketReceiver) -> Option<NetworkPacket> {
+        tokio::time::advance(by).await;
         tokio::task::yield_now().await;
         up_rx.try_recv().ok()
     }
@@ -1217,33 +1222,53 @@ mod tests {
         let sent = up_rx.recv().await.unwrap();
         assert_eq!(tcp_header_of(&sent).sequence_number, local_seq);
 
-        let again = advance(BACKOFF[0], &mut up_rx).await.expect("no retransmission");
+        let again = advance(Duration::from_secs(BACKOFF[0]), &mut up_rx)
+            .await
+            .expect("no retransmission");
         assert_eq!(tcp_header_of(&again).sequence_number, local_seq);
         assert_eq!(again.payload.as_deref(), Some(&b"hello"[..]));
     }
 
-    /// RFC 9293 §3.8.3: R2 transmissions of the same segment close the connection, after the at
-    /// least 100 seconds SHLD-11 asks for.
+    /// RFC 9293 §3.8.3: the connection closes when a segment's transmissions reach R2, one timeout
+    /// after the last retransmission and past the 100 seconds SHLD-11 asks for.
     #[tokio::test(start_paused = true)]
     async fn unacknowledged_segment_closes_the_connection_at_r2() {
         let (mut stream, mut up_rx, _) = established().await;
         let opened = tokio::time::Instant::now();
+        let just_before = |seconds: u64| Duration::from_secs(seconds) - Duration::from_millis(1);
 
         stream.write_all(b"hello").await.unwrap();
         up_rx.recv().await.unwrap();
 
-        // every interval but the last carries a retransmission; the last carries the reset
         for seconds in BACKOFF.iter().take(MAX_RETRANSMIT_COUNT - 1) {
-            let packet = advance(*seconds, &mut up_rx).await.expect("no retransmission");
+            assert!(advance(just_before(*seconds), &mut up_rx).await.is_none());
+            let packet = advance(Duration::from_millis(1), &mut up_rx).await.expect("no retransmission");
             assert!(!tcp_header_of(&packet).rst);
         }
-        // the last expiry retransmits once more and then resets
-        let last = advance(BACKOFF[MAX_RETRANSMIT_COUNT - 1], &mut up_rx).await;
-        assert!(!tcp_header_of(&last.expect("no retransmission")).rst);
-        assert!(tcp_header_of(&up_rx.try_recv().expect("no reset")).rst);
+
+        assert!(advance(just_before(BACKOFF[MAX_RETRANSMIT_COUNT - 1]), &mut up_rx).await.is_none());
+        let reset = advance(Duration::from_millis(1), &mut up_rx).await.expect("no reset");
+        assert!(tcp_header_of(&reset).rst);
+        assert!(up_rx.try_recv().is_err());
 
         assert!((tokio::time::Instant::now() - opened).as_secs() > 100);
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+    }
+
+    /// RFC 9293 §3.10.7.4: a reset closes the connection and ends its retransmission.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_stops_retransmission() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream.write_all(b"hello").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        let reset = create_raw_packet(src, dst, |_, _| usize::MAX, RST, TTL, 1001, local_seq, u16::MAX, Vec::new(), &[]).unwrap();
+        stream.stream_sender().send(reset).unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(advance(Duration::from_secs(BACKOFF[0]), &mut up_rx).await.is_none());
     }
 
     /// RFC 6298 §5.4 retransmits the earliest unacknowledged segment, so every attempt carries the
@@ -1256,7 +1281,7 @@ mod tests {
         up_rx.recv().await.unwrap();
 
         for seconds in BACKOFF.iter().take(4) {
-            let packet = advance(*seconds, &mut up_rx).await.expect("no retransmission");
+            let packet = advance(Duration::from_secs(*seconds), &mut up_rx).await.expect("no retransmission");
             assert_eq!(tcp_header_of(&packet).sequence_number, local_seq);
             assert_eq!(packet.payload.as_deref(), Some(&b"hello"[..]));
         }
@@ -1272,7 +1297,7 @@ mod tests {
         up_rx.recv().await.unwrap();
 
         for seconds in BACKOFF.iter().take(5) {
-            advance(*seconds, &mut up_rx).await.expect("no retransmission");
+            advance(Duration::from_secs(*seconds), &mut up_rx).await.expect("no retransmission");
         }
 
         stream.stream_sender().send(peer_ack(1001, local_seq + 5)).unwrap();

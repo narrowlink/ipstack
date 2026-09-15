@@ -10,6 +10,9 @@ pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicat
 /// Retransmission timeout
 pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Floor on the configured retransmission timeout, per RFC 6298 §2.4
+const MIN_RTO: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Ceiling on the backed-off retransmission timeout; RFC 6298 §2.5 permits one of at least 60 seconds
 const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -94,6 +97,7 @@ impl Tcb {
         rto: std::time::Duration,
         max_retransmit_count: usize,
     ) -> Tcb {
+        let rto = rto.max(MIN_RTO);
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
@@ -380,36 +384,41 @@ impl Tcb {
     }
 
     /// The deadline the connection waits on: the earliest send time in the inflight queue plus the
-    /// current retransmission timeout, and nothing while no data is outstanding.
+    /// current retransmission timeout, present while data is outstanding and the sum fits the clock.
     pub(crate) fn get_retransmission_deadline(&self) -> Option<tokio::time::Instant> {
         self.inflight_packets
             .values()
             .map(|p| p.send_time)
             .min()
-            .map(|t| t + self.current_rto)
+            .and_then(|t| t.checked_add(self.current_rto))
     }
 
     #[must_use]
     /// The segments whose deadline has passed, and whether one of them reached R2, the transmission
-    /// count RFC 9293 §3.8.3 closes the connection at.
+    /// count RFC 9293 §3.8.3 closes the connection at. At R2 the list is empty.
     pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> (Vec<InflightPacket>, bool) {
-        let mut retransmit_list = Vec::new();
         let (rto, r2) = (self.current_rto, self.max_retransmit_count);
-        let mut exhausted = false;
+        if self
+            .inflight_packets
+            .values()
+            .any(|p| p.is_timed_out(rto) && p.retransmit_count + 1 >= r2)
+        {
+            return (Vec::new(), true);
+        }
 
+        let mut retransmit_list = Vec::new();
         for packet in self.inflight_packets.values_mut() {
             if packet.is_timed_out(rto) {
                 packet.retransmit_count += 1;
-                exhausted |= packet.retransmit_count >= r2;
                 retransmit_list.push(packet.clone());
             }
         }
         if !retransmit_list.is_empty() {
             let now = tokio::time::Instant::now();
             self.inflight_packets.values_mut().for_each(|packet| packet.send_time = now); // restart the timer, per RFC 6298 §5.6
-            self.current_rto = (self.current_rto * 2).min(MAX_RTO.max(self.rto)); // back off the timer, per RFC 6298 §5.5
+            self.current_rto = self.current_rto.saturating_mul(2).min(MAX_RTO.max(self.rto)); // back off the timer, per RFC 6298 §5.5
         }
-        (retransmit_list, exhausted)
+        (retransmit_list, false)
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
@@ -660,12 +669,55 @@ mod tests {
         assert_eq!(tcb.current_rto, RTO);
     }
 
+    /// RFC 6298 §2.4: a configured timeout below one second is raised to one second.
+    #[tokio::test(start_paused = true)]
+    async fn test_timeout_below_one_second_is_raised() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            Duration::from_millis(100),
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        assert_eq!(
+            tcb.get_retransmission_deadline(),
+            Some(tokio::time::Instant::now() + Duration::from_secs(1))
+        );
+    }
+
+    /// A configured timeout beyond the clock's range gives a deadline of `None`.
+    #[tokio::test(start_paused = true)]
+    async fn test_timeout_too_large_for_the_clock_has_no_deadline() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            Duration::MAX,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        assert!(tcb.get_retransmission_deadline().is_none());
+    }
+
     /// RFC 6298 §5.6: an expiry restarts the timer for every outstanding segment, so none is
     /// retransmitted before the backed-off timeout has run from that expiry.
     #[tokio::test(start_paused = true)]
     async fn test_expiry_restarts_the_timer_for_every_segment() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -696,6 +748,8 @@ mod tests {
         let rto = Duration::from_secs(120);
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -739,11 +793,15 @@ mod tests {
             tokio::time::advance(wait).await;
 
             let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
-            assert_eq!(packets.len(), 1);
-            let packet = &packets[0];
-            assert_eq!(packet.retransmit_count, i + 1);
+            if i + 1 < MAX_RETRANSMIT_COUNT {
+                assert_eq!(packets.len(), 1);
+                assert_eq!(packets[0].retransmit_count, i + 1);
+                assert!(!exhausted);
+            } else {
+                assert!(packets.is_empty());
+                assert!(exhausted);
+            }
             assert!(tcb.current_rto > RTO);
-            assert_eq!(exhausted, i + 1 >= MAX_RETRANSMIT_COUNT);
         }
 
         // the segment stays outstanding at R2; the connection closes rather than the queue losing it
