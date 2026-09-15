@@ -738,6 +738,7 @@ async fn tcp_main_logic_loop(
                     extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                 }
                 tcb.change_state(TcpState::Established);
+                write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
             }
             TcpState::Established => {
                 if flags == ACK {
@@ -824,6 +825,7 @@ async fn tcp_main_logic_loop(
                         tcb.add_unordered_packet(incoming_seq, payload);
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                     }
+                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 } else {
                     // unnormal case, we do nothing here
                     log::trace!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, unnormal case, we do nothing here");
@@ -1108,6 +1110,18 @@ mod tests {
     use super::*;
     use crate::stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, READ_BUFFER_SIZE, RTO};
 
+    /// A waker that records whether it was woken, and the flag it sets.
+    fn recording_waker() -> (Arc<std::sync::atomic::AtomicBool>, Waker) {
+        struct Recording(Arc<std::sync::atomic::AtomicBool>);
+        impl std::task::Wake for Recording {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (woken.clone(), Waker::from(Arc::new(Recording(woken))))
+    }
+
     #[tokio::test]
     async fn extract_reserves_before_consuming() {
         let (up_tx, _up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
@@ -1185,11 +1199,16 @@ mod tests {
         })
     }
 
-    /// A peer offering a shift of 7 gets the option back and has its windows honoured shifted by 7.
+    /// A peer offering a shift of 7 gets this stack's shift of 0 back and has its windows honoured
+    /// shifted by 7.
     #[tokio::test]
     async fn syn_with_window_scale_is_answered_and_honoured() {
         let (stream, syn_ack, mut up_rx) = open(4000, &[TcpOptionElement::WindowScale(7)]).await;
-        assert!(window_scale_of(&syn_ack).is_some(), "the SYN-ACK carries no window scale option");
+        assert_eq!(
+            window_scale_of(&syn_ack),
+            Some(0),
+            "the SYN-ACK does not carry this stack's window scale"
+        );
 
         let peer_seq = SeqNum(syn_ack.acknowledgment_number);
         feed(&stream, &syn_ack, peer_seq, 40_000, &[1; 4]);
@@ -1216,24 +1235,39 @@ mod tests {
         assert_eq!(tcb.get_send_window(), 40_000 << 14);
     }
 
-    /// A peer opening with a closed window holds the writer until a later segment reopens it.
+    /// A closed peer window holds the writer, and the segment that reopens it wakes the writer, both
+    /// when it completes the handshake and when it arrives on an established connection.
     #[tokio::test]
     async fn zero_peer_window_holds_the_writer_until_it_reopens() {
         let (mut stream, syn_ack, mut up_rx) = open(0, &[]).await;
         let peer_seq = SeqNum(syn_ack.acknowledgment_number);
 
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(
-            Pin::new(&mut stream).poll_write(&mut cx, b"held").is_pending(),
-            "a closed peer window let the write through"
-        );
-
+        // the segment completing the handshake reopens the window
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_write(&mut cx, b"held").is_pending());
         feed(&stream, &syn_ack, peer_seq, 40_000, &[1; 4]);
         up_rx.recv().await.unwrap();
-        assert_eq!(stream.tcb.lock().unwrap().get_send_window(), 40_000);
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the handshake reopened the window without waking the writer"
+        );
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"held"), Poll::Ready(Ok(4))));
+        assert_eq!(up_rx.recv().await.unwrap().payload.as_deref(), Some(&b"held"[..]));
 
+        // a data segment closes the window and a later one reopens it
+        feed(&stream, &syn_ack, peer_seq + 4, 0, &[2; 4]);
+        up_rx.recv().await.unwrap();
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_write(&mut cx, b"sent").is_pending());
+        feed(&stream, &syn_ack, peer_seq + 8, 40_000, &[3; 4]);
+        up_rx.recv().await.unwrap();
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "a data segment reopened the window without waking the writer"
+        );
         assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"sent"), Poll::Ready(Ok(4))));
-        let packet = up_rx.recv().await.unwrap();
-        assert_eq!(packet.payload.as_deref(), Some(&b"sent"[..]));
+        assert_eq!(up_rx.recv().await.unwrap().payload.as_deref(), Some(&b"sent"[..]));
     }
 }

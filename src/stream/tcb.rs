@@ -102,7 +102,10 @@ impl Tcb {
         let recv_window_shift = peer_window_shift.map(|_| {
             (0..=MAX_WINDOW_SHIFT)
                 .find(|&shift| read_buffer_size >> shift <= u16::MAX as usize)
-                .unwrap_or(MAX_WINDOW_SHIFT)
+                .unwrap_or_else(|| {
+                    log::warn!("Read buffer size {read_buffer_size} is too large to scale, limiting the shift count to {MAX_WINDOW_SHIFT}");
+                    MAX_WINDOW_SHIFT
+                })
         });
         Tcb {
             seq: seq.into(),
@@ -623,6 +626,7 @@ mod tests {
     #[test]
     fn test_peer_window_shift_is_taken_from_the_syn() {
         let mut tcb = window_tcb(4000, Some(7), READ_BUFFER_SIZE);
+        assert_eq!(tcb.get_send_window(), 4000); // the SYN's own window is unscaled
 
         tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
         assert_eq!(tcb.get_send_window(), 40_000 << 7);
@@ -632,6 +636,7 @@ mod tests {
     #[test]
     fn test_no_window_scale_option_leaves_the_window_unshifted() {
         let mut tcb = window_tcb(4000, None, READ_BUFFER_SIZE);
+        assert_eq!(tcb.get_send_window(), 4000);
 
         tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
         assert_eq!(tcb.get_send_window(), 40_000);
