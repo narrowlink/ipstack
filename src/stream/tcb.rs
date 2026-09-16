@@ -13,6 +13,9 @@ pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 /// Maximum count of retransmissions before dropping the packet
 pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
 
+/// Maximum window scale shift count, which RFC 7323 §2.3 limits to 14 for a maximum window of 1 GiB
+const MAX_WINDOW_SHIFT: u8 = 14;
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
     // Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
@@ -44,13 +47,19 @@ pub(super) enum PacketType {
 /// - `unordered_packets` is the bytes stream received from the lower device,
 ///   which can be acknowledged and extracted by `consume_unordered_packets` method
 ///   then can be read by upstream application via `Tcp::poll_read` method.
+/// - `send_window_shift` is the peer's window scale, applied to every window the peer advertises,
+///   and `recv_window_shift` is this stack's own, applied to every window this stack advertises.
+///   Both are settled by the SYN exchange, and `recv_window_shift` is `None` when the peer's SYN
+///   carried no window scale option, which leaves both directions unscaled.
 #[derive(Debug, Clone)]
 pub(crate) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     mtu: u16,
     last_received_ack: SeqNum,
-    send_window: u16,
+    send_window: u32,
+    send_window_shift: u8,
+    recv_window_shift: Option<u8>,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
@@ -64,8 +73,11 @@ pub(crate) struct Tcb {
 }
 
 impl Tcb {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         ack: SeqNum,
+        peer_window: u16,
+        peer_window_shift: Option<u8>,
         mtu: u16,
         max_unacked_bytes: u32,
         read_buffer_size: usize,
@@ -77,12 +89,32 @@ impl Tcb {
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::RngExt::random::<u32>(&mut rand::rng());
+        let send_window_shift = peer_window_shift.map_or(0, |shift| {
+            if shift > MAX_WINDOW_SHIFT {
+                log::warn!("Peer window scale shift count {shift} is too large, limiting it to {MAX_WINDOW_SHIFT}");
+                MAX_WINDOW_SHIFT
+            } else {
+                shift
+            }
+        });
+        // The stack scales its own receive window by the smallest shift that expresses the whole
+        // read buffer in the 16-bit window field.
+        let recv_window_shift = peer_window_shift.map(|_| {
+            (0..=MAX_WINDOW_SHIFT)
+                .find(|&shift| read_buffer_size >> shift <= u16::MAX as usize)
+                .unwrap_or_else(|| {
+                    log::warn!("Read buffer size {read_buffer_size} is too large to scale, limiting the shift count to {MAX_WINDOW_SHIFT}");
+                    MAX_WINDOW_SHIFT
+                })
+        });
         Tcb {
             seq: seq.into(),
             ack,
             mtu,
             last_received_ack: seq.into(),
-            send_window: u16::MAX,
+            send_window: peer_window as u32,
+            send_window_shift,
+            recv_window_shift,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
@@ -209,14 +241,28 @@ impl Tcb {
     pub(super) fn get_state(&self) -> TcpState {
         self.state
     }
-    pub(super) fn update_send_window(&mut self, window: u16) {
-        self.send_window = window;
+    fn honoured_window(&self, tcp_header: &TcpHeader) -> u32 {
+        // RFC 7323 §2.3: SND.WND = SEG.WND << Snd.Wind.Shift, except on a segment carrying SYN,
+        // whose window field is never scaled.
+        let window = tcp_header.window_size as u32;
+        if tcp_header.syn { window } else { window << self.send_window_shift }
     }
-    pub(super) fn get_send_window(&self) -> u16 {
+    pub(super) fn update_send_window(&mut self, tcp_header: &TcpHeader) {
+        self.send_window = self.honoured_window(tcp_header);
+    }
+    pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
     }
     pub(super) fn get_recv_window(&self) -> u16 {
         self.get_available_read_buffer_size().try_into().unwrap_or(u16::MAX)
+    }
+    pub(super) fn get_scaled_recv_window(&self) -> u16 {
+        // RFC 7323 §2.3: SEG.WND = RCV.WND >> Rcv.Wind.Shift
+        let window = self.get_available_read_buffer_size() >> self.recv_window_shift.unwrap_or(0);
+        window.try_into().unwrap_or(u16::MAX)
+    }
+    pub(super) fn get_recv_window_shift(&self) -> Option<u8> {
+        self.recv_window_shift
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
@@ -234,7 +280,7 @@ impl Tcb {
     pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketType {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
-        let rcvd_window = tcp_header.window_size;
+        let rcvd_window = self.honoured_window(tcp_header);
         let len = payload.len();
         let res = if rcvd_ack > self.seq {
             PacketType::Invalid
@@ -339,7 +385,7 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
         // Simplified version: min(cwnd, rwnd)
-        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window() as u32)
+        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window())
     }
 }
 
@@ -391,6 +437,8 @@ mod tests {
     fn test_get_unordered_packets_with_max_bytes() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -431,6 +479,8 @@ mod tests {
     fn test_add_unordered_packet_enforces_read_buffer() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -456,6 +506,8 @@ mod tests {
     fn test_consume_trims_overlapping_head_entry() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -480,6 +532,8 @@ mod tests {
     fn test_update_inflight_packet_queue() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -512,6 +566,8 @@ mod tests {
     fn test_update_inflight_packet_queue_cumulative_ack() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -535,6 +591,8 @@ mod tests {
     fn test_retransmit_with_exponential_backoff() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
+            u16::MAX,
+            None,
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
@@ -562,5 +620,77 @@ mod tests {
         let packets = tcb.collect_timed_out_inflight_packets();
         assert!(packets.is_empty());
         assert!(tcb.inflight_packets.is_empty());
+    }
+
+    /// A peer shift of 7 is applied to every window the peer advertises after the handshake.
+    #[test]
+    fn test_peer_window_shift_is_taken_from_the_syn() {
+        let mut tcb = window_tcb(4000, Some(7), READ_BUFFER_SIZE);
+        assert_eq!(tcb.get_send_window(), 4000); // the SYN's own window is unscaled
+
+        tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
+        assert_eq!(tcb.get_send_window(), 40_000 << 7);
+    }
+
+    /// A peer that offers no window scale option has its windows honoured as they stand.
+    #[test]
+    fn test_no_window_scale_option_leaves_the_window_unshifted() {
+        let mut tcb = window_tcb(4000, None, READ_BUFFER_SIZE);
+        assert_eq!(tcb.get_send_window(), 4000);
+
+        tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
+        assert_eq!(tcb.get_send_window(), 40_000);
+        assert_eq!(tcb.get_recv_window_shift(), None);
+    }
+
+    /// RFC 7323 §2.3 limits the shift count to 14, so a larger one is used as 14.
+    #[test]
+    fn test_peer_window_shift_above_the_maximum_is_clamped() {
+        let mut tcb = window_tcb(4000, Some(15), READ_BUFFER_SIZE);
+
+        tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
+        assert_eq!(tcb.get_send_window(), 40_000 << MAX_WINDOW_SHIFT);
+    }
+
+    /// A peer opening with a closed window is held to it, whatever shift the same SYN offers.
+    #[test]
+    fn test_zero_peer_window_is_honoured() {
+        assert_eq!(window_tcb(0, None, READ_BUFFER_SIZE).get_send_window(), 0);
+        assert_eq!(window_tcb(0, Some(7), READ_BUFFER_SIZE).get_send_window(), 0);
+    }
+
+    /// The announced shift is the smallest expressing the read buffer in 16 bits, the advertised
+    /// window is the free space shifted down by it, and a peer shift of 0 still enables scaling.
+    #[test]
+    fn test_advertised_window_is_derived_from_the_read_buffer() {
+        assert_eq!(window_tcb(4000, Some(0), 16 * 1024).get_recv_window_shift(), Some(0));
+        assert_eq!(window_tcb(4000, Some(0), 64 * 1024).get_recv_window_shift(), Some(1));
+
+        // 1.2 MiB needs a shift of 5, which expresses the window only in multiples of 32, so the
+        // advertised value rounds down and withholds the remainder rather than overstating the room
+        let buffer = 1_258_291;
+        let mut tcb = window_tcb(4000, Some(0), buffer);
+        assert_eq!(tcb.get_recv_window_shift(), Some(5));
+        assert_eq!(usize::from(tcb.get_scaled_recv_window()), buffer >> 5);
+        assert!(usize::from(tcb.get_scaled_recv_window()) << 5 < buffer);
+
+        // the advertised window shrinks as the buffer fills
+        tcb.add_unordered_packet(SeqNum(1000), vec![0; buffer - 1000]);
+        assert_eq!(usize::from(tcb.get_scaled_recv_window()), 1000 >> 5);
+    }
+
+    // A `Tcb` opened by a SYN advertising `peer_window` under `peer_window_shift`.
+    fn window_tcb(peer_window: u16, peer_window_shift: Option<u8>, read_buffer_size: usize) -> Tcb {
+        Tcb::new(
+            SeqNum(1000),
+            peer_window,
+            peer_window_shift,
+            1500,
+            MAX_UNACK,
+            read_buffer_size,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        )
     }
 }
