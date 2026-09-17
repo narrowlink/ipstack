@@ -7,11 +7,8 @@ pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 pub(super) const READ_CHUNK: usize = 8192; // 8KB, bytes drained from the reassembly buffer per handoff
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
-/// Retransmission timeout
+/// Retransmission timeout, and the floor RFC 6298 §2.4 rounds a configured one up to
 pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Floor on the configured retransmission timeout, per RFC 6298 §2.4
-const MIN_RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Ceiling on the backed-off retransmission timeout; RFC 6298 §2.5 permits one of at least 60 seconds
 const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(60);
@@ -97,7 +94,7 @@ impl Tcb {
         rto: std::time::Duration,
         max_retransmit_count: usize,
     ) -> Tcb {
-        let rto = rto.max(MIN_RTO);
+        let rto = rto.max(RTO);
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
@@ -388,9 +385,8 @@ impl Tcb {
     pub(crate) fn get_retransmission_deadline(&self) -> Option<tokio::time::Instant> {
         self.inflight_packets
             .values()
-            .map(|p| p.send_time)
-            .min()
-            .and_then(|t| t.checked_add(self.current_rto))
+            .next()
+            .and_then(|p| p.send_time.checked_add(self.current_rto))
     }
 
     #[must_use]
