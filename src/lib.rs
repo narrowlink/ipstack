@@ -325,6 +325,10 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             log::info!("Device EOF, stopping IP stack");
                             return Ok(());
                         }
+                        Ok(n) if n <= offset => {
+                            log::warn!("Discarding packet smaller than header offset: received {n} bytes, expected > {offset} bytes");
+                            continue;
+                        }
                         Ok(n) => n,
                         Err(e) => {
                             log::error!("Device read error: {e}");
@@ -470,5 +474,30 @@ mod tests {
             .await
             .expect("accept should not hang after device EOF");
         assert!(matches!(accept_result, Err(IpStackError::AcceptError)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn packet_smaller_than_header_offset_is_discarded_without_panic() {
+        use tokio::io::AsyncWriteExt;
+
+        let (device, mut peer) = duplex(1024);
+        let mut config = IpStackConfig::default();
+        config.packet_information(true);
+        let mut ip_stack = IpStack::new(config, device);
+
+        let mut packet_data = vec![0u8; 4];
+        let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(1234, 5678);
+        builder.write(&mut packet_data, &[1, 2, 3, 4]).unwrap();
+
+        peer.write_all(&[0x00, 0x01]).await.unwrap();
+        tokio::task::yield_now().await;
+        peer.write_all(&packet_data).await.unwrap();
+
+        let accepted = timeout(Duration::from_secs(1), ip_stack.accept())
+            .await
+            .expect("accept timed out")
+            .expect("accept returned error");
+        assert!(matches!(accepted, IpStackStream::Udp(_)));
     }
 }
