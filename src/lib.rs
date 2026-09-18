@@ -457,11 +457,71 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        collections::VecDeque,
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
-    use tokio::{io::duplex, time::timeout};
+    use tokio::{
+        io::{duplex, AsyncRead, AsyncWrite, ReadBuf},
+        time::timeout,
+    };
 
     use super::*;
+
+    struct ChunkedDevice {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    impl ChunkedDevice {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into(),
+            }
+        }
+    }
+
+    impl AsyncRead for ChunkedDevice {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(mut chunk) = self.chunks.pop_front() {
+                let to_copy = buf.remaining().min(chunk.len());
+                buf.put_slice(&chunk[..to_copy]);
+                chunk.drain(..to_copy);
+                if !chunk.is_empty() {
+                    self.chunks.push_front(chunk);
+                }
+            }
+
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ChunkedDevice {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn device_eof_closes_accept_channel() {
@@ -479,20 +539,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn packet_smaller_than_header_offset_is_discarded_without_panic() {
-        use tokio::io::AsyncWriteExt;
-
-        let (device, mut peer) = duplex(1024);
         let mut config = IpStackConfig::default();
         config.packet_information(true);
-        let mut ip_stack = IpStack::new(config, device);
-
         let mut packet_data = vec![0u8; 4];
         let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(1234, 5678);
         builder.write(&mut packet_data, &[1, 2, 3, 4]).unwrap();
 
-        peer.write_all(&[0x00, 0x01]).await.unwrap();
-        tokio::task::yield_now().await;
-        peer.write_all(&packet_data).await.unwrap();
+        let device = ChunkedDevice::new(vec![vec![0x00, 0x01], packet_data]);
+        let mut ip_stack = IpStack::new(config, device);
 
         let accepted = timeout(Duration::from_secs(1), ip_stack.accept())
             .await
