@@ -1,10 +1,13 @@
 use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::Duration,
+};
 
 pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
 pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
-pub(super) const READ_CHUNK: usize = 8192; // 8KB, bytes drained from the reassembly buffer per handoff
+pub(super) const READ_CHUNK: usize = 8192; // 8KB, bytes drained from the received queue per handoff
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 /// Retransmission timeout, and the floor RFC 6298 §2.4 rounds a configured one up to
@@ -49,8 +52,8 @@ pub(super) enum PacketType {
 /// - `inflight_packets` is prerepresented bytes stream from upstream application,
 ///   which have been sent to the lower device but not yet acknowledged.
 /// - `unordered_packets` is the bytes stream received from the lower device,
-///   which can be acknowledged and extracted by `consume_unordered_packets` method
-///   then can be read by upstream application via `Tcp::poll_read` method.
+///   whose in-sequence part `acknowledge_unordered_packets` acknowledges and moves to `received`.
+/// - `received` is the acknowledged bytes stream, which `take_received` hands to the upstream reader.
 /// - `send_window_shift` is the peer's window scale, applied to every window the peer advertises,
 ///   and `recv_window_shift` is this stack's own, applied to every window this stack advertises.
 ///   Both are settled by the SYN exchange, and `recv_window_shift` is `None` when the peer's SYN
@@ -67,6 +70,7 @@ pub(crate) struct Tcb {
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
+    received: VecDeque<u8>,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
     max_unacked_bytes: u32,
@@ -128,6 +132,7 @@ impl Tcb {
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
+            received: VecDeque::new(),
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
             max_unacked_bytes,
@@ -159,23 +164,28 @@ impl Tcb {
         self.duplicate_ack_count >= self.max_count_for_dup_ack
     }
 
-    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
+    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, mut buf: Vec<u8>) {
         if seq < self.ack {
             #[rustfmt::skip]
             log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
             return;
         }
-        // The head-of-line segment always advances the stream, so it is admitted even at the limit;
-        // any other segment beyond the receive window is dropped for the peer's RTO to resend.
-        if seq != self.ack && self.get_unordered_packets_total_len() >= self.read_buffer_size {
+        // A segment starting beyond a closed receive window is dropped for the peer's RTO to resend.
+        if seq != self.ack && self.get_available_read_buffer_size() == 0 {
             #[rustfmt::skip]
             log::warn!("{:?}: Receive window full, dropping packet seq {seq}, len = {}", self.state, buf.len());
             return;
         }
-        self.unordered_packets.insert(seq, buf);
+        // Bytes past the right edge of the receive window are dropped for the peer to resend.
+        let window = self.read_buffer_size.saturating_sub(self.received.len());
+        buf.truncate(window.saturating_sub(seq.distance(self.ack) as usize));
+        if !buf.is_empty() {
+            self.unordered_packets.insert(seq, buf);
+        }
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
+        self.read_buffer_size
+            .saturating_sub(self.get_unordered_packets_total_len() + self.received.len())
     }
     #[inline]
     pub(crate) fn get_unordered_packets_total_len(&self) -> usize {
@@ -226,6 +236,19 @@ impl Tcb {
         }
 
         if data.is_empty() { None } else { Some(data) }
+    }
+
+    /// Acknowledges the in-sequence data of the reassembly buffer, moving it to `received`.
+    pub(super) fn acknowledge_unordered_packets(&mut self) {
+        if let Some(data) = self.consume_unordered_packets(usize::MAX) {
+            self.received.extend(data);
+        }
+    }
+
+    /// Takes up to `max_bytes` of acknowledged data, in sequence order.
+    pub(super) fn take_received(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
+        let len = max_bytes.min(self.received.len());
+        (len > 0).then(|| self.received.drain(..len).collect())
     }
 
     pub(super) fn increase_seq(&mut self) {
@@ -535,17 +558,13 @@ mod tests {
             MAX_RETRANSMIT_COUNT,
         );
 
-        // fill the receive buffer to its limit with an out-of-order gap held open
-        tcb.add_unordered_packet(SeqNum(1000 + READ_BUFFER_SIZE as u32), vec![7; READ_BUFFER_SIZE]);
+        // fill the receive buffer to its limit
+        tcb.add_unordered_packet(SeqNum(1000), vec![7; READ_BUFFER_SIZE]);
         assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
 
         // a further out-of-order segment is dropped, keeping the buffer bounded
         tcb.add_unordered_packet(SeqNum(1000 + 2 * READ_BUFFER_SIZE as u32), vec![8; 500]);
         assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
-
-        // the head-of-line segment is admitted even at the limit, so the stream advances
-        tcb.add_unordered_packet(SeqNum(1000), vec![9; 500]);
-        assert_eq!(tcb.unordered_packets.get(&SeqNum(1000)).unwrap().len(), 500);
     }
 
     #[test]

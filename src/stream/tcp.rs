@@ -312,6 +312,14 @@ impl AsyncRead for IpStackTcpStream {
 
         let state = self.tcb.lock().unwrap().get_state();
         if state == TcpState::Closed {
+            // Data on hand reaches the reader before end-of-stream.
+            let data = self.data_rx.try_recv().ok();
+            if let Some(data) = data.or_else(|| self.tcb.lock().unwrap().take_received(usize::MAX)) {
+                let len = std::cmp::min(buf.remaining(), data.len());
+                buf.put_slice(&data[..len]);
+                self.temp_read_buffer.extend_from_slice(&data[len..]);
+                return Poll::Ready(Ok(()));
+            }
             self.shutdown.lock().unwrap().ready();
             self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
             return Poll::Ready(Ok(()));
@@ -671,6 +679,7 @@ async fn tcp_main_logic_loop(
         let network_packet = tokio::select! {
             _ = exit_monitor.recv() => {
                 log::debug!("{network_tuple} task exited due to exit signal");
+                read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 break;
             }
             _ = drain_notify.notified() => {
@@ -943,7 +952,9 @@ async fn tcp_main_logic_loop(
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
-                    if flags & FIN == FIN {
+                    if flags & FIN == FIN && tcb.get_ack() == incoming_seq + len as u32 {
+                        tcb.increase_ack();
+                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                         tcb.change_state(TcpState::TimeWait);
                         tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
                         let new_state = tcb.get_state();
@@ -994,8 +1005,9 @@ fn extract_data_n_write_upstream(
         return Ok(());
     }
 
-    // Reserve the handoff slot before consuming, so buffered data is removed only once it has a
-    // guaranteed home; the reserved permit shrinks the advertised window until the reader drains it.
+    tcb.acknowledge_unordered_packets();
+
+    // Reserve the handoff slot before taking acknowledged data.
     let permit = match data_tx.try_reserve() {
         Ok(permit) => permit,
         Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
@@ -1007,7 +1019,7 @@ fn extract_data_n_write_upstream(
         }
     };
 
-    if let Some(data) = tcb.consume_unordered_packets(READ_CHUNK) {
+    if let Some(data) = tcb.take_received(READ_CHUNK) {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         permit.send(data);
@@ -1336,18 +1348,18 @@ mod tests {
         extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
         assert_eq!(tcb.get_ack(), SeqNum(2000));
 
-        // channel is full: extract leaves the remaining data in the map and does not advance ack
+        // channel is full: extract advances ack over the tail and holds it for the reader
         tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
         extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
-        assert_eq!(tcb.get_ack(), SeqNum(2000));
-        assert_eq!(tcb.get_unordered_packets_total_len(), 500);
+        assert_eq!(tcb.get_ack(), SeqNum(2500));
+        assert_eq!(tcb.get_available_read_buffer_size(), READ_BUFFER_SIZE - 500);
 
         // draining the reader frees a slot, and the next extract flushes the tail
         let first = data_rx.recv().await.unwrap();
         assert_eq!(first.len(), 1000);
         extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
         assert_eq!(tcb.get_ack(), SeqNum(2500));
-        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+        assert_eq!(tcb.get_available_read_buffer_size(), READ_BUFFER_SIZE);
     }
 
     /// Opens a connection with a SYN advertising `window` and `syn_options`, returning the stream
