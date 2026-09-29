@@ -459,6 +459,13 @@ impl Tcb {
         self.inflight_packets.values().collect::<Vec<_>>()
     }
 
+    /// Bytes that may still be sent: the peer's window, capped by the unacknowledged limit, less
+    /// what is already in flight.
+    pub(super) fn send_room(&self) -> usize {
+        let limit = self.max_unacked_bytes.min(self.get_send_window());
+        limit.saturating_sub(self.seq.distance(self.get_last_received_ack())) as usize
+    }
+
     pub fn is_send_buffer_full(&self) -> bool {
         // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
         // Simplified version: min(cwnd, rwnd)

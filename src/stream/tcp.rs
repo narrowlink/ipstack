@@ -391,8 +391,11 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Pending;
         }
 
+        // A segment carries no more than the peer's window has room for (RFC 9293 §3.8.6.1), and only
+        // that much of `buf` is copied: the rest is the caller's to offer again.
+        let take = buf.len().min(tcb.send_room()).min(tcb.get_mtu() as usize);
         let sender = &self.up_packet_sender;
-        let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
+        let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf[..take].to_vec()))?;
         let was_empty = tcb.is_inflight_queue_empty();
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
         if was_empty {
@@ -1318,6 +1321,24 @@ mod tests {
             assert_eq!(buf[..8], [1; 8]);
             assert_eq!(buf[8..], [3; 4]);
         }
+    }
+
+    /// RFC 9293 §3.8.6.1: a sender keeps the data in flight within the peer's window, so the last
+    /// segment before the window fills is cut to the room left rather than sent whole.
+    #[tokio::test]
+    async fn segments_stay_inside_the_peers_window() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        stream.stream_sender().send(peer_segment(1001, local_seq, ACK, 3000, &[])).unwrap();
+        written(&mut up_rx).await;
+
+        // More than the window: the write parks once the window is full.
+        let _ = tokio::time::timeout(Duration::from_millis(100), stream.write_all(&[7; 4000])).await;
+        let sent: Vec<usize> = written(&mut up_rx)
+            .await
+            .iter()
+            .filter_map(|p| p.payload.as_ref().map(Vec::len))
+            .collect();
+        assert_eq!(sent.iter().sum::<usize>(), 3000, "sent {sent:?} into a 3000-byte window");
     }
 
     /// The intervals RFC 6298 §5.5 produces from a one-second timeout doubling to the §2.5 ceiling.
