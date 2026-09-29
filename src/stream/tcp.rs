@@ -773,8 +773,15 @@ async fn tcp_main_logic_loop(
         match state {
             TcpState::SynReceived if flags & ACK == ACK => {
                 if len > 0 {
-                    tcb.add_unordered_packet(incoming_seq, payload);
-                    extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                    receive_segment(
+                        &up_packet_sender,
+                        &mut tcb,
+                        network_tuple,
+                        incoming_seq,
+                        payload,
+                        &data_tx,
+                        &read_notify,
+                    )?;
                 }
                 tcb.change_state(TcpState::Established);
                 write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
@@ -799,9 +806,8 @@ async fn tcp_main_logic_loop(
                             }
                         }
                         PacketType::NewPacket => {
-                            tcb.add_unordered_packet(incoming_seq, payload);
                             let nt = network_tuple;
-                            extract_data_n_write_upstream(&up_packet_sender, &mut tcb, nt, &data_tx, &read_notify)?;
+                            receive_segment(&up_packet_sender, &mut tcb, nt, incoming_seq, payload, &data_tx, &read_notify)?;
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                         }
                         PacketType::Ack => {
@@ -860,9 +866,18 @@ async fn tcp_main_logic_loop(
                         ));
                     }
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
-                    if !payload.is_empty() && tcb.get_ack() == incoming_seq {
-                        tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                    // PSH changes nothing about where a segment belongs: one that arrives out of order
+                    // is kept and answered like any other.
+                    if !payload.is_empty() {
+                        receive_segment(
+                            &up_packet_sender,
+                            &mut tcb,
+                            network_tuple,
+                            incoming_seq,
+                            payload,
+                            &data_tx,
+                            &read_notify,
+                        )?;
                     }
                     write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 } else {
@@ -918,8 +933,15 @@ async fn tcp_main_logic_loop(
                     tcb.change_state(TcpState::FinWait2);
                     if len > 0 {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                        tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        receive_segment(
+                            &up_packet_sender,
+                            &mut tcb,
+                            network_tuple,
+                            incoming_seq,
+                            payload,
+                            &data_tx,
+                            &read_notify,
+                        )?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
                     let new_state = tcb.get_state();
@@ -948,8 +970,15 @@ async fn tcp_main_logic_loop(
                         write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     } else {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                        tcb.add_unordered_packet(incoming_seq, payload);
-                        extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        receive_segment(
+                            &up_packet_sender,
+                            &mut tcb,
+                            network_tuple,
+                            incoming_seq,
+                            payload,
+                            &data_tx,
+                            &read_notify,
+                        )?;
                         write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
                     if flags & FIN == FIN && tcb.get_ack() == incoming_seq + len as u32 {
@@ -991,18 +1020,41 @@ async fn wait_retransmission_deadline(tcb: &TcbPtr, arm_notify: &tokio::sync::No
     }
 }
 
+/// Stores a data segment that arrived from the peer and acknowledges it.
+///
+/// The ACK goes out even when no new data reaches the reader: a segment that arrives out of order,
+/// or one already received, is answered with a duplicate ACK at once (RFC 5681 §4.2), which is
+/// what lets the peer fast-retransmit the segment in the gap instead of waiting out its timer.
+fn receive_segment(
+    up_packet_sender: &PacketSender,
+    tcb: &mut Tcb,
+    network_tuple: NetworkTuple,
+    seq: SeqNum,
+    payload: Vec<u8>,
+    data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+) -> std::io::Result<()> {
+    tcb.add_unordered_packet(seq, payload);
+    if !extract_data_n_write_upstream(up_packet_sender, tcb, network_tuple, data_tx, read_notify)? {
+        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
+    }
+    Ok(())
+}
+
+/// Hands acknowledged data to the reader. Returns whether an ACK was written, or none is due
+/// because the session is closed.
 fn extract_data_n_write_upstream(
     up_packet_sender: &PacketSender,
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
     data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
     let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
     if state == TcpState::Closed {
         log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
-        return Ok(());
+        return Ok(true);
     }
 
     tcb.acknowledge_unordered_packets();
@@ -1012,7 +1064,7 @@ fn extract_data_n_write_upstream(
         Ok(permit) => permit,
         Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
             write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
-            return Ok(());
+            return Ok(true);
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
             return Err(std::io::Error::new(BrokenPipe, "data channel closed"));
@@ -1025,8 +1077,9 @@ fn extract_data_n_write_upstream(
         permit.send(data);
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Send a TCP packet to the downstream device, with the specified flags, sequence number, and payload.
@@ -1212,6 +1265,59 @@ mod tests {
     fn peer_ack(seq: u32, ack: u32) -> NetworkPacket {
         let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
         create_raw_packet(src, dst, |_, _| usize::MAX, ACK, TTL, seq, ack, u16::MAX, Vec::new(), &[]).unwrap()
+    }
+
+    /// A segment from the peer carrying `payload` at `seq`, with `flags` and a raw `window`.
+    fn peer_segment(seq: u32, ack: u32, flags: u8, window: u16, payload: &[u8]) -> NetworkPacket {
+        let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        create_raw_packet(src, dst, |_, _| usize::MAX, flags, TTL, seq, ack, window, payload.to_vec(), &[]).unwrap()
+    }
+
+    /// Drains what the stack wrote to the device so far.
+    async fn written(up_rx: &mut PacketReceiver) -> Vec<NetworkPacket> {
+        tokio::task::yield_now().await;
+        let mut packets = Vec::new();
+        while let Ok(packet) = up_rx.try_recv() {
+            packets.push(packet);
+        }
+        packets
+    }
+
+    /// RFC 5681 §4.2: an out-of-order segment is answered at once with a duplicate ACK, whether or
+    /// not it carries PSH, and is kept for when the gap fills.
+    #[tokio::test(start_paused = true)]
+    async fn out_of_order_segment_is_answered_with_a_duplicate_ack() {
+        for flags in [ACK, ACK | PSH] {
+            let (mut stream, mut up_rx, local_seq) = established().await;
+
+            // Bytes 1001..1009 are missing; 1009..1013 arrive first.
+            stream
+                .stream_sender()
+                .send(peer_segment(1009, local_seq, flags, u16::MAX, &[3; 4]))
+                .unwrap();
+            let acks: Vec<u32> = written(&mut up_rx)
+                .await
+                .iter()
+                .map(|p| tcp_header_of(p).acknowledgment_number)
+                .collect();
+            assert_eq!(acks, [1001], "flags {flags:#x}: the out-of-order segment got no duplicate ACK");
+
+            // The gap fills: the ACK covers both segments and the reader sees them in order.
+            stream
+                .stream_sender()
+                .send(peer_segment(1001, local_seq, flags, u16::MAX, &[1; 8]))
+                .unwrap();
+            let acks: Vec<u32> = written(&mut up_rx)
+                .await
+                .iter()
+                .map(|p| tcp_header_of(p).acknowledgment_number)
+                .collect();
+            assert_eq!(acks.last(), Some(&1013), "flags {flags:#x}: the buffered segment was not kept");
+            let mut buf = [0u8; 12];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+            assert_eq!(buf[..8], [1; 8]);
+            assert_eq!(buf[8..], [3; 4]);
+        }
     }
 
     /// The intervals RFC 6298 §5.5 produces from a one-second timeout doubling to the §2.5 ceiling.
