@@ -247,7 +247,7 @@ impl IpStackTcpStream {
 
         let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst).saturating_add(1);
         let (seq, ack, state) = { (tcb.get_seq().0, tcb.get_ack().0, tcb.get_state()) };
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+        let l_info = LocalInfo(seq, ack);
         log::debug!("{tuple} {state:?}: {l_info} session begins, total TCP sessions: {sessions}");
 
         stream.spawn_tasks()?;
@@ -330,7 +330,7 @@ impl AsyncRead for IpStackTcpStream {
             {
                 let mut tcb = self.tcb.lock().unwrap();
                 let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
-                let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+                let l_info = LocalInfo(seq, ack);
                 log::debug!("{network_tuple} {state:?}: [poll_read] {l_info}, session timeout reached, closing forcefully...");
                 let sender = &self.up_packet_sender;
                 write_packet_to_device(sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
@@ -386,14 +386,14 @@ impl AsyncWrite for IpStackTcpStream {
 
         if send_window == 0 || is_full {
             self.write_notify.lock().unwrap().replace(cx.waker().clone());
-            let info = format!("current send window: {send_window}, send buffer full: {is_full}");
-            log::trace!("{nt} {state:?}: [poll_write] {info}, waiting for the other side to send ACK...");
+            log::trace!(
+                "{nt} {state:?}: [poll_write] current send window: {send_window}, send buffer full: {is_full}, waiting for the other side to send ACK..."
+            );
             return Poll::Pending;
         }
 
-        // A segment carries no more than the peer's window has room for (RFC 9293 §3.8.6.1), and only
-        // that much of `buf` is copied: the rest is the caller's to offer again.
-        let take = buf.len().min(tcb.send_room()).min(tcb.get_mtu() as usize);
+        // A segment past the right edge of the peer window is trimmed by the peer (RFC 9293 §3.10.7.4).
+        let buf = &buf[..buf.len().min(tcb.get_usable_send_window() as usize)];
         let sender = &self.up_packet_sender;
         let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf[..take].to_vec()))?;
         let was_empty = tcb.is_inflight_queue_empty();
@@ -405,7 +405,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+        let l_info = LocalInfo(seq, ack);
         log::trace!("{nt} {state:?}: [poll_write] {l_info} upstream data written to device, len = {payload_len}");
 
         Poll::Ready(Ok(payload_len))
@@ -572,7 +572,7 @@ async fn tcp_main_logic_loop(
 
         tcb.increase_ack();
         let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+        let l_info = LocalInfo(seq, ack);
         log::trace!("{network_tuple} {state:?}: {l_info} session begins");
         write_packet_to_device(
             &up_packet_sender,
@@ -766,9 +766,12 @@ async fn tcp_main_logic_loop(
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
         let (state, seq, ack) = { (tcb.get_state(), tcb.get_seq(), tcb.get_ack()) };
-        let (info, len) = (tcp_header_fmt(tcp_header), payload.len());
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-        log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
+        let len = payload.len();
+        let l_info = LocalInfo(seq, ack);
+        if log::log_enabled!(log::Level::Trace) {
+            let info = tcp_header_fmt(tcp_header);
+            log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
+        }
         if pkt_type == PacketType::Invalid {
             continue;
         }
@@ -1054,7 +1057,7 @@ fn extract_data_n_write_upstream(
     read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
 ) -> std::io::Result<bool> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
-    let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+    let l_info = LocalInfo(seq, ack);
     if state == TcpState::Closed {
         log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
         return Ok(true);
@@ -1086,6 +1089,16 @@ fn extract_data_n_write_upstream(
 }
 
 /// Send a TCP packet to the downstream device, with the specified flags, sequence number, and payload.
+/// `local { seq, ack }` for log lines, formatted only when a line is actually emitted: the session
+/// loop builds one for every packet, whether or not anything is logged.
+struct LocalInfo<S, A>(S, A);
+
+impl<S: std::fmt::Display, A: std::fmt::Display> std::fmt::Display for LocalInfo<S, A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "local {{ seq: {}, ack: {} }}", self.0, self.1)
+    }
+}
+
 /// The returned value is the length of the `payload` sent, it may be shorter than the length of the incoming parameter `payload`.
 pub(crate) fn write_packet_to_device(
     up_packet_sender: &PacketSender,
@@ -1596,5 +1609,29 @@ mod tests {
         );
         assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"sent"), Poll::Ready(Ok(4))));
         assert_eq!(up_rx.recv().await.unwrap().payload.as_deref(), Some(&b"sent"[..]));
+    }
+
+    /// A write that would pass the right edge of the peer window is cut at the edge, and the next
+    /// one waits for an ACK instead of sending past it.
+    #[tokio::test]
+    async fn writer_stops_at_the_right_edge_of_the_peer_window() {
+        let (mut stream, syn_ack, mut up_rx) = open(2000, &[]).await;
+        let peer_seq = SeqNum(syn_ack.acknowledgment_number);
+        feed(&stream, &syn_ack, peer_seq, 2000, &[1; 4]);
+        up_rx.recv().await.unwrap();
+
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let chunk = [7; 1460];
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, &chunk), Poll::Ready(Ok(1460))));
+        assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(1460));
+
+        assert!(
+            matches!(Pin::new(&mut stream).poll_write(&mut cx, &chunk), Poll::Ready(Ok(540))),
+            "the second write is not cut at the right edge of the 2000-byte window"
+        );
+        assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(540));
+
+        assert!(Pin::new(&mut stream).poll_write(&mut cx, &chunk).is_pending());
     }
 }
