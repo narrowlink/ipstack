@@ -465,7 +465,7 @@ mod tests {
     };
 
     use tokio::{
-        io::{duplex, AsyncRead, AsyncWrite, ReadBuf},
+        io::{AsyncRead, AsyncWrite, ReadBuf, duplex},
         time::timeout,
     };
 
@@ -477,18 +477,12 @@ mod tests {
 
     impl ChunkedDevice {
         fn new(chunks: Vec<Vec<u8>>) -> Self {
-            Self {
-                chunks: chunks.into(),
-            }
+            Self { chunks: chunks.into() }
         }
     }
 
     impl AsyncRead for ChunkedDevice {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
             if let Some(mut chunk) = self.chunks.pop_front() {
                 let to_copy = buf.remaining().min(chunk.len());
                 buf.put_slice(&chunk[..to_copy]);
@@ -503,11 +497,7 @@ mod tests {
     }
 
     impl AsyncWrite for ChunkedDevice {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
             Poll::Ready(Ok(buf.len()))
         }
 
@@ -515,10 +505,7 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
