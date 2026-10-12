@@ -395,7 +395,7 @@ impl AsyncWrite for IpStackTcpStream {
         // A segment past the right edge of the peer window is trimmed by the peer (RFC 9293 §3.10.7.4).
         let buf = &buf[..buf.len().min(tcb.get_usable_send_window() as usize)];
         let sender = &self.up_packet_sender;
-        let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf[..take].to_vec()))?;
+        let payload_len = write_packet_to_device(sender, nt, &tcb, None, ACK | PSH, None, Some(buf.to_vec()))?;
         let was_empty = tcb.is_inflight_queue_empty();
         tcb.add_inflight_packet(buf[..payload_len].to_vec())?;
         if was_empty {
