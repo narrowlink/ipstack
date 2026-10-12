@@ -164,11 +164,17 @@ impl Tcb {
         self.duplicate_ack_count >= self.max_count_for_dup_ack
     }
 
-    pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, mut buf: Vec<u8>) {
+    pub(super) fn add_unordered_packet(&mut self, mut seq: SeqNum, mut buf: Vec<u8>) {
         if seq < self.ack {
-            #[rustfmt::skip]
-            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
-            return;
+            // A retransmission re-segmented across the ack: keep the bytes past it.
+            let received = self.ack.distance(seq) as usize;
+            if received >= buf.len() {
+                #[rustfmt::skip]
+                log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
+                return;
+            }
+            buf.drain(..received);
+            seq = self.ack;
         }
         // A segment starting beyond a closed receive window is dropped for the peer's RTO to resend.
         if seq != self.ack && self.get_available_read_buffer_size() == 0 {
@@ -547,6 +553,35 @@ mod tests {
         // test 3: no data to extract
         let data = tcb.consume_unordered_packets(1000);
         assert!(data.is_none());
+    }
+
+    /// A retransmission re-segmented across the ack keeps the bytes past it (RFC 9293 §3.10.7.4
+    /// trims a segment to the part that lies in the window), instead of being dropped whole.
+    #[test]
+    fn test_add_unordered_packet_keeps_the_new_part_of_a_straddling_segment() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 100]);
+        tcb.consume_unordered_packets(usize::MAX).unwrap();
+        assert_eq!(tcb.ack, SeqNum(1100));
+
+        // 1050..1150: the first 50 bytes were already received, the last 50 are new.
+        tcb.add_unordered_packet(SeqNum(1050), vec![2; 100]);
+        assert_eq!(tcb.consume_unordered_packets(usize::MAX), Some(vec![2; 50]));
+        assert_eq!(tcb.ack, SeqNum(1150));
+
+        // Entirely below the ack: a pure duplicate, nothing is stored.
+        tcb.add_unordered_packet(SeqNum(1000), vec![3; 100]);
+        assert_eq!(tcb.consume_unordered_packets(usize::MAX), None);
     }
 
     #[test]
