@@ -384,6 +384,13 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
 
+        // The task that answers the SYN may not have run yet. Data written now would leave ahead of
+        // the SYN-ACK, under the initial sequence number.
+        if state == TcpState::Listen {
+            self.write_notify.lock().unwrap().replace(cx.waker().clone());
+            return Poll::Pending;
+        }
+
         if send_window == 0 || is_full {
             self.write_notify.lock().unwrap().replace(cx.waker().clone());
             log::trace!(
@@ -588,6 +595,7 @@ async fn tcp_main_logic_loop(
         let state = tcb.get_state();
         log::trace!("{network_tuple} {state:?}: session now in {state:?} state");
     }
+    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
 
     let tcb_clone = tcb.clone();
 
@@ -1633,5 +1641,36 @@ mod tests {
         assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(540));
 
         assert!(Pin::new(&mut stream).poll_write(&mut cx, &chunk).is_pending());
+    }
+
+    /// Data written before the task that answers the SYN has run must not leave ahead of the
+    /// SYN-ACK.
+    #[tokio::test]
+    async fn write_before_the_syn_ack_waits_for_it() {
+        let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
+        syn.syn = true;
+        let mut stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"early").is_pending(),
+            "a write was accepted before the SYN-ACK went out"
+        );
+        let packets = written(&mut up_rx).await;
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the SYN-ACK did not wake the writer"
+        );
+        assert!(
+            matches!(packets.as_slice(), [packet] if tcp_header_of(packet).syn),
+            "the SYN-ACK is not the first packet"
+        );
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"early"), Poll::Ready(Ok(5))));
+        let packets = written(&mut up_rx).await;
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].payload.as_deref(), Some(&b"early"[..]));
     }
 }
