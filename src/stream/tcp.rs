@@ -362,6 +362,10 @@ impl AsyncRead for IpStackTcpStream {
             Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Pending => {
                 self.read_notify.lock().unwrap().replace(cx.waker().clone());
+                // The peer's FIN is in and the channel is empty, so nothing more can arrive.
+                if matches!(state, TcpState::CloseWait | TcpState::LastAck | TcpState::TimeWait) {
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Pending
             }
         }
@@ -1008,6 +1012,11 @@ async fn tcp_main_logic_loop(
             _ => {}
         } // end of match state
 
+        // A FIN can move the session into a state where `poll_read` reports end-of-stream.
+        if flags & FIN == FIN {
+            read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+        }
+
         tcb.update_last_received_ack(incoming_ack);
         tcb.update_send_window(tcp_header);
     } // end of loop
@@ -1633,5 +1642,30 @@ mod tests {
         assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(540));
 
         assert!(Pin::new(&mut stream).poll_write(&mut cx, &chunk).is_pending());
+    }
+
+    /// After the peer's FIN nothing more can arrive, so a pending reader is woken and reads
+    /// end-of-stream instead of waiting for the idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn reader_sees_end_of_stream_after_the_peers_fin() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut storage = [0u8; 16];
+        let mut buf = tokio::io::ReadBuf::new(&mut storage);
+        assert!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf).is_pending());
+
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[]))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the peer's FIN did not wake the pending reader"
+        );
+        assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf), Poll::Ready(Ok(()))));
+        assert!(buf.filled().is_empty(), "the reader got data instead of end-of-stream");
     }
 }
