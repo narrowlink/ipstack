@@ -196,7 +196,7 @@ impl IpStackTcpStream {
                 })
             })
             .flatten();
-        let tcb = Tcb::new(
+        let mut tcb = Tcb::new(
             SeqNum(tcp.sequence_number),
             tcp.window_size,
             peer_window_shift,
@@ -207,6 +207,15 @@ impl IpStackTcpStream {
             config.rto,
             config.max_retransmit_count,
         );
+        // Like the window scale, the MSS option is read only from a segment carrying SYN.
+        if tcp.syn
+            && let Some(mss) = tcp.options_iterator().flatten().find_map(|option| match option {
+                TcpOptionElement::MaximumSegmentSize(mss) => Some(mss),
+                _ => None,
+            })
+        {
+            tcb.set_peer_mss(mss);
+        }
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
             if !tcp.rst
@@ -1633,5 +1642,26 @@ mod tests {
         assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(540));
 
         assert!(Pin::new(&mut stream).poll_write(&mut cx, &chunk).is_pending());
+    }
+
+    /// RFC 9293 §3.7.1: a segment never carries more payload than the MSS the peer announced in its
+    /// SYN, and an announced MSS below 536 is read as 536.
+    #[tokio::test]
+    async fn segments_stay_within_the_peers_mss() {
+        for (announced, expected) in [(600, 600), (100, 536)] {
+            let (mut stream, syn_ack, mut up_rx) = open(u16::MAX, &[TcpOptionElement::MaximumSegmentSize(announced)]).await;
+            let peer_seq = SeqNum(syn_ack.acknowledgment_number);
+            feed(&stream, &syn_ack, peer_seq, u16::MAX, &[1; 4]);
+            up_rx.recv().await.unwrap();
+
+            let (_, waker) = recording_waker();
+            let mut cx = Context::from_waker(&waker);
+            let written = match Pin::new(&mut stream).poll_write(&mut cx, &[7; 1460]) {
+                Poll::Ready(Ok(n)) => n,
+                other => panic!("the write did not complete: {other:?}"),
+            };
+            assert_eq!(written, expected, "peer MSS {announced}: wrong write size");
+            assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(expected));
+        }
     }
 }
