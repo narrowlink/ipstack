@@ -426,6 +426,11 @@ impl AsyncWrite for IpStackTcpStream {
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
+        // The FIN waits for in-flight data, and the ACKs that settle it wake `write_notify`, which
+        // no writer waits on once the stream is shutting down.
+        if !is_ready {
+            self.write_notify.lock().unwrap().replace(cx.waker().clone());
+        }
         match shutdown {
             Shutdown::None => {
                 if is_ready && state == TcpState::Established {
@@ -1633,5 +1638,38 @@ mod tests {
         assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(540));
 
         assert!(Pin::new(&mut stream).poll_write(&mut cx, &chunk).is_pending());
+    }
+
+    /// A shutdown that waits for in-flight data is woken by the ACK that settles it, and then sends
+    /// the FIN.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_is_woken_when_in_flight_data_is_acknowledged() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"data"), Poll::Ready(Ok(4))));
+        written(&mut up_rx).await;
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        assert!(
+            written(&mut up_rx).await.is_empty(),
+            "the FIN went out before the data was acknowledged"
+        );
+
+        stream.stream_sender().send(peer_ack(1001, local_seq + 4)).unwrap();
+        written(&mut up_rx).await;
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the ACK did not wake the pending shutdown"
+        );
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        let packets = written(&mut up_rx).await;
+        assert!(
+            packets.iter().any(|packet| tcp_header_of(packet).fin),
+            "no FIN was sent once the data was acknowledged"
+        );
     }
 }
