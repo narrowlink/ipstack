@@ -362,6 +362,17 @@ impl AsyncRead for IpStackTcpStream {
             Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Pending => {
                 self.read_notify.lock().unwrap().replace(cx.waker().clone());
+                // The peer's FIN is in and the channel is empty, so nothing more can arrive. Acknowledged
+                // data may still wait in the Tcb for a channel slot, and it goes to the reader first.
+                if matches!(state, TcpState::CloseWait | TcpState::LastAck | TcpState::TimeWait) {
+                    let data = self.tcb.lock().unwrap().take_received(usize::MAX);
+                    if let Some(data) = data {
+                        let len = std::cmp::min(buf.remaining(), data.len());
+                        buf.put_slice(&data[..len]);
+                        self.temp_read_buffer.extend_from_slice(&data[len..]);
+                    }
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Pending
             }
         }
@@ -1008,6 +1019,11 @@ async fn tcp_main_logic_loop(
             _ => {}
         } // end of match state
 
+        // A FIN can move the session into a state where `poll_read` reports end-of-stream.
+        if flags & FIN == FIN {
+            read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+        }
+
         tcb.update_last_received_ack(incoming_ack);
         tcb.update_send_window(tcp_header);
     } // end of loop
@@ -1297,6 +1313,66 @@ mod tests {
             packets.push(packet);
         }
         packets
+    }
+
+    /// After the peer's FIN nothing more can arrive, so a pending reader is woken and reads
+    /// end-of-stream instead of waiting for the idle timeout.
+    #[tokio::test(start_paused = true)]
+    async fn reader_sees_end_of_stream_after_the_peers_fin() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut storage = [0u8; 16];
+        let mut buf = tokio::io::ReadBuf::new(&mut storage);
+        assert!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf).is_pending());
+
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[]))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the peer's FIN did not wake the pending reader"
+        );
+        assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf), Poll::Ready(Ok(()))));
+        assert!(buf.filled().is_empty(), "the reader got data instead of end-of-stream");
+    }
+
+    /// Data acknowledged before the peer's FIN reaches the reader first, even when it still waits
+    /// in the Tcb because the data channel had no free slot.
+    #[tokio::test(start_paused = true)]
+    async fn queued_data_is_read_before_end_of_stream() {
+        let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
+        syn.syn = true;
+        // A buffer of one chunk makes a data channel of one slot.
+        let config = TcpConfig { read_buffer_size: 8192, ..TcpConfig::default() };
+        let mut stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, None, Arc::new(config)).unwrap();
+        let syn_ack = up_rx.recv().await.unwrap();
+        let local_seq = tcp_header_of(&syn_ack).sequence_number + 1;
+        stream.stream_sender().send(peer_ack(1001, local_seq)).unwrap();
+        tokio::task::yield_now().await;
+        for (seq, flags, payload) in [(1001, ACK, &[1u8; 100][..]), (1101, ACK, &[2; 100]), (1201, ACK | FIN, &[])] {
+            stream.stream_sender().send(peer_segment(seq, local_seq, flags, u16::MAX, payload)).unwrap();
+            written(&mut up_rx).await;
+        }
+        assert!(matches!(stream.tcb.lock().unwrap().get_state(), TcpState::CloseWait | TcpState::LastAck));
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut read = Vec::new();
+        loop {
+            let mut storage = [0u8; 4096];
+            let mut buf = tokio::io::ReadBuf::new(&mut storage);
+            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf), Poll::Ready(Ok(()))));
+            if buf.filled().is_empty() {
+                break;
+            }
+            read.extend_from_slice(buf.filled());
+        }
+        assert_eq!(read, [vec![1u8; 100], vec![2u8; 100]].concat(), "bytes were lost before end-of-stream");
     }
 
     /// RFC 5681 §4.2: an out-of-order segment is answered at once with a duplicate ACK, whether or
