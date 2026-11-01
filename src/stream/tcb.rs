@@ -63,6 +63,8 @@ pub(crate) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     mtu: u16,
+    /// The largest segment the peer announced in the MSS option of its SYN, unbounded without one.
+    peer_mss: u16,
     last_received_ack: SeqNum,
     send_window: u32,
     send_window_shift: u8,
@@ -125,6 +127,7 @@ impl Tcb {
             seq: seq.into(),
             ack,
             mtu,
+            peer_mss: u16::MAX,
             last_received_ack: seq.into(),
             send_window: peer_window as u32,
             send_window_shift,
@@ -144,10 +147,19 @@ impl Tcb {
         }
     }
 
+    /// RFC 9293 §3.7.1: a sender never sends a segment larger than the peer announced. Below 88,
+    /// the floor Linux applies (TCP_MIN_MSS), the option is not followed, so a peer cannot ask for
+    /// its data a few bytes at a time.
+    pub(super) fn set_peer_mss(&mut self, mss: u16) {
+        self.peer_mss = mss.max(88);
+    }
+
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
         let send_window = self.get_send_window() as usize;
         let mtu = self.get_mtu() as usize;
-        std::cmp::min(send_window, mtu.saturating_sub(ip_header_size + tcp_header_size))
+        // The MSS counts the payload and the TCP options of a segment, but not the 20-byte base header.
+        let mss = (self.peer_mss as usize).saturating_sub(tcp_header_size.saturating_sub(20));
+        send_window.min(mtu.saturating_sub(ip_header_size + tcp_header_size)).min(mss)
     }
 
     pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
