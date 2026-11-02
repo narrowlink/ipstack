@@ -22,15 +22,40 @@ impl std::fmt::Display for NetworkTuple {
     }
 }
 
-pub mod tcp_flags {
-    pub const CWR: u8 = 0b10000000;
-    pub const ECE: u8 = 0b01000000;
-    pub const URG: u8 = 0b00100000;
-    pub const ACK: u8 = 0b00010000;
-    pub const PSH: u8 = 0b00001000;
-    pub const RST: u8 = 0b00000100;
-    pub const SYN: u8 = 0b00000010;
-    pub const FIN: u8 = 0b00000001;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpFlags(u8);
+
+impl TcpFlags {
+    pub(crate) const CWR: Self = Self(0b10000000);
+    pub(crate) const ECE: Self = Self(0b01000000);
+    pub(crate) const URG: Self = Self(0b00100000);
+    pub(crate) const ACK: Self = Self(0b00010000);
+    pub(crate) const PSH: Self = Self(0b00001000);
+    pub(crate) const RST: Self = Self(0b00000100);
+    pub(crate) const SYN: Self = Self(0b00000010);
+    pub(crate) const FIN: Self = Self(0b00000001);
+
+    fn empty() -> Self {
+        Self(0)
+    }
+
+    pub(crate) fn contains(self, flags: Self) -> bool {
+        self.0 & flags.0 == flags.0
+    }
+}
+
+impl std::ops::BitOr for TcpFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for TcpFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -170,31 +195,31 @@ pub fn tcp_header_fmt(header: &TcpHeader) -> String {
     )
 }
 
-pub fn tcp_header_flags(inner: &TcpHeader) -> u8 {
-    let mut flags = 0;
+pub(crate) fn tcp_header_flags(inner: &TcpHeader) -> TcpFlags {
+    let mut flags = TcpFlags::empty();
     if inner.cwr {
-        flags |= tcp_flags::CWR;
+        flags |= TcpFlags::CWR;
     }
     if inner.ece {
-        flags |= tcp_flags::ECE;
+        flags |= TcpFlags::ECE;
     }
     if inner.urg {
-        flags |= tcp_flags::URG;
+        flags |= TcpFlags::URG;
     }
     if inner.ack {
-        flags |= tcp_flags::ACK;
+        flags |= TcpFlags::ACK;
     }
     if inner.psh {
-        flags |= tcp_flags::PSH;
+        flags |= TcpFlags::PSH;
     }
     if inner.rst {
-        flags |= tcp_flags::RST;
+        flags |= TcpFlags::RST;
     }
     if inner.syn {
-        flags |= tcp_flags::SYN;
+        flags |= TcpFlags::SYN;
     }
     if inner.fin {
-        flags |= tcp_flags::FIN;
+        flags |= TcpFlags::FIN;
     }
 
     flags
