@@ -104,9 +104,14 @@ impl ShutdownSignal {
         }
     }
 
+    /// Re-poll a deferred shutdown without completing it.
+    fn wake(&self) {
+        self.waker.wake();
+    }
+
     fn complete(&self) {
         self.completed.store(true, Ordering::Release);
-        self.waker.wake();
+        self.wake();
     }
 }
 
@@ -514,6 +519,7 @@ impl IpStackTcpStream {
                 drain_notify,
                 arm_notify,
                 exit_monitor,
+                shutdown.clone(),
             )
             .await;
             if let Err(e) = &v {
@@ -544,6 +550,7 @@ async fn tcp_main_logic_loop(
     drain_notify: Arc<tokio::sync::Notify>,
     arm_notify: Arc<tokio::sync::Notify>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
+    shutdown: Arc<ShutdownSignal>,
 ) -> std::io::Result<()> {
     {
         let mut tcb = tcb.lock().unwrap();
@@ -999,6 +1006,11 @@ async fn tcp_main_logic_loop(
 
         tcb.update_last_received_ack(incoming_ack);
         tcb.update_send_window(tcp_header);
+        // ACKs with or without data can retire the last outstanding bytes. The
+        // shutdown waiter may belong to a different task than the writer.
+        if flags & ACK != 0 && tcb.get_state() == TcpState::Established && tcb.is_inflight_queue_empty() {
+            shutdown.wake();
+        }
     } // end of loop
     Ok::<(), std::io::Error>(())
 }
@@ -1303,6 +1315,76 @@ mod tests {
             }),
         )
         .await
+    }
+
+    async fn shutdown_after_ack(same_task: bool, ack_flags: u8) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let (write_woken, write_waker) = recording_waker();
+        let mut write_cx = Context::from_waker(&write_waker);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut write_cx, b"hello"),
+            Poll::Ready(Ok(5))
+        ));
+        up_rx.recv().await.unwrap();
+
+        let (shutdown_woken, shutdown_waker) = if same_task { (write_woken, write_waker) } else { recording_waker() };
+        let mut shutdown_cx = Context::from_waker(&shutdown_waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
+        assert!(up_rx.try_recv().is_err(), "FIN must wait for outstanding data");
+
+        // A partial ACK must not send FIN or wake an independent shutdown waiter.
+        stream.stream_sender().send(peer_ack(1001, local_seq + 2)).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stream.tcb.lock().unwrap().get_inflight_packets_total_len() != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(up_rx.try_recv().is_err());
+        if !same_task {
+            assert!(!shutdown_woken.load(Ordering::SeqCst));
+        }
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
+        shutdown_woken.store(false, Ordering::SeqCst);
+
+        // The final ACK can also carry peer data; both paths must wake shutdown.
+        let payload: &[u8] = if ack_flags & PSH != 0 { b"reply" } else { b"" };
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq + 5, ack_flags, u16::MAX, payload))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stream.tcb.lock().unwrap().is_inflight_queue_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(shutdown_woken.load(Ordering::SeqCst), "final ACK did not wake shutdown");
+
+        // Waking requests another poll; it must not mark shutdown complete.
+        assert!(!stream.shutdown.completed.load(Ordering::Acquire));
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
+        let packets = written(&mut up_rx).await;
+        let fins: Vec<_> = packets.iter().map(tcp_header_of).filter(|header| header.fin).collect();
+        assert_eq!(fins.len(), 1, "shutdown must send exactly one FIN");
+        assert_eq!(fins[0].sequence_number, local_seq + 5);
+    }
+
+    #[tokio::test]
+    async fn final_ack_wakes_shutdown_from_the_writing_task() {
+        for flags in [ACK, ACK | PSH] {
+            shutdown_after_ack(true, flags).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn final_ack_wakes_shutdown_from_a_different_task() {
+        for flags in [ACK, ACK | PSH] {
+            shutdown_after_ack(false, flags).await;
+        }
     }
 
     #[tokio::test(start_paused = true)]
