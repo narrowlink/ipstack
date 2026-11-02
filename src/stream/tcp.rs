@@ -311,6 +311,8 @@ impl AsyncRead for IpStackTcpStream {
         let network_tuple = self.network_tuple();
 
         let state = self.tcb.lock().unwrap().get_state();
+        #[cfg(test)]
+        tests::run_after_state_snapshot();
         if state == TcpState::Closed {
             // Data on hand reaches the reader before end-of-stream.
             let data = self.data_rx.try_recv().ok();
@@ -362,6 +364,13 @@ impl AsyncRead for IpStackTcpStream {
             Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Pending => {
                 self.read_notify.lock().unwrap().replace(cx.waker().clone());
+                // RST may have closed the connection after the first state check but
+                // before this registration. Register first, then check again: either
+                // we observe Closed or the reset path will find and wake this waker.
+                let is_closed = self.tcb.lock().unwrap().get_state() == TcpState::Closed;
+                if is_closed {
+                    cx.waker().wake_by_ref();
+                }
                 Poll::Pending
             }
         }
@@ -423,24 +432,26 @@ impl AsyncWrite for IpStackTcpStream {
             (self.network_tuple(), tcb.get_state(), tcb.get_seq(), is_ready)
         };
         log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}, shutdown {shutdown}",);
+        #[cfg(test)]
+        tests::run_after_state_snapshot();
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
         match shutdown {
-            Shutdown::None => {
+            Shutdown::None | Shutdown::Pending(_) => {
                 if is_ready && state == TcpState::Established {
                     let mut tcb = self.tcb.lock().unwrap();
                     send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
                 }
-                self.shutdown.lock().unwrap().pending(cx.waker().clone());
-                Poll::Pending
-            }
-            Shutdown::Pending(_) => {
-                if is_ready && state == TcpState::Established {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
+                // The task may have completed since the snapshot above. Check Ready
+                // and register the latest waker under the same lock used by ready().
+                let mut shutdown = self.shutdown.lock().unwrap();
+                if matches!(*shutdown, Shutdown::Ready) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    shutdown.pending(cx.waker().clone());
+                    Poll::Pending
                 }
-                Poll::Pending
             }
             Shutdown::Ready => Poll::Ready(Ok(())),
         }
@@ -756,7 +767,12 @@ async fn tcp_main_logic_loop(
 
         if flags & RST == RST {
             tcb.change_state(TcpState::Closed);
-            continue;
+            drop(tcb);
+            write_notify.lock().unwrap().take().map(|w| w.wake()).unwrap_or(());
+            read_notify.lock().unwrap().take().map(|w| w.wake()).unwrap_or(());
+            // Finish the task so its destroy notification and shutdown waker are delivered
+            // even if the peer never sends another packet.
+            break;
         }
 
         tcb.update_duplicate_ack_count(incoming_ack);
@@ -1261,20 +1277,251 @@ mod tests {
     /// Opens a connection and completes its handshake, returning the stream, the device receiver,
     /// and the sequence number the stack sends its first data byte at.
     async fn established() -> (IpStackTcpStream, PacketReceiver, u32) {
+        established_with_destroy(None).await
+    }
+
+    async fn established_with_destroy(destroy: Option<tokio::sync::oneshot::Sender<()>>) -> (IpStackTcpStream, PacketReceiver, u32) {
         let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
         let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
 
         let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
         syn.syn = true;
-        let stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+        let stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, destroy, Arc::new(TcpConfig::default())).unwrap();
 
-        let syn_ack = up_rx.recv().await.unwrap();
+        let syn_ack = tokio::time::timeout(Duration::from_secs(1), up_rx.recv())
+            .await
+            .expect("SYN-ACK did not arrive")
+            .expect("TCP task closed before SYN-ACK");
         let local_seq = tcp_header_of(&syn_ack).sequence_number + 1;
         stream.stream_sender().send(peer_ack(1001, local_seq)).unwrap();
-        tokio::task::yield_now().await;
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+        wait_for_handshake(&stream).await.expect("handshake did not complete");
 
         (stream, up_rx, local_seq)
+    }
+
+    async fn wait_for_handshake(stream: &IpStackTcpStream) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| {
+                let tcb = stream.tcb.lock().unwrap();
+                if tcb.get_state() == TcpState::Established {
+                    Poll::Ready(())
+                } else {
+                    // The handshake transition holds tcb and wakes write_notify. Register
+                    // under the same state lock so that the transition cannot be missed.
+                    stream.write_notify.lock().unwrap().replace(cx.waker().clone());
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_wait_times_out_without_peer_ack() {
+        let (stream, _syn_ack, _up_rx) = open(u16::MAX, &[]).await;
+        let started = tokio::time::Instant::now();
+        assert!(wait_for_handshake(&stream).await.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::SynReceived);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_wait_is_woken_by_peer_ack() {
+        let (stream, syn_ack, mut up_rx) = open(u16::MAX, &[]).await;
+        let started = tokio::time::Instant::now();
+        let wait = wait_for_handshake(&stream);
+        tokio::pin!(wait);
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(std::future::Future::poll(wait.as_mut(), &mut cx).is_pending());
+        stream
+            .stream_sender()
+            .send(peer_ack(syn_ack.acknowledgment_number, syn_ack.sequence_number.wrapping_add(1)))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert!(woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(std::future::Future::poll(wait.as_mut(), &mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// A reset wakes blocked operations and ends the session task without waiting for a timer
+    /// or a second packet. Exercise both RST and RST|ACK with no time advancement.
+    #[tokio::test(start_paused = true)]
+    async fn reset_wakes_pending_read_write_and_shutdown() {
+        for flags in [RST, RST | ACK] {
+            let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+            let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+            stream.write_all(b"outstanding").await.unwrap();
+            written(&mut up_rx).await;
+            stream.stream_sender().send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+            written(&mut up_rx).await;
+
+            let (read_woken, read_waker) = recording_waker();
+            let mut read_cx = Context::from_waker(&read_waker);
+            let mut storage = [0; 16];
+            let mut read = tokio::io::ReadBuf::new(&mut storage);
+            assert!(Pin::new(&mut stream).poll_read(&mut read_cx, &mut read).is_pending());
+
+            let (write_woken, write_waker) = recording_waker();
+            let mut write_cx = Context::from_waker(&write_waker);
+            assert!(Pin::new(&mut stream).poll_write(&mut write_cx, b"blocked").is_pending());
+
+            let (shutdown_woken, shutdown_waker) = recording_waker();
+            let mut shutdown_cx = Context::from_waker(&shutdown_waker);
+            assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
+
+            let now = tokio::time::Instant::now();
+            stream.stream_sender().send(peer_segment(1001, local_seq, flags, 0, &[])).unwrap();
+            written(&mut up_rx).await;
+            assert_eq!(tokio::time::Instant::now(), now);
+            assert!(read_woken.load(std::sync::atomic::Ordering::SeqCst), "RST did not wake the reader");
+            assert!(write_woken.load(std::sync::atomic::Ordering::SeqCst), "RST did not wake the writer");
+            assert!(
+                shutdown_woken.load(std::sync::atomic::Ordering::SeqCst),
+                "RST did not wake shutdown"
+            );
+            assert!(
+                stream.task_handle.as_ref().unwrap().is_finished(),
+                "the reset session task is still running"
+            );
+            assert_eq!(destroy_rx.try_recv(), Ok(()), "RST must notify the stack to clean up the session");
+
+            let mut read = tokio::io::ReadBuf::new(&mut storage);
+            assert!(matches!(
+                Pin::new(&mut stream).poll_read(&mut read_cx, &mut read),
+                Poll::Ready(Ok(()))
+            ));
+            assert!(read.filled().is_empty());
+            assert!(matches!(
+                Pin::new(&mut stream).poll_write(&mut write_cx, b"blocked"),
+                Poll::Ready(Err(_))
+            ));
+            assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx), Poll::Ready(Ok(()))));
+        }
+    }
+
+    /// Closing on RST must not discard bytes already accepted for the application.
+    #[tokio::test(start_paused = true)]
+    async fn reset_preserves_queued_data_before_eof() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, ACK | PSH, u16::MAX, b"hello"))
+            .unwrap();
+        written(&mut up_rx).await;
+        stream
+            .stream_sender()
+            .send(peer_segment(1006, local_seq, RST | ACK, u16::MAX, &[]))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert!(stream.task_handle.as_ref().unwrap().is_finished());
+
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut output = Vec::new();
+        // Small reads exercise both the queued data and the temporary read buffer.
+        loop {
+            let mut storage = [0; 2];
+            let mut read = tokio::io::ReadBuf::new(&mut storage);
+            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut read), Poll::Ready(Ok(()))));
+            if read.filled().is_empty() {
+                break;
+            }
+            output.extend_from_slice(read.filled());
+            assert!(output.len() <= 5);
+        }
+        assert_eq!(output, b"hello");
+    }
+
+    thread_local! {
+        // Thread-local so unrelated tests and TCP workers cannot consume this hook.
+        static AFTER_STATE_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reset_wakes_the_latest_shutdown_waiter() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let (old_woken, old_waker) = recording_waker();
+        let mut old_cx = Context::from_waker(&old_waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut old_cx).is_pending());
+        written(&mut up_rx).await;
+
+        let (new_woken, new_waker) = recording_waker();
+        let mut new_cx = Context::from_waker(&new_waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut new_cx).is_pending());
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, RST | ACK, u16::MAX, &[]))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert!(new_woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!old_woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut new_cx), Poll::Ready(Ok(()))));
+    }
+
+    pub(super) fn run_after_state_snapshot() {
+        let hook = AFTER_STATE_SNAPSHOT.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Arrange for a real TCP worker to finish processing RST after a poll method has
+    /// read the old state, but before it registers its waker. No state is mocked.
+    fn reset_after_state_snapshot(stream: &mut IpStackTcpStream, local_seq: u32) {
+        let sender = stream.stream_sender();
+        let task = stream.task_handle.take().unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        AFTER_STATE_SNAPSHOT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    sender.send(peer_segment(1001, local_seq, RST | ACK, u16::MAX, &[])).unwrap();
+                    runtime.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(1), task)
+                            .await
+                            .expect("RST did not finish the TCP task")
+                            .expect("TCP task panicked")
+                            .expect("TCP task failed");
+                    });
+                })
+                .join()
+                .expect("reset worker panicked");
+            }));
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_during_read_registration_does_not_lose_wakeup() {
+        let (mut stream, _up_rx, local_seq) = established().await;
+        reset_after_state_snapshot(&mut stream, local_seq);
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut storage = [0; 16];
+        let mut read = tokio::io::ReadBuf::new(&mut storage);
+        let result = Pin::new(&mut stream).poll_read(&mut cx, &mut read);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        if result.is_pending() {
+            assert!(
+                woken.load(std::sync::atomic::Ordering::SeqCst),
+                "read missed RST during registration"
+            );
+            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut read), Poll::Ready(Ok(()))));
+        } else {
+            assert!(matches!(result, Poll::Ready(Ok(()))));
+        }
+        assert!(read.filled().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_during_shutdown_registration_does_not_lose_wakeup() {
+        let (mut stream, _up_rx, local_seq) = established().await;
+        reset_after_state_snapshot(&mut stream, local_seq);
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert!(matches!(*stream.shutdown.lock().unwrap(), Shutdown::Ready));
     }
 
     /// An acknowledgement from the peer, carrying no data.
