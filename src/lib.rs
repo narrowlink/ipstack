@@ -345,8 +345,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                 }
                 Some(network_tuple) = session_remove_rx.recv() => {
-                    sessions.remove(&network_tuple);
-                    log::debug!("session destroyed: {network_tuple}");
+                    remove_closed_session(&mut sessions, network_tuple);
                 }
                 Some(packet) = up_pkt_receiver.recv() => {
                     process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
@@ -354,6 +353,15 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
         }
     })
+}
+
+fn remove_closed_session(sessions: &mut SessionCollection, network_tuple: NetworkTuple) {
+    // A dead stream may already have been replaced while its destroy notification
+    // was queued. Never remove a live replacement on behalf of the old stream.
+    if sessions.get(&network_tuple).is_some_and(PacketSender::is_closed) {
+        sessions.remove(&network_tuple);
+        log::debug!("session destroyed: {network_tuple}");
+    }
 }
 
 async fn process_device_read(
@@ -388,24 +396,59 @@ async fn process_device_read(
         std::collections::hash_map::Entry::Occupied(entry) => {
             let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
             log::trace!("packet sent to stream: {network_tuple} len {len}");
-            entry.get().send(packet).map_err(std::io::Error::other)?;
+            if let Err(send_error) = entry.get().send(packet) {
+                // The receiver is gone, but its removal notification has not yet been
+                // processed (issue #81). Keep this packet as the new stream's first packet.
+                let packet = send_error.0;
+                entry.remove();
+                create_and_register_stream(
+                    packet,
+                    network_tuple,
+                    sessions,
+                    session_remove_tx,
+                    up_pkt_sender,
+                    config,
+                    accept_sender,
+                )?;
+            }
         }
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            let ip_stack_stream = create_stream(packet, config, up_pkt_sender.clone(), Some(tx))?;
-            let session_remove_tx = session_remove_tx.clone();
-            tokio::spawn(async move {
-                rx.await.ok();
-                if let Err(e) = session_remove_tx.send(network_tuple) {
-                    log::error!("Failed to send session removal for {network_tuple}: {e}");
-                }
-            });
-            let packet_sender = ip_stack_stream.stream_sender()?;
-            accept_sender.send(ip_stack_stream)?;
-            entry.insert(packet_sender);
-            log::debug!("session created: {network_tuple}");
+        std::collections::hash_map::Entry::Vacant(_) => {
+            create_and_register_stream(
+                packet,
+                network_tuple,
+                sessions,
+                session_remove_tx,
+                up_pkt_sender,
+                config,
+                accept_sender,
+            )?;
         }
     }
+    Ok(())
+}
+
+fn create_and_register_stream(
+    packet: NetworkPacket,
+    network_tuple: NetworkTuple,
+    sessions: &mut SessionCollection,
+    session_remove_tx: &UnboundedSender<NetworkTuple>,
+    up_pkt_sender: &PacketSender,
+    config: &IpStackConfig,
+    accept_sender: &UnboundedSender<IpStackStream>,
+) -> Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let ip_stack_stream = create_stream(packet, config, up_pkt_sender.clone(), Some(tx))?;
+    let session_remove_tx = session_remove_tx.clone();
+    tokio::spawn(async move {
+        rx.await.ok();
+        if let Err(e) = session_remove_tx.send(network_tuple) {
+            log::error!("Failed to send session removal for {network_tuple}: {e}");
+        }
+    });
+    let packet_sender = ip_stack_stream.stream_sender()?;
+    accept_sender.send(ip_stack_stream)?;
+    sessions.insert(network_tuple, packet_sender);
+    log::debug!("session created: {network_tuple}");
     Ok(())
 }
 
@@ -470,6 +513,114 @@ mod tests {
     };
 
     use super::*;
+
+    fn udp_packet(payload: &[u8]) -> Vec<u8> {
+        use etherparse::{IpNumber, Ipv4Header, UdpHeader};
+        let mut ip = Ipv4Header::new(0, 64, IpNumber::UDP, [192, 0, 2, 1], [192, 0, 2, 2]).unwrap();
+        ip.set_payload_len(payload.len() + 8).unwrap();
+        let udp = UdpHeader::with_ipv4_checksum(53000, 53, &ip, payload).unwrap();
+        NetworkPacket {
+            ip: packet::IpHeader::Ipv4(ip),
+            transport: TransportHeader::Udp(udp),
+            payload: Some(payload.to_vec()),
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    /// Exercise dispatch before the old removal notification is consumed, then pass that
+    /// notification through the same handler used by the event loop.
+    #[tokio::test]
+    async fn dead_udp_session_preserves_payload_and_survives_stale_removal() {
+        let mut sessions = SessionCollection::new();
+        let (remove_tx, mut remove_rx) = mpsc::unbounded_channel();
+        let (up_tx, _up_rx) = mpsc::unbounded_channel();
+        let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
+        let config = IpStackConfig::default();
+        process_device_read(&udp_packet(b"first"), &mut sessions, &remove_tx, &up_tx, &config, &accept_tx)
+            .await
+            .unwrap();
+        let first = accept_rx.recv().await.unwrap();
+        let tuple = NetworkTuple::new(first.local_addr(), first.peer_addr(), false);
+        drop(first);
+        // Waiting for the notification does not remove the stale table entry.
+        let old_notification = remove_rx.recv().await.unwrap();
+        assert_eq!(old_notification, tuple);
+
+        process_device_read(&udp_packet(b"replacement"), &mut sessions, &remove_tx, &up_tx, &config, &accept_tx)
+            .await
+            .expect("the first datagram after closure must recreate the session");
+        let IpStackStream::Udp(mut replacement) = accept_rx.recv().await.unwrap() else {
+            panic!("expected replacement UDP stream");
+        };
+        let mut buffer = [0; 64];
+        let n = replacement.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], b"replacement");
+
+        remove_closed_session(&mut sessions, old_notification);
+        assert!(sessions.contains_key(&tuple), "old notification removed the replacement");
+        process_device_read(&udp_packet(b"next"), &mut sessions, &remove_tx, &up_tx, &config, &accept_tx)
+            .await
+            .unwrap();
+        let n = replacement.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], b"next");
+        assert!(accept_rx.try_recv().is_err(), "a live replacement must be reused");
+
+        drop(replacement);
+        remove_closed_session(&mut sessions, remove_rx.recv().await.unwrap());
+        assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_udp_removal_does_not_remove_a_live_session() {
+        let mut sessions = SessionCollection::new();
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let tuple = NetworkTuple::new("192.0.2.1:53000".parse().unwrap(), "192.0.2.2:53".parse().unwrap(), false);
+        sessions.insert(tuple, sender);
+        remove_closed_session(&mut sessions, tuple);
+        assert!(sessions.contains_key(&tuple));
+    }
+
+    /// Run the real event loop, send no more packets after drop/expiration, and observe
+    /// that it releases its sender. The retained probe is the only remaining strong sender.
+    async fn udp_session_is_cleaned_without_more_traffic(expire: bool) {
+        let (device, mut peer) = duplex(4096);
+        let mut config = IpStackConfig::default();
+        config.udp_timeout(Duration::from_secs(1));
+        let mut stack = IpStack::new(config, device);
+        peer.write_all(&udp_packet(b"first")).await.unwrap();
+        let IpStackStream::Udp(mut stream) = stack.accept().await.unwrap() else {
+            panic!("expected a UDP stream");
+        };
+        let probe = stream.stream_sender();
+        let mut buffer = [0; 64];
+        assert_eq!(stream.read(&mut buffer).await.unwrap(), 5);
+        assert_eq!(probe.strong_count(), 3); // stream, table, and probe
+        if expire {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert_eq!(stream.read(&mut buffer).await.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        }
+        drop(stream);
+        // No device input or manual table manipulation: only the production event loop runs.
+        for _ in 0..100 {
+            if probe.strong_count() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(probe.strong_count(), 1, "closed UDP session remains in the table");
+        assert!(!stack.handle.is_finished(), "cleanup must not stop the IP stack");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_udp_session_is_cleaned_without_more_traffic() {
+        udp_session_is_cleaned_without_more_traffic(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_udp_session_is_cleaned_without_more_traffic() {
+        udp_session_is_cleaned_without_more_traffic(true).await;
+    }
 
     struct ChunkedDevice {
         chunks: VecDeque<Vec<u8>>,
