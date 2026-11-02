@@ -10,6 +10,7 @@ homepage = 'https://narrowlink.com'
 readme = "README.md"
 
 [dependencies]
+atomic-waker = "1.1"
 ahash = { version = "0.8", default-features = false, features = ["std"] }
 etherparse = { version = "0.20", default-features = false, features = ["std"] }
 log = { version = "0.4", default-features = false }

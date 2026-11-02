@@ -585,6 +585,33 @@ mod tests {
     }
 
     #[test]
+    fn test_add_unordered_packet_keeps_straddling_tail_across_sequence_wrap() {
+        let mut tcb = Tcb::new(
+            SeqNum(3),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        // MAX-2, MAX-1, MAX, 0, 1, 2 are already acknowledged; 3 and 4 are new.
+        tcb.add_unordered_packet(SeqNum(u32::MAX - 2), vec![10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(tcb.consume_unordered_packets(usize::MAX), Some(vec![16, 17]));
+        assert_eq!(tcb.ack, SeqNum(5));
+        assert!(tcb.unordered_packets.is_empty());
+
+        // Repeating the segment after delivery must not duplicate its tail.
+        tcb.add_unordered_packet(SeqNum(u32::MAX - 2), vec![10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(tcb.consume_unordered_packets(usize::MAX), None);
+        assert_eq!(tcb.ack, SeqNum(5));
+        assert!(tcb.unordered_packets.is_empty());
+    }
+
+    #[test]
     fn test_add_unordered_packet_enforces_read_buffer() {
         let mut tcb = Tcb::new(
             SeqNum(1000),
