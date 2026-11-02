@@ -16,8 +16,11 @@ use std::{
     io::ErrorKind::{BrokenPipe, ConnectionRefused, InvalidInput, UnexpectedEof},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
-    task::{Context, Poll, Waker},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -83,41 +86,27 @@ impl Default for TcpConfig {
     }
 }
 
-#[derive(Debug)]
-enum Shutdown {
-    None,
-    Pending(Waker),
-    Ready,
+/// Remembers shutdown completion and wakes the latest task polling for it.
+#[derive(Debug, Default)]
+struct ShutdownSignal {
+    completed: AtomicBool,
+    waker: AtomicWaker,
 }
 
-impl Shutdown {
-    fn pending(&mut self, w: Waker) {
-        *self = Shutdown::Pending(w);
-    }
-    fn ready(&mut self) {
-        if let Shutdown::Pending(w) = self {
-            w.wake_by_ref();
+impl ShutdownSignal {
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        // Register first: completion either wakes this task or is observed below.
+        self.waker.register(cx.waker());
+        if self.completed.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
-        *self = Shutdown::Ready;
     }
 
-    // Just for comparison purpose
-    fn fake_clone(&self) -> Shutdown {
-        match self {
-            Shutdown::None => Shutdown::None,
-            Shutdown::Pending(_) => Shutdown::Pending(Waker::noop().clone()),
-            Shutdown::Ready => Shutdown::Ready,
-        }
-    }
-}
-
-impl std::fmt::Display for Shutdown {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Shutdown::None => write!(f, "None"),
-            Shutdown::Pending(_) => write!(f, "Pending"),
-            Shutdown::Ready => write!(f, "Ready"),
-        }
+    fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+        self.waker.wake();
     }
 }
 
@@ -162,7 +151,7 @@ pub struct IpStackTcpStream {
     stream_receiver: Option<PacketReceiver>,
     up_packet_sender: PacketSender,
     tcb: TcbPtr,
-    shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
+    shutdown: Arc<ShutdownSignal>,
     write_notify: Arc<AtomicWaker>,
     destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     timeout: Pin<Box<tokio::time::Sleep>>,
@@ -231,7 +220,7 @@ impl IpStackTcpStream {
             stream_receiver: Some(stream_receiver),
             up_packet_sender,
             tcb: std::sync::Arc::new(std::sync::Mutex::new(tcb.clone())),
-            shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
+            shutdown: Arc::new(ShutdownSignal::default()),
             write_notify: Arc::new(AtomicWaker::new()),
             destroy_messenger,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
@@ -325,7 +314,7 @@ impl AsyncRead for IpStackTcpStream {
                 self.temp_read_buffer.extend_from_slice(&data[len..]);
                 return Poll::Ready(Ok(()));
             }
-            self.shutdown.lock().unwrap().ready();
+            self.shutdown.complete();
             self.write_notify.wake();
             return Poll::Ready(Ok(()));
         }
@@ -343,7 +332,7 @@ impl AsyncRead for IpStackTcpStream {
                 let state = tcb.get_state();
                 log::debug!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
             }
-            self.shutdown.lock().unwrap().ready();
+            self.shutdown.complete();
 
             return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         }
@@ -383,7 +372,7 @@ impl AsyncWrite for IpStackTcpStream {
         let is_full = tcb.is_send_buffer_full();
 
         if state == TcpState::Closed {
-            self.shutdown.lock().unwrap().ready();
+            self.shutdown.complete();
             self.read_notify.wake();
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
@@ -419,36 +408,26 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let shutdown = { self.shutdown.lock().unwrap().fake_clone() };
+        if self.shutdown.poll_ready(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
         let (nt, state, seq, is_ready) = {
             let tcb = self.tcb.lock().unwrap();
             let is_ready = tcb.get_inflight_packets_total_len() == 0;
             (self.network_tuple(), tcb.get_state(), tcb.get_seq(), is_ready)
         };
-        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}, shutdown {shutdown}",);
+        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}",);
         #[cfg(test)]
         tests::run_after_state_snapshot();
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
-        match shutdown {
-            Shutdown::None | Shutdown::Pending(_) => {
-                if is_ready && state == TcpState::Established {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
-                }
-                // The task may have completed since the snapshot above. Check Ready
-                // and register the latest waker under the same lock used by ready().
-                let mut shutdown = self.shutdown.lock().unwrap();
-                if matches!(*shutdown, Shutdown::Ready) {
-                    Poll::Ready(Ok(()))
-                } else {
-                    shutdown.pending(cx.waker().clone());
-                    Poll::Pending
-                }
-            }
-            Shutdown::Ready => Poll::Ready(Ok(())),
+        if is_ready && state == TcpState::Established {
+            let mut tcb = self.tcb.lock().unwrap();
+            send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
         }
+        // Completion may have happened since the initial poll or state snapshot.
+        self.shutdown.poll_ready(cx).map(Ok)
     }
 }
 
@@ -542,8 +521,8 @@ impl IpStackTcpStream {
             }
             _ = destroy_messenger.map(|m| m.send(())).unwrap_or(Ok(()));
             log::trace!("{network_tuple} task completed, destroy messenger sent successfully");
-            shutdown.lock().unwrap().ready();
-            log::trace!("{network_tuple} shutdown.lock().unwrap().ready() ==========");
+            shutdown.complete();
+            log::trace!("{network_tuple} shutdown completed");
             v
         });
         self.task_handle = Some(task_handle);
@@ -1242,6 +1221,7 @@ pub(crate) fn create_raw_packet(
 mod tests {
     use super::*;
     use crate::stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, READ_BUFFER_SIZE, RTO};
+    use std::task::Waker;
 
     /// A waker that records whether it was woken, and the flag it sets.
     fn recording_waker() -> (Arc<std::sync::atomic::AtomicBool>, Waker) {
@@ -1253,6 +1233,20 @@ mod tests {
         }
         let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
         (woken.clone(), Waker::from(Arc::new(Recording(woken))))
+    }
+
+    #[test]
+    fn shutdown_completion_is_remembered_before_any_waiter() {
+        let signal = ShutdownSignal::default();
+        signal.complete();
+        signal.complete();
+
+        // Completion stays ready across polls, including polls with a different task waker.
+        for _ in 0..2 {
+            let (_, waker) = recording_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(signal.poll_ready(&mut cx).is_ready());
+        }
     }
 
     use tokio::io::AsyncWriteExt;
@@ -1516,7 +1510,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
-        assert!(matches!(*stream.shutdown.lock().unwrap(), Shutdown::Ready));
+        assert!(stream.shutdown.poll_ready(&mut cx).is_ready());
     }
 
     /// An acknowledgement from the peer, carrying no data.
