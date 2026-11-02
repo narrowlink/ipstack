@@ -214,6 +214,9 @@ impl AsyncWrite for IpStackUdpStream {
 
 impl Drop for IpStackUdpStream {
     fn drop(&mut self) {
+        // Cleanup must observe a closed receiver as soon as it is notified.
+        self.stream_receiver.close();
+
         if let Some(messenger) = self.destroy_messenger.take() {
             let _ = messenger.send(());
         }
@@ -236,6 +239,44 @@ mod tests {
             Duration::from_secs(30),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn receiver_is_closed_before_destroy_notification_wakes_waiter() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct CheckClosedOnWake {
+            sender: PacketSender,
+            observed_closed: AtomicBool,
+        }
+
+        impl Wake for CheckClosedOnWake {
+            fn wake(self: Arc<Self>) {
+                // Inspect the channel synchronously inside notification delivery,
+                // before Drop returns and Rust destroys the receiver field.
+                self.observed_closed.store(self.sender.is_closed(), Ordering::SeqCst);
+            }
+        }
+
+        let mut stream = stream(Vec::new());
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        stream.destroy_messenger = Some(destroy_tx);
+        let check = Arc::new(CheckClosedOnWake {
+            sender: stream.stream_sender(),
+            observed_closed: AtomicBool::new(false),
+        });
+        let waker = Waker::from(check.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(Pin::new(&mut destroy_rx).poll(&mut cx), Poll::Pending));
+
+        drop(stream);
+
+        assert!(check.observed_closed.load(Ordering::SeqCst));
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
     }
 
     // A datagram larger than the caller's buffer used to panic `put_slice`; it
