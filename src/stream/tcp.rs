@@ -2,11 +2,7 @@ use super::seqnum::SeqNum;
 use crate::{
     PacketReceiver, PacketSender, TTL,
     error::IpStackError,
-    packet::{
-        IpHeader, NetworkPacket, NetworkTuple, TransportHeader,
-        tcp_flags::{ACK, FIN, PSH, RST, SYN},
-        tcp_header_flags, tcp_header_fmt,
-    },
+    packet::{IpHeader, NetworkPacket, NetworkTuple, TcpFlags, TransportHeader, tcp_header_flags, tcp_header_fmt},
     stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, READ_CHUNK, RTO, Tcb, TcpState},
 };
 use atomic_waker::AtomicWaker;
@@ -32,6 +28,12 @@ const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAST_ACK_MAX_RETRIES: usize = 3;
 const LAST_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const TIMEOUT: Duration = Duration::from_secs(60);
+
+const ACK: TcpFlags = TcpFlags::ACK;
+const FIN: TcpFlags = TcpFlags::FIN;
+const PSH: TcpFlags = TcpFlags::PSH;
+const RST: TcpFlags = TcpFlags::RST;
+const SYN: TcpFlags = TcpFlags::SYN;
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -745,7 +747,7 @@ async fn tcp_main_logic_loop(
             break;
         }
 
-        if flags & RST == RST {
+        if flags.contains(RST) {
             tcb.change_state(TcpState::Closed);
             drop(tcb);
             write_notify.wake();
@@ -773,7 +775,7 @@ async fn tcp_main_logic_loop(
         }
 
         match state {
-            TcpState::SynReceived if flags & ACK == ACK => {
+            TcpState::SynReceived if flags.contains(ACK) => {
                 if len > 0 {
                     receive_segment(
                         &up_packet_sender,
@@ -888,7 +890,7 @@ async fn tcp_main_logic_loop(
                 }
             }
             TcpState::CloseWait => {
-                if flags & ACK == ACK && tcb.get_inflight_packets_total_len() == 0 {
+                if flags.contains(ACK) && tcb.get_inflight_packets_total_len() == 0 {
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, None, None)?;
                     tcb.increase_seq();
                     tcb.change_state(TcpState::LastAck);
@@ -911,7 +913,7 @@ async fn tcp_main_logic_loop(
                     write_notify.wake();
                 }
             }
-            TcpState::LastAck if flags & ACK == ACK => {
+            TcpState::LastAck if flags.contains(ACK) => {
                 tcb.change_state(TcpState::Closed);
                 tokio::spawn(async move {
                     if let Err(e) = exit_notifier.send(()).await {
@@ -922,7 +924,7 @@ async fn tcp_main_logic_loop(
                 log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
             }
             TcpState::FinWait1 => {
-                if flags & (ACK | FIN) == (ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
+                if flags.contains(ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
                     // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
@@ -931,7 +933,7 @@ async fn tcp_main_logic_loop(
                     tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
                     let new_state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Final ACK|FIN received too early, transitioned to {new_state:?} directly");
-                } else if flags & ACK == ACK {
+                } else if flags.contains(ACK) {
                     tcb.change_state(TcpState::FinWait2);
                     if len > 0 {
                         // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
@@ -954,20 +956,20 @@ async fn tcp_main_logic_loop(
                 }
             }
             TcpState::FinWait2 => {
-                if flags & (ACK | FIN) == (ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
+                if flags.contains(ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     tcb.change_state(TcpState::TimeWait);
                     tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
                     let new_state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
-                } else if flags & ACK == ACK && len == 0 {
+                } else if flags.contains(ACK) && len == 0 {
                     // unnormal case, we do nothing here
                     let l_ack = tcb.get_ack();
                     if incoming_seq < l_ack {
                         log::trace!("{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {l_ack}");
                     }
-                } else if flags & ACK == ACK && len > 0 {
+                } else if flags.contains(ACK) && len > 0 {
                     if pkt_type == PacketType::KeepAlive {
                         write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     } else {
@@ -983,7 +985,7 @@ async fn tcp_main_logic_loop(
                         )?;
                         write_notify.wake();
                     }
-                    if flags & FIN == FIN && tcb.get_ack() == incoming_seq + len as u32 {
+                    if flags.contains(FIN) && tcb.get_ack() == incoming_seq + len as u32 {
                         tcb.increase_ack();
                         write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                         tcb.change_state(TcpState::TimeWait);
@@ -996,7 +998,7 @@ async fn tcp_main_logic_loop(
                     log::trace!("{network_tuple} {state:?}: Some unnormal case, we do nothing here");
                 }
             }
-            TcpState::TimeWait if flags & (ACK | FIN) == (ACK | FIN) => {
+            TcpState::TimeWait if flags.contains(ACK | FIN) => {
                 write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                 // wait to timeout, can't call `tcb.change_state(TcpState::Closed);` to change state here
                 // now we need to wait for the timeout to reach...
@@ -1008,7 +1010,7 @@ async fn tcp_main_logic_loop(
         tcb.update_send_window(tcp_header);
         // ACKs with or without data can retire the last outstanding bytes. The
         // shutdown waiter may belong to a different task than the writer.
-        if flags & ACK != 0 && tcb.get_state() == TcpState::Established && tcb.is_inflight_queue_empty() {
+        if flags.contains(ACK) && tcb.get_state() == TcpState::Established && tcb.is_inflight_queue_empty() {
             shutdown.wake();
         }
     } // end of loop
@@ -1106,7 +1108,7 @@ pub(crate) fn write_packet_to_device(
     tuple: NetworkTuple,
     tcb: &Tcb,
     options: Option<&Vec<TcpOptions>>,
-    flags: u8,
+    flags: TcpFlags,
     seq: Option<SeqNum>,
     payload: Option<Vec<u8>>,
 ) -> std::io::Result<usize> {
@@ -1116,7 +1118,7 @@ pub(crate) fn write_packet_to_device(
     // otherwise advertise zero so the peer enters persist mode until the reader frees space.
     let recv_window = tcb.get_recv_window();
     // RFC 7323 §2.2: the window field of a segment carrying SYN is not scaled.
-    let advertised = if flags & SYN != 0 {
+    let advertised = if flags.contains(SYN) {
         recv_window
     } else {
         tcb.get_scaled_recv_window()
@@ -1133,7 +1135,7 @@ pub(crate) fn write_packet_to_device(
     }
     // RFC 7323 §2.2: the window scale option travels only on a segment carrying SYN, and only when
     // the peer's SYN carried one.
-    if flags & SYN != 0
+    if flags.contains(SYN)
         && let Some(shift) = tcb.get_recv_window_shift()
     {
         tcp_options.push(TcpOptionElement::WindowScale(shift));
@@ -1161,7 +1163,7 @@ pub(crate) fn create_raw_packet(
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     calculate_payload_max_len: impl Fn(usize, usize) -> usize,
-    flags: u8,
+    flags: TcpFlags,
     ttl: u8,
     seq: u32,
     ack: u32,
@@ -1171,11 +1173,11 @@ pub(crate) fn create_raw_packet(
 ) -> std::io::Result<NetworkPacket> {
     let mut tcp_header = etherparse::TcpHeader::new(src_addr.port(), dst_addr.port(), seq, win);
     tcp_header.acknowledgment_number = ack;
-    tcp_header.syn = flags & SYN != 0;
-    tcp_header.ack = flags & ACK != 0;
-    tcp_header.rst = flags & RST != 0;
-    tcp_header.fin = flags & FIN != 0;
-    tcp_header.psh = flags & PSH != 0;
+    tcp_header.syn = flags.contains(SYN);
+    tcp_header.ack = flags.contains(ACK);
+    tcp_header.rst = flags.contains(RST);
+    tcp_header.fin = flags.contains(FIN);
+    tcp_header.psh = flags.contains(PSH);
 
     tcp_header.set_options(options).map_err(|e| std::io::Error::new(InvalidInput, e))?;
 
@@ -1317,7 +1319,7 @@ mod tests {
         .await
     }
 
-    async fn shutdown_after_ack(same_task: bool, ack_flags: u8) {
+    async fn shutdown_after_ack(same_task: bool, ack_flags: TcpFlags) {
         let (mut stream, mut up_rx, local_seq) = established().await;
         let (write_woken, write_waker) = recording_waker();
         let mut write_cx = Context::from_waker(&write_waker);
@@ -1349,7 +1351,7 @@ mod tests {
         shutdown_woken.store(false, Ordering::SeqCst);
 
         // The final ACK can also carry peer data; both paths must wake shutdown.
-        let payload: &[u8] = if ack_flags & PSH != 0 { b"reply" } else { b"" };
+        let payload: &[u8] = if ack_flags.contains(PSH) { b"reply" } else { b"" };
         stream
             .stream_sender()
             .send(peer_segment(1001, local_seq + 5, ack_flags, u16::MAX, payload))
@@ -1602,7 +1604,7 @@ mod tests {
     }
 
     /// A segment from the peer carrying `payload` at `seq`, with `flags` and a raw `window`.
-    fn peer_segment(seq: u32, ack: u32, flags: u8, window: u16, payload: &[u8]) -> NetworkPacket {
+    fn peer_segment(seq: u32, ack: u32, flags: TcpFlags, window: u16, payload: &[u8]) -> NetworkPacket {
         let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
         create_raw_packet(src, dst, |_, _| usize::MAX, flags, TTL, seq, ack, window, payload.to_vec(), &[]).unwrap()
     }
@@ -1634,7 +1636,7 @@ mod tests {
                 .iter()
                 .map(|p| tcp_header_of(p).acknowledgment_number)
                 .collect();
-            assert_eq!(acks, [1001], "flags {flags:#x}: the out-of-order segment got no duplicate ACK");
+            assert_eq!(acks, [1001], "flags {flags:?}: the out-of-order segment got no duplicate ACK");
 
             // The gap fills: the ACK covers both segments and the reader sees them in order.
             stream
@@ -1646,7 +1648,7 @@ mod tests {
                 .iter()
                 .map(|p| tcp_header_of(p).acknowledgment_number)
                 .collect();
-            assert_eq!(acks.last(), Some(&1013), "flags {flags:#x}: the buffered segment was not kept");
+            assert_eq!(acks.last(), Some(&1013), "flags {flags:?}: the buffered segment was not kept");
             let mut buf = [0u8; 12];
             tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
             assert_eq!(buf[..8], [1; 8]);
