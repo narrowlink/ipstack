@@ -9,14 +9,18 @@ use crate::{
     },
     stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, READ_CHUNK, RTO, Tcb, TcpState},
 };
+use atomic_waker::AtomicWaker;
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
 use std::{
     future::Future,
     io::ErrorKind::{BrokenPipe, ConnectionRefused, InvalidInput, UnexpectedEof},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
-    task::{Context, Poll, Waker},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -82,41 +86,27 @@ impl Default for TcpConfig {
     }
 }
 
-#[derive(Debug)]
-enum Shutdown {
-    None,
-    Pending(Waker),
-    Ready,
+/// Remembers shutdown completion and wakes the latest task polling for it.
+#[derive(Debug, Default)]
+struct ShutdownSignal {
+    completed: AtomicBool,
+    waker: AtomicWaker,
 }
 
-impl Shutdown {
-    fn pending(&mut self, w: Waker) {
-        *self = Shutdown::Pending(w);
-    }
-    fn ready(&mut self) {
-        if let Shutdown::Pending(w) = self {
-            w.wake_by_ref();
+impl ShutdownSignal {
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        // Register first: completion either wakes this task or is observed below.
+        self.waker.register(cx.waker());
+        if self.completed.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
-        *self = Shutdown::Ready;
     }
 
-    // Just for comparison purpose
-    fn fake_clone(&self) -> Shutdown {
-        match self {
-            Shutdown::None => Shutdown::None,
-            Shutdown::Pending(_) => Shutdown::Pending(Waker::noop().clone()),
-            Shutdown::Ready => Shutdown::Ready,
-        }
-    }
-}
-
-impl std::fmt::Display for Shutdown {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Shutdown::None => write!(f, "None"),
-            Shutdown::Pending(_) => write!(f, "Pending"),
-            Shutdown::Ready => write!(f, "Ready"),
-        }
+    fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+        self.waker.wake();
     }
 }
 
@@ -161,13 +151,13 @@ pub struct IpStackTcpStream {
     stream_receiver: Option<PacketReceiver>,
     up_packet_sender: PacketSender,
     tcb: TcbPtr,
-    shutdown: std::sync::Arc<std::sync::Mutex<Shutdown>>,
-    write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    shutdown: Arc<ShutdownSignal>,
+    write_notify: Arc<AtomicWaker>,
     destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     timeout: Pin<Box<tokio::time::Sleep>>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    read_notify: Arc<AtomicWaker>,
     drain_notify: Arc<tokio::sync::Notify>,
     arm_notify: Arc<tokio::sync::Notify>,
     task_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
@@ -230,13 +220,13 @@ impl IpStackTcpStream {
             stream_receiver: Some(stream_receiver),
             up_packet_sender,
             tcb: std::sync::Arc::new(std::sync::Mutex::new(tcb.clone())),
-            shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
-            write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            shutdown: Arc::new(ShutdownSignal::default()),
+            write_notify: Arc::new(AtomicWaker::new()),
             destroy_messenger,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             data_tx,
             data_rx,
-            read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            read_notify: Arc::new(AtomicWaker::new()),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             arm_notify: Arc::new(tokio::sync::Notify::new()),
             task_handle: None,
@@ -310,6 +300,8 @@ impl AsyncRead for IpStackTcpStream {
 
         let network_tuple = self.network_tuple();
 
+        // Register before checking state so a concurrent close cannot miss this reader.
+        self.read_notify.register(cx.waker());
         let state = self.tcb.lock().unwrap().get_state();
         #[cfg(test)]
         tests::run_after_state_snapshot();
@@ -322,8 +314,8 @@ impl AsyncRead for IpStackTcpStream {
                 self.temp_read_buffer.extend_from_slice(&data[len..]);
                 return Poll::Ready(Ok(()));
             }
-            self.shutdown.lock().unwrap().ready();
-            self.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            self.shutdown.complete();
+            self.write_notify.wake();
             return Poll::Ready(Ok(()));
         }
 
@@ -340,7 +332,7 @@ impl AsyncRead for IpStackTcpStream {
                 let state = tcb.get_state();
                 log::debug!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
             }
-            self.shutdown.lock().unwrap().ready();
+            self.shutdown.complete();
 
             return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         }
@@ -362,17 +354,7 @@ impl AsyncRead for IpStackTcpStream {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending => {
-                self.read_notify.lock().unwrap().replace(cx.waker().clone());
-                // RST may have closed the connection after the first state check but
-                // before this registration. Register first, then check again: either
-                // we observe Closed or the reset path will find and wake this waker.
-                let is_closed = self.tcb.lock().unwrap().get_state() == TcpState::Closed;
-                if is_closed {
-                    cx.waker().wake_by_ref();
-                }
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -382,19 +364,20 @@ impl AsyncWrite for IpStackTcpStream {
         let nt = self.network_tuple();
         self.reset_timeout();
 
+        // Register before checking readiness so a concurrent ACK cannot miss this writer.
+        self.write_notify.register(cx.waker());
         let mut tcb = self.tcb.lock().unwrap();
         let state = tcb.get_state();
         let send_window = tcb.get_send_window();
         let is_full = tcb.is_send_buffer_full();
 
         if state == TcpState::Closed {
-            self.shutdown.lock().unwrap().ready();
-            self.read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            self.shutdown.complete();
+            self.read_notify.wake();
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
 
         if send_window == 0 || is_full {
-            self.write_notify.lock().unwrap().replace(cx.waker().clone());
             log::trace!(
                 "{nt} {state:?}: [poll_write] current send window: {send_window}, send buffer full: {is_full}, waiting for the other side to send ACK..."
             );
@@ -425,36 +408,26 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let shutdown = { self.shutdown.lock().unwrap().fake_clone() };
+        if self.shutdown.poll_ready(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
         let (nt, state, seq, is_ready) = {
             let tcb = self.tcb.lock().unwrap();
             let is_ready = tcb.get_inflight_packets_total_len() == 0;
             (self.network_tuple(), tcb.get_state(), tcb.get_seq(), is_ready)
         };
-        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}, shutdown {shutdown}",);
+        log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}",);
         #[cfg(test)]
         tests::run_after_state_snapshot();
         if state == TcpState::Closed {
             return Poll::Ready(Ok(()));
         }
-        match shutdown {
-            Shutdown::None | Shutdown::Pending(_) => {
-                if is_ready && state == TcpState::Established {
-                    let mut tcb = self.tcb.lock().unwrap();
-                    send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
-                }
-                // The task may have completed since the snapshot above. Check Ready
-                // and register the latest waker under the same lock used by ready().
-                let mut shutdown = self.shutdown.lock().unwrap();
-                if matches!(*shutdown, Shutdown::Ready) {
-                    Poll::Ready(Ok(()))
-                } else {
-                    shutdown.pending(cx.waker().clone());
-                    Poll::Pending
-                }
-            }
-            Shutdown::Ready => Poll::Ready(Ok(())),
+        if is_ready && state == TcpState::Established {
+            let mut tcb = self.tcb.lock().unwrap();
+            send_fin_n_change_state_to_fin_wait1("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?;
         }
+        // Completion may have happened since the initial poll or state snapshot.
+        self.shutdown.poll_ready(cx).map(Ok)
     }
 }
 
@@ -548,8 +521,8 @@ impl IpStackTcpStream {
             }
             _ = destroy_messenger.map(|m| m.send(())).unwrap_or(Ok(()));
             log::trace!("{network_tuple} task completed, destroy messenger sent successfully");
-            shutdown.lock().unwrap().ready();
-            log::trace!("{network_tuple} shutdown.lock().unwrap().ready() ==========");
+            shutdown.complete();
+            log::trace!("{network_tuple} shutdown completed");
             v
         });
         self.task_handle = Some(task_handle);
@@ -565,8 +538,8 @@ async fn tcp_main_logic_loop(
     up_packet_sender: PacketSender,
     exit_notifier: tokio::sync::mpsc::Sender<()>,
     network_tuple: NetworkTuple,
-    write_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-    read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    write_notify: Arc<AtomicWaker>,
+    read_notify: Arc<AtomicWaker>,
     data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     drain_notify: Arc<tokio::sync::Notify>,
     arm_notify: Arc<tokio::sync::Notify>,
@@ -693,7 +666,7 @@ async fn tcp_main_logic_loop(
         let network_packet = tokio::select! {
             _ = exit_monitor.recv() => {
                 log::debug!("{network_tuple} task exited due to exit signal");
-                read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                read_notify.wake();
                 break;
             }
             _ = drain_notify.notified() => {
@@ -717,8 +690,8 @@ async fn tcp_main_logic_loop(
                     log::warn!("{network_tuple} segment reached R2 transmissions, closing session");
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
                     tcb.change_state(TcpState::Closed);
-                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-                    read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    write_notify.wake();
+                    read_notify.wake();
                     break;
                 }
                 for packet in packets {
@@ -743,8 +716,8 @@ async fn tcp_main_logic_loop(
             let state = { tcb.lock().unwrap().get_state() };
             log::debug!("{network_tuple} {state:?}: session closed unexpectedly by pipe broken, exiting task");
             tcb.lock().unwrap().change_state(TcpState::Closed);
-            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-            read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            write_notify.wake();
+            read_notify.wake();
             break;
         };
 
@@ -768,8 +741,8 @@ async fn tcp_main_logic_loop(
         if flags & RST == RST {
             tcb.change_state(TcpState::Closed);
             drop(tcb);
-            write_notify.lock().unwrap().take().map(|w| w.wake()).unwrap_or(());
-            read_notify.lock().unwrap().take().map(|w| w.wake()).unwrap_or(());
+            write_notify.wake();
+            read_notify.wake();
             // Finish the task so its destroy notification and shutdown waker are delivered
             // even if the peer never sends another packet.
             break;
@@ -806,13 +779,13 @@ async fn tcp_main_logic_loop(
                     )?;
                 }
                 tcb.change_state(TcpState::Established);
-                write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                write_notify.wake();
             }
             TcpState::Established => {
                 if flags == ACK {
                     match pkt_type {
                         PacketType::WindowUpdate => {
-                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            write_notify.wake();
                         }
                         PacketType::KeepAlive => {
                             write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
@@ -830,10 +803,10 @@ async fn tcp_main_logic_loop(
                         PacketType::NewPacket => {
                             let nt = network_tuple;
                             receive_segment(&up_packet_sender, &mut tcb, nt, incoming_seq, payload, &data_tx, &read_notify)?;
-                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            write_notify.wake();
                         }
                         PacketType::Ack => {
-                            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                            write_notify.wake();
                         }
                         PacketType::Invalid => {}
                     }
@@ -871,7 +844,7 @@ async fn tcp_main_logic_loop(
                         ));
                     } else {
                         // Upstream data pending, wake write_notify and wait
-                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                        write_notify.wake();
                         log::debug!("{network_tuple} {state:?}: Waiting for upstream data to complete, inflight packets: {len}",);
 
                         // Spawn a timeout task to force FIN if upstream is unresponsive
@@ -901,7 +874,7 @@ async fn tcp_main_logic_loop(
                             &read_notify,
                         )?;
                     }
-                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    write_notify.wake();
                 } else {
                     // unnormal case, we do nothing here
                     log::trace!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, unnormal case, we do nothing here");
@@ -928,7 +901,7 @@ async fn tcp_main_logic_loop(
                         config.last_ack_max_retries,
                     ));
                 } else {
-                    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                    write_notify.wake();
                 }
             }
             TcpState::LastAck if flags & ACK == ACK => {
@@ -964,7 +937,7 @@ async fn tcp_main_logic_loop(
                             &data_tx,
                             &read_notify,
                         )?;
-                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                        write_notify.wake();
                     }
                     let new_state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {new_state:?}");
@@ -1001,7 +974,7 @@ async fn tcp_main_logic_loop(
                             &data_tx,
                             &read_notify,
                         )?;
-                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+                        write_notify.wake();
                     }
                     if flags & FIN == FIN && tcb.get_ack() == incoming_seq + len as u32 {
                         tcb.increase_ack();
@@ -1054,7 +1027,7 @@ fn receive_segment(
     seq: SeqNum,
     payload: Vec<u8>,
     data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-    read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    read_notify: &AtomicWaker,
 ) -> std::io::Result<()> {
     tcb.add_unordered_packet(seq, payload);
     if !extract_data_n_write_upstream(up_packet_sender, tcb, network_tuple, data_tx, read_notify)? {
@@ -1070,7 +1043,7 @@ fn extract_data_n_write_upstream(
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
     data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-    read_notify: &std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    read_notify: &AtomicWaker,
 ) -> std::io::Result<bool> {
     let (state, seq, ack) = (tcb.get_state(), tcb.get_seq(), tcb.get_ack());
     let l_info = LocalInfo(seq, ack);
@@ -1097,7 +1070,7 @@ fn extract_data_n_write_upstream(
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         permit.send(data);
-        read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+        read_notify.wake();
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
         return Ok(true);
     }
@@ -1248,6 +1221,7 @@ pub(crate) fn create_raw_packet(
 mod tests {
     use super::*;
     use crate::stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, READ_BUFFER_SIZE, RTO};
+    use std::task::Waker;
 
     /// A waker that records whether it was woken, and the flag it sets.
     fn recording_waker() -> (Arc<std::sync::atomic::AtomicBool>, Waker) {
@@ -1259,6 +1233,20 @@ mod tests {
         }
         let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
         (woken.clone(), Waker::from(Arc::new(Recording(woken))))
+    }
+
+    #[test]
+    fn shutdown_completion_is_remembered_before_any_waiter() {
+        let signal = ShutdownSignal::default();
+        signal.complete();
+        signal.complete();
+
+        // Completion stays ready across polls, including polls with a different task waker.
+        for _ in 0..2 {
+            let (_, waker) = recording_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(signal.poll_ready(&mut cx).is_ready());
+        }
     }
 
     use tokio::io::AsyncWriteExt;
@@ -1309,7 +1297,7 @@ mod tests {
                 } else {
                     // The handshake transition holds tcb and wakes write_notify. Register
                     // under the same state lock so that the transition cannot be missed.
-                    stream.write_notify.lock().unwrap().replace(cx.waker().clone());
+                    stream.write_notify.register(cx.waker());
                     Poll::Pending
                 }
             }),
@@ -1468,7 +1456,8 @@ mod tests {
     }
 
     /// Arrange for a real TCP worker to finish processing RST after a poll method has
-    /// read the old state, but before it registers its waker. No state is mocked.
+    /// read the old state. This exercises early read registration and the shutdown
+    /// state recheck after registration. No state is mocked.
     fn reset_after_state_snapshot(stream: &mut IpStackTcpStream, local_seq: u32) {
         let sender = stream.stream_sender();
         let task = stream.task_handle.take().unwrap();
@@ -1521,7 +1510,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
-        assert!(matches!(*stream.shutdown.lock().unwrap(), Shutdown::Ready));
+        assert!(stream.shutdown.poll_ready(&mut cx).is_ready());
     }
 
     /// An acknowledgement from the peer, carrying no data.
@@ -1646,12 +1635,38 @@ mod tests {
         }
 
         assert!(advance(just_before(BACKOFF[MAX_RETRANSMIT_COUNT - 1]), &mut up_rx).await.is_none());
+
+        // Leave both halves waiting immediately before the final timeout closes the connection.
+        stream.reset_timeout();
+        let (reader_woken, reader_waker) = recording_waker();
+        let mut read_cx = Context::from_waker(&reader_waker);
+        let mut bytes = [0; 1];
+        let mut read_buf = tokio::io::ReadBuf::new(&mut bytes);
+        assert!(Pin::new(&mut stream).poll_read(&mut read_cx, &mut read_buf).is_pending());
+        // The default window cap is 16 KiB; fill the remainder behind the initial five bytes.
+        let remaining = vec![0; MAX_UNACK as usize - 5];
+        stream.tcb.lock().unwrap().add_inflight_packet(remaining).unwrap();
+        let (writer_woken, writer_waker) = recording_waker();
+        let mut write_cx = Context::from_waker(&writer_waker);
+        assert!(Pin::new(&mut stream).poll_write(&mut write_cx, b"waiting").is_pending());
+
         let reset = advance(Duration::from_millis(1), &mut up_rx).await.expect("no reset");
         assert!(tcp_header_of(&reset).rst);
         assert!(up_rx.try_recv().is_err());
 
         assert!((tokio::time::Instant::now() - opened).as_secs() > 100);
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert!(reader_woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(writer_woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut read_cx, &mut read_buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(read_buf.filled().is_empty());
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut write_cx, b"waiting"),
+            Poll::Ready(Err(err)) if err.kind() == BrokenPipe
+        ));
     }
 
     /// RFC 9293 §3.10.7.4: a reset closes the connection and ends its retransmission.
@@ -1713,7 +1728,7 @@ mod tests {
     async fn extract_reserves_before_consuming() {
         let (up_tx, _up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let read_notify = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let read_notify = Arc::new(AtomicWaker::new());
         let nt = NetworkTuple::new("1.1.1.1:1".parse().unwrap(), "2.2.2.2:2".parse().unwrap(), true);
 
         let mut tcb = Tcb::new(
@@ -1820,6 +1835,28 @@ mod tests {
         let tcb = stream.tcb.lock().unwrap();
         assert_eq!(tcb.get_state(), TcpState::Established);
         assert_eq!(tcb.get_send_window(), 40_000 << 14);
+    }
+
+    #[tokio::test]
+    async fn pending_reader_wakes_for_each_new_segment() {
+        let (mut stream, syn_ack, mut up_rx) = open(4000, &[]).await;
+        let peer_seq = SeqNum(syn_ack.acknowledgment_number);
+        feed(&stream, &syn_ack, peer_seq, 4000, &[]);
+        tokio::task::yield_now().await;
+
+        for offset in 0..2 {
+            let (woken, waker) = recording_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut bytes = [0; 4];
+            let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+            assert!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf).is_pending());
+
+            feed(&stream, &syn_ack, peer_seq + offset * 4, 4000, b"data");
+            up_rx.recv().await.unwrap();
+            assert!(woken.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf), Poll::Ready(Ok(()))));
+            assert_eq!(buf.filled(), b"data");
+        }
     }
 
     /// A closed peer window holds the writer, and the segment that reopens it wakes the writer, both
