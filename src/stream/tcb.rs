@@ -14,7 +14,7 @@ pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicat
 pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Ceiling on the backed-off retransmission timeout; RFC 6298 §2.5 permits one of at least 60 seconds
-const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(60);
+pub(super) const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// R2, the transmission count at which the connection closes. Seven reaches 123 seconds against
 /// RFC 9293 §3.8.3's SHLD-11 of at least 100.
@@ -32,6 +32,7 @@ pub(crate) enum TcpState {
     Established,
     FinWait1, // act as a client, actively send a farewell packet to the other side, followed with FinWait2, TimeWait, Closed
     FinWait2,
+    Closing, // Both FINs sent; our FIN is still unacknowledged.
     TimeWait,
     CloseWait, // act as a server, followed with LastAck, Closed
     LastAck,
@@ -86,6 +87,17 @@ pub(crate) struct Tcb {
 }
 
 impl Tcb {
+    pub(super) fn retransmission_timeout(&self) -> Duration {
+        self.current_rto
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_send_sequence(&mut self, seq: SeqNum) {
+        assert!(self.inflight_packets.is_empty());
+        self.seq = seq;
+        self.last_received_ack = seq;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         ack: SeqNum,
