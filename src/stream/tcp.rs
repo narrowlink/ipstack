@@ -387,7 +387,6 @@ impl AsyncWrite for IpStackTcpStream {
         // The task that answers the SYN may not have run yet. Data written now would leave ahead of
         // the SYN-ACK, under the initial sequence number.
         if state == TcpState::Listen {
-            self.write_notify.lock().unwrap().replace(cx.waker().clone());
             return Poll::Pending;
         }
 
@@ -588,7 +587,7 @@ async fn tcp_main_logic_loop(
         let state = tcb.get_state();
         log::trace!("{network_tuple} {state:?}: session now in {state:?} state");
     }
-    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+    write_notify.wake();
 
     let tcb_clone = tcb.clone();
 
