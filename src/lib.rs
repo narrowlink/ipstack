@@ -314,6 +314,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
     let mut buffer = vec![0_u8; config.mtu as usize + offset];
+    let mut outgoing_buffer = Vec::with_capacity(config.mtu as usize + offset);
     let (up_pkt_sender, mut up_pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
 
     tokio::spawn(async move {
@@ -348,7 +349,7 @@ fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     remove_closed_session(&mut sessions, network_tuple);
                 }
                 Some(packet) = up_pkt_receiver.recv() => {
-                    process_upstream_recv(packet, &mut device, #[cfg(unix)]pi).await?;
+                    process_upstream_recv(packet, &mut device, &mut outgoing_buffer, #[cfg(unix)]pi).await?;
                 }
             }
         }
@@ -477,22 +478,33 @@ fn create_stream(
 async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
     up_packet: NetworkPacket,
     device: &mut Device,
+    packet_bytes: &mut Vec<u8>,
     #[cfg(unix)] packet_information: bool,
 ) -> Result<()> {
-    #[allow(unused_mut)]
-    let Ok(mut packet_bytes) = up_packet.to_bytes() else {
-        log::warn!("to_bytes error");
-        return Ok(());
+    #[cfg(unix)]
+    let metadata_len = if packet_information {
+        TUN_FLAGS.len() + TUN_PROTO_IP4.len()
+    } else {
+        0
     };
+    #[cfg(not(unix))]
+    let metadata_len = 0;
+    packet_bytes.clear();
+    packet_bytes.reserve(metadata_len + up_packet.serialized_len());
     #[cfg(unix)]
     if packet_information {
+        packet_bytes.extend_from_slice(&TUN_FLAGS);
         if up_packet.src_addr().is_ipv4() {
-            packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
+            packet_bytes.extend_from_slice(&TUN_PROTO_IP4);
         } else {
-            packet_bytes.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
+            packet_bytes.extend_from_slice(&TUN_PROTO_IP6);
         }
     }
-    device.write_all(&packet_bytes).await?;
+    if up_packet.write_to(packet_bytes).is_err() {
+        log::warn!("to_bytes error");
+        return Ok(());
+    }
+    device.write_all(packet_bytes).await?;
     // device.flush().await?;
 
     Ok(())
@@ -526,6 +538,41 @@ mod tests {
         }
         .to_bytes()
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_packet_information_precedes_serialized_ipv4_and_ipv6_packets() {
+        use tokio::io::AsyncReadExt;
+
+        let mut buffer = Vec::new();
+        for ipv6 in [false, true] {
+            let mut raw = Vec::new();
+            if ipv6 {
+                etherparse::PacketBuilder::ipv6([0; 16], [1; 16], 64)
+                    .udp(1234, 5678)
+                    .write(&mut raw, b"payload")
+                    .unwrap();
+            } else {
+                raw = udp_packet(b"payload");
+            }
+            for packet_information in [false, true] {
+                let packet = NetworkPacket::parse(&raw).unwrap();
+                let mut expected = Vec::new();
+                if packet_information {
+                    expected.extend_from_slice(&TUN_FLAGS);
+                    expected.extend_from_slice(if ipv6 { &TUN_PROTO_IP6 } else { &TUN_PROTO_IP4 });
+                }
+                expected.extend_from_slice(&packet.to_bytes().unwrap());
+                let (mut device, mut peer) = duplex(256);
+                process_upstream_recv(packet, &mut device, &mut buffer, packet_information)
+                    .await
+                    .unwrap();
+                let mut actual = vec![0; expected.len()];
+                peer.read_exact(&mut actual).await.unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     /// Exercise dispatch before the old removal notification is consumed, then pass that

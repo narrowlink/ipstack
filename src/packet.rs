@@ -137,21 +137,39 @@ impl NetworkPacket {
         }
     }
     pub fn to_bytes(&self) -> Result<Vec<u8>, IpStackError> {
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(self.serialized_len());
+        self.write_to(&mut buf)?;
+        Ok(buf)
+    }
+
+    pub(crate) fn serialized_len(&self) -> usize {
+        let ip_len = match &self.ip {
+            IpHeader::Ipv4(ip) => ip.header_len(),
+            IpHeader::Ipv6(ip) => ip.header_len(),
+        };
+        let transport_len = match &self.transport {
+            TransportHeader::Tcp(tcp) => tcp.header_len(),
+            TransportHeader::Udp(_) => UdpHeader::LEN,
+            TransportHeader::Unknown => 0,
+        };
+        ip_len + transport_len + self.payload.as_ref().map_or(0, Vec::len)
+    }
+
+    pub(crate) fn write_to(&self, buf: &mut Vec<u8>) -> Result<(), IpStackError> {
         match self.ip {
-            IpHeader::Ipv4(ref ip) => ip.write(&mut buf)?,
-            IpHeader::Ipv6(ref ip) => ip.write(&mut buf)?,
+            IpHeader::Ipv4(ref ip) => ip.write(&mut *buf)?,
+            IpHeader::Ipv6(ref ip) => ip.write(&mut *buf)?,
         }
         match self.transport {
-            TransportHeader::Tcp(ref h) => h.write(&mut buf)?,
-            TransportHeader::Udp(ref h) => h.write(&mut buf)?,
+            TransportHeader::Tcp(ref h) => h.write(&mut *buf)?,
+            TransportHeader::Udp(ref h) => h.write(&mut *buf)?,
             _ => {}
         };
 
         if let Some(payload) = &self.payload {
             buf.extend_from_slice(payload);
         }
-        Ok(buf)
+        Ok(())
     }
     pub fn ttl(&self) -> u8 {
         match &self.ip {
