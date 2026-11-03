@@ -814,7 +814,12 @@ async fn tcp_main_logic_loop(
                 // The upstream reader freed channel space, so flush whatever is buffered and
                 // let the follow-up ACK carry the reopened window.
                 let mut tcb = tcb.lock().unwrap();
-                extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                // After the peer's FIN, poll_read drains the remaining bytes itself.
+                // A delayed notification must not send a window update after our final
+                // ACK: a peer already in Closed would answer it with RST.
+                if matches!(tcb.get_state(), TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2) {
+                    extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                }
                 continue;
             }
             _ = wait_retransmission_deadline(&tcb, &arm_notify) => {
@@ -1364,12 +1369,19 @@ mod tests {
     }
 
     async fn established_with_destroy(destroy: Option<tokio::sync::oneshot::Sender<()>>) -> (IpStackTcpStream, PacketReceiver, u32) {
+        established_with_config(destroy, TcpConfig::default()).await
+    }
+
+    async fn established_with_config(
+        destroy: Option<tokio::sync::oneshot::Sender<()>>,
+        config: TcpConfig,
+    ) -> (IpStackTcpStream, PacketReceiver, u32) {
         let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
         let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
 
         let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
         syn.syn = true;
-        let stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, destroy, Arc::new(TcpConfig::default())).unwrap();
+        let stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, destroy, Arc::new(config)).unwrap();
 
         let syn_ack = tokio::time::timeout(Duration::from_secs(1), up_rx.recv())
             .await
@@ -3015,5 +3027,229 @@ mod tests {
         pass(TcpConfig::default().timeout).await;
         assert_eq!(review_state(&stream), TcpState::Closed);
         assert!(written(&mut rx).await.iter().map(tcp_header_of).any(|h| h.rst));
+    }
+
+    #[test]
+    fn complete_drop_outside_runtime_resets_and_removes_session() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (destroy_tx, destroyed) = tokio::sync::oneshot::channel();
+        let (stream, mut rx, _) = runtime.block_on(established_with_destroy(Some(destroy_tx)));
+        let tcb = stream.tcb.clone();
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(stream);
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::Closed);
+        let packet = rx.try_recv().expect("outside-runtime drop must enqueue RST immediately");
+        assert!(tcp_header_of(&packet).rst);
+        assert!(!tcp_header_of(&packet).fin);
+        runtime.block_on(async {
+            assert!(tokio::time::timeout(Duration::from_secs(1), destroyed).await.unwrap().is_err());
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_delayed_reader_notification_does_not_ack_after_final_ack() {
+        let (mut stream, mut rx, seq) = established().await;
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        written(&mut rx).await;
+        stream.stream_sender().send(peer_ack(1001, seq + 1)).unwrap();
+        settle().await;
+        for i in 0..3u32 {
+            stream
+                .stream_sender()
+                .send(peer_segment(1001 + i * 4, seq + 1, ACK | PSH, u16::MAX, &[i as u8; 4]))
+                .unwrap();
+        }
+        stream
+            .stream_sender()
+            .send(peer_segment(1013, seq + 1, ACK | FIN, u16::MAX, &[]))
+            .unwrap();
+        assert_eq!(acks_written(&mut rx).await.last(), Some(&1014));
+        assert_eq!(review_state(&stream), TcpState::TimeWait);
+        // A notification from an earlier read can be selected after processing FIN.
+        stream.drain_notify.notify_one();
+        assert!(
+            written(&mut rx).await.is_empty(),
+            "reader drain sent an ACK after the final FIN ACK"
+        );
+        assert_eq!(read_to_end_now(&mut stream).await, [[0; 4], [1; 4], [2; 4]].concat());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_time_wait_duplicate_fin_then_rst_closes_without_reply() {
+        let (mut stream, mut rx, seq) = established().await;
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        written(&mut rx).await;
+        for _ in 0..2 {
+            stream
+                .stream_sender()
+                .send(peer_segment(1001, seq + 1, ACK | FIN, u16::MAX, &[]))
+                .unwrap();
+            assert_eq!(acks_written(&mut rx).await, [1002]);
+            assert_eq!(review_state(&stream), TcpState::TimeWait);
+        }
+        // A peer already in Closed may reset our ACK of its delayed duplicate FIN.
+        // RFC 9293 section 3.10.7.4 closes TimeWait on receipt of RST.
+        stream.stream_sender().send(peer_segment(1002, 0, RST, 0, &[])).unwrap();
+        assert!(written(&mut rx).await.is_empty());
+        assert_eq!(review_state(&stream), TcpState::Closed);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_ready());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn complete_parallel_sessions_close_and_release_workers() {
+        let start = Arc::new(tokio::sync::Barrier::new(257));
+        let mut sessions = tokio::task::JoinSet::new();
+        for iteration in 0..256 {
+            let start = start.clone();
+            sessions.spawn(async move {
+                let (destroy_tx, destroyed) = tokio::sync::oneshot::channel();
+                let (mut stream, mut rx, seq) = established_with_destroy(Some(destroy_tx)).await;
+                stream.write_all(b"hello").await.unwrap();
+                assert_eq!(rx.recv().await.unwrap().payload.as_deref(), Some(&b"hello"[..]));
+                let sender = stream.stream_sender();
+                // All 256 streams exist with outstanding data before any closes.
+                start.wait().await;
+                let peer = tokio::spawn(async move {
+                    if iteration % 2 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    sender
+                        .send(peer_segment(1001, seq + 5, ACK | FIN | PSH, u16::MAX, b"tail"))
+                        .unwrap();
+                    loop {
+                        let packet = rx.recv().await.expect("stream closed before FIN");
+                        if tcp_header_of(&packet).fin {
+                            assert_eq!(tcp_header_of(&packet).sequence_number, seq + 5);
+                            assert_eq!(tcp_header_of(&packet).acknowledgment_number, 1006);
+                            sender.send(peer_ack(1006, seq + 6)).unwrap();
+                            break;
+                        }
+                    }
+                });
+                if iteration % 2 != 0 {
+                    tokio::task::yield_now().await;
+                }
+                stream.shutdown().await.unwrap();
+                peer.await.unwrap();
+                assert_eq!(read_to_end_now(&mut stream).await, b"tail");
+                destroyed.await.expect("worker aborted instead of completing");
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            start.wait().await;
+            let mut completed = 0;
+            while let Some(result) = sessions.join_next().await {
+                result.unwrap();
+                completed += 1;
+            }
+            assert_eq!(completed, 256);
+        })
+        .await
+        .expect("parallel close or worker cleanup hung");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_drop_active_close_waits_for_both_fin_directions() {
+        let (destroy_tx, mut destroyed) = tokio::sync::oneshot::channel();
+        let (mut stream, mut rx, seq) = established_with_destroy(Some(destroy_tx)).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+        stream.write_all(b"reply").await.unwrap();
+        written(&mut rx).await;
+        drop(stream);
+        settle().await;
+        assert!(fins_written(&mut rx).await.is_empty());
+        sender.send(peer_ack(1001, seq + 5)).unwrap();
+        assert_eq!(fins_written(&mut rx).await, [seq + 5]);
+        sender.send(peer_ack(1001, seq + 6)).unwrap();
+        settle().await;
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::FinWait2);
+        assert!(destroyed.try_recv().is_err());
+        sender.send(peer_segment(1001, seq + 6, ACK | FIN, u16::MAX, &[])).unwrap();
+        written(&mut rx).await;
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::TimeWait);
+        pass(TcpConfig::default().two_msl - Duration::from_millis(1)).await;
+        assert!(destroyed.try_recv().is_err());
+        pass(Duration::from_millis(1)).await;
+        assert_eq!(destroyed.try_recv(), Ok(()));
+        assert_eq!(tcb.lock().unwrap().get_state(), TcpState::Closed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_fin_wait2_data_renews_inactivity_deadline() {
+        let config = TcpConfig {
+            timeout: Duration::from_millis(100),
+            ..TcpConfig::default()
+        };
+        let (mut stream, mut rx, seq) = established_with_config(None, config).await;
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        written(&mut rx).await;
+        stream.stream_sender().send(peer_ack(1001, seq + 1)).unwrap();
+        settle().await;
+        pass(Duration::from_millis(75)).await;
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, seq + 1, ACK | PSH, u16::MAX, b"x"))
+            .unwrap();
+        written(&mut rx).await;
+        pass(Duration::from_millis(26)).await;
+        assert_eq!(review_state(&stream), TcpState::FinWait2, "original deadline was not renewed");
+        pass(Duration::from_millis(73)).await;
+        assert_eq!(review_state(&stream), TcpState::FinWait2);
+        pass(Duration::from_millis(1)).await;
+        assert_eq!(review_state(&stream), TcpState::Closed);
+        assert!(written(&mut rx).await.iter().map(tcp_header_of).any(|h| h.rst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_fin_retry_limits_and_floors_in_all_closing_states() {
+        for state in [TcpState::FinWait1, TcpState::Closing, TcpState::LastAck] {
+            for retries in [0, 1, 3] {
+                // Explicit expected intervals include a configured floor above the
+                // data RTO and a data RTO above the ordinary 60-second ceiling.
+                for (rto, floor_ms, intervals) in [(1, 500, [1, 2, 4, 8]), (2, 3000, [3, 6, 12, 24]), (120, 500, [120; 4])] {
+                    let config = TcpConfig {
+                        rto: Duration::from_secs(rto),
+                        last_ack_timeout: Duration::from_millis(floor_ms),
+                        last_ack_max_retries: retries,
+                        ..TcpConfig::default()
+                    };
+                    let (mut stream, mut rx, seq) = established_with_config(None, config).await;
+                    if state == TcpState::LastAck {
+                        stream
+                            .stream_sender()
+                            .send(peer_segment(1001, seq, ACK | FIN, u16::MAX, &[]))
+                            .unwrap();
+                        written(&mut rx).await;
+                    }
+                    let mut cx = Context::from_waker(Waker::noop());
+                    assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+                    assert_eq!(fins_written(&mut rx).await, [seq]);
+                    if state == TcpState::Closing {
+                        stream
+                            .stream_sender()
+                            .send(peer_segment(1001, seq, ACK | FIN, u16::MAX, &[]))
+                            .unwrap();
+                        written(&mut rx).await;
+                    }
+                    assert_eq!(review_state(&stream), state);
+                    for seconds in intervals.iter().take(retries) {
+                        pass(Duration::from_secs(*seconds) - Duration::from_millis(1)).await;
+                        assert!(fins_written(&mut rx).await.is_empty());
+                        assert_eq!(review_state(&stream), state);
+                        pass(Duration::from_millis(1)).await;
+                        assert_eq!(fins_written(&mut rx).await, [seq]);
+                    }
+                    pass(Duration::from_secs(intervals[retries]) - Duration::from_millis(1)).await;
+                    assert_eq!(review_state(&stream), state);
+                    pass(Duration::from_millis(1)).await;
+                    assert_eq!(review_state(&stream), TcpState::Closed);
+                    assert!(fins_written(&mut rx).await.is_empty());
+                }
+            }
+        }
     }
 }
