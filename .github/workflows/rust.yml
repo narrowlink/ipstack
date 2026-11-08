@@ -10,29 +10,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build_n_test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest] # macos-latest, windows-latest
-
-    runs-on: ${{ matrix.os }}
-
+  check:
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt, clippy
     - uses: taiki-e/install-action@nextest
-    - name: rustfmt
-      run: cargo fmt --all -- --check
     - name: check
       run: cargo check --all-targets --all-features --verbose
-    - name: clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
     - name: Build
       run: cargo build --verbose --all-targets --all-features
     - name: Test
       run: cargo nextest run --all-features --all-targets
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        if: always()
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
 
   semver:
     name: Check semver
