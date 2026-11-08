@@ -34,12 +34,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
         if: always()
 
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
   semver:
     name: Check semver
     strategy:
