@@ -16,16 +16,20 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - uses: taiki-e/install-action@nextest
     - name: rustfmt
       run: cargo fmt --all -- --check
     - name: check
-      run: cargo check --verbose
+      run: cargo check --all-targets --all-features --verbose
     - name: clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo build --verbose --examples --tests --all-features
+      run: cargo build --verbose --all-targets --all-features
     - name: Test
-      run: cargo test --all-features --examples
+      run: cargo nextest run --all-features --all-targets
 
   semver:
     name: Check semver
