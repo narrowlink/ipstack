@@ -45,7 +45,6 @@ pub struct TcpConfig {
     pub last_ack_timeout: Duration,
     /// No longer used. After the peer's FIN the write side stays open until the application shuts
     /// it down or drops the stream (RFC 9293 §3.6), so CLOSE_WAIT has no timer.
-    #[deprecated(note = "CLOSE_WAIT has no timer: our FIN waits for the application to shut down or drop the stream")]
     pub close_wait_timeout: Duration,
     /// Timeout for TCP connections. Default is 60 seconds.
     pub timeout: Duration,
@@ -73,7 +72,6 @@ pub enum TcpOptions {
 }
 
 impl Default for TcpConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         TcpConfig {
             last_ack_max_retries: LAST_ACK_MAX_RETRIES,
@@ -2059,9 +2057,7 @@ mod tests {
             .send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[]))
             .unwrap();
         written(&mut up_rx).await;
-        #[allow(deprecated)]
-        let close_wait_timeout = TcpConfig::default().close_wait_timeout;
-        pass(close_wait_timeout + Duration::from_millis(100)).await;
+        pass(TcpConfig::default().close_wait_timeout + Duration::from_millis(100)).await;
         let result = stream.write_all(b"delayed response").await;
         assert!(
             result.is_ok(),
