@@ -43,8 +43,9 @@ pub struct TcpConfig {
     pub last_ack_max_retries: usize,
     /// Timeout for the last ACK in the LAST_ACK state. Default is 500ms.
     pub last_ack_timeout: Duration,
-    /// Timeout for the CLOSE_WAIT state: once this long passes with nothing sent or acknowledged, our FIN is
-    /// sent for an application that has not shut down. Default is 5 seconds.
+    /// No longer used. After the peer's FIN the write side stays open until the application shuts
+    /// it down or drops the stream (RFC 9293 §3.6), so CLOSE_WAIT has no timer.
+    #[deprecated(note = "CLOSE_WAIT has no timer: our FIN waits for the application to shut down or drop the stream")]
     pub close_wait_timeout: Duration,
     /// Timeout for TCP connections. Default is 60 seconds.
     pub timeout: Duration,
@@ -72,6 +73,7 @@ pub enum TcpOptions {
 }
 
 impl Default for TcpConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         TcpConfig {
             last_ack_max_retries: LAST_ACK_MAX_RETRIES,
@@ -525,7 +527,8 @@ async fn task_last_ack(
                 return;
             }
             log::debug!("{nt} {state:?}: {hint} timer expired, resending ACK|FIN (retry {idx}/{last_ack_max_retries})");
-            _ = write_packet_to_device(&pkt_sdr, nt, &tcb, None, ACK | FIN, None, None);
+            // Our FIN took the sequence number before `seq`, which it advanced; send it again there.
+            _ = write_packet_to_device(&pkt_sdr, nt, &tcb, None, ACK | FIN, Some(tcb.get_seq() - 1), None);
         }
     }
     {
@@ -681,54 +684,6 @@ async fn tcp_main_logic_loop(
             log::debug!("{nt} {state:?}: [task_wait_to_close] session closed after {two_msl:?}");
         }
         exit_notifier.send(()).await.unwrap_or(());
-    }
-
-    async fn task_timed_out_for_close_wait(
-        tcb: TcbPtr,
-        exit_notifier: tokio::sync::mpsc::Sender<()>,
-        nt: NetworkTuple,
-        up_packet_sender: PacketSender,
-        close_wait_timeout: Duration,
-        last_ack_timeout: Duration,
-        last_ack_max_retries: usize,
-    ) -> std::io::Result<()> {
-        // Wait until a whole CLOSE_WAIT_TIMEOUT passes with nothing new sent or acknowledged, so a
-        // reply still on its way is not cut.
-        let progress = |tcb: &Tcb| (tcb.get_seq(), tcb.get_last_received_ack());
-        let mut last = progress(&tcb.lock().unwrap());
-        loop {
-            tokio::time::sleep(close_wait_timeout).await;
-            let tcb = tcb.lock().unwrap();
-            let now = progress(&tcb);
-            if now == last || tcb.get_state() != TcpState::CloseWait {
-                break;
-            }
-            last = now;
-        }
-        let tcb_clone = tcb.clone();
-        let mut tcb = tcb.lock().unwrap();
-        let state = tcb.get_state();
-        if state != TcpState::CloseWait {
-            return Ok(());
-        }
-        log::warn!("{nt} {state:?}: Upstream timeout, forcing FIN");
-        write_packet_to_device(&up_packet_sender, nt, &tcb, None, ACK | FIN, None, None)?;
-        tcb.increase_seq();
-        tcb.change_state(TcpState::LastAck);
-        let new_state = tcb.get_state();
-        log::debug!("{nt} {state:?}: Forced transition to {new_state:?}");
-
-        // Here we set a timer to wait for the last ACK from the other side.
-        tokio::spawn(task_last_ack(
-            tcb_clone,
-            exit_notifier,
-            nt,
-            up_packet_sender,
-            last_ack_timeout,
-            last_ack_max_retries,
-        ));
-
-        Ok::<(), std::io::Error>(())
     }
 
     loop {
@@ -901,19 +856,6 @@ async fn tcp_main_logic_loop(
                         write_notify.wake();
                         let len = tcb.get_inflight_packets_total_len();
                         log::trace!("{network_tuple} CloseWait: {l_info}, closed by the other side, inflight: {len}");
-
-                        // Spawn a timeout task to force FIN if upstream stays idle without closing
-                        let tcb = tcb_clone.clone();
-                        let up = up_packet_sender.clone();
-                        tokio::spawn(task_timed_out_for_close_wait(
-                            tcb,
-                            exit_notifier,
-                            network_tuple,
-                            up,
-                            config.close_wait_timeout,
-                            config.last_ack_timeout,
-                            config.last_ack_max_retries,
-                        ));
                     }
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
                     // PSH changes nothing about where a segment belongs: one that arrives out of order
@@ -2083,12 +2025,11 @@ mod tests {
         assert_eq!(fins_written(&mut up_rx).await, [local_seq]);
     }
 
-    /// An application that never shuts down after the peer's FIN gets our FIN sent for it once
-    /// `close_wait_timeout` passes with nothing written and nothing acknowledged.
+    /// RFC 9293 §3.6: after the peer's FIN the write side stays open, however long the application
+    /// takes to answer; our FIN is sent only when it shuts down.
     #[tokio::test(start_paused = true)]
-    async fn idle_close_wait_sends_our_fin_at_the_timeout() {
-        let (stream, mut up_rx, local_seq) = established().await;
-        let timeout = TcpConfig::default().close_wait_timeout;
+    async fn close_wait_keeps_the_write_side_open_until_shutdown() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
         stream
             .stream_sender()
             .send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[]))
@@ -2096,51 +2037,57 @@ mod tests {
         settle().await;
         written(&mut up_rx).await;
 
-        pass(timeout - Duration::from_millis(1)).await;
-        assert!(fins_written(&mut up_rx).await.is_empty());
-        pass(Duration::from_millis(1)).await;
-        assert_eq!(
-            fins_written(&mut up_rx).await,
-            [local_seq],
-            "no FIN after an idle close_wait_timeout"
+        pass(Duration::from_secs(30)).await;
+        assert!(fins_written(&mut up_rx).await.is_empty(), "our FIN was sent before shutdown");
+        stream.write_all(b"late reply").await.unwrap();
+        stream.stream_sender().send(peer_ack(1002, local_seq + 10)).unwrap();
+        settle().await;
+        written(&mut up_rx).await;
+
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        assert_eq!(fins_written(&mut up_rx).await, [local_seq + 10]);
+    }
+
+    /// A half-closed stream still accepts a response written after what used to be the
+    /// close-wait timeout.
+    #[tokio::test(start_paused = true)]
+    async fn regression_delayed_response_after_peer_fin() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[]))
+            .unwrap();
+        written(&mut up_rx).await;
+        #[allow(deprecated)]
+        let close_wait_timeout = TcpConfig::default().close_wait_timeout;
+        pass(close_wait_timeout + Duration::from_millis(100)).await;
+        let result = stream.write_all(b"delayed response").await;
+        assert!(
+            result.is_ok(),
+            "a half-closed stream should not reject a delayed response: {result:?}"
         );
     }
 
-    /// A reply still moving after the peer's FIN is not cut by `close_wait_timeout`, which counts only
-    /// time without progress.
+    /// A retransmitted FIN carries the sequence number of the first one.
     #[tokio::test(start_paused = true)]
-    async fn close_wait_timeout_does_not_cut_a_reply_in_progress() {
+    async fn regression_fin_retry_preserves_sequence_number() {
         let (mut stream, mut up_rx, local_seq) = established().await;
-        let timeout = TcpConfig::default().close_wait_timeout;
         stream
             .stream_sender()
             .send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[]))
             .unwrap();
-        settle().await;
         written(&mut up_rx).await;
-
-        // Within every `close_wait_timeout` a byte is written, and then the peer acknowledges one.
-        let step = timeout - Duration::from_secs(1);
-        for i in 1..=2 {
-            pass(step).await;
-            stream.write_all(b"x").await.unwrap();
-            assert!(
-                fins_written(&mut up_rx).await.is_empty(),
-                "write {i}: the reply was cut while written"
-            );
-        }
-        for i in 1..=2 {
-            pass(step).await;
-            stream.stream_sender().send(peer_ack(1002, local_seq + i)).unwrap();
-            assert!(
-                fins_written(&mut up_rx).await.is_empty(),
-                "ack {i}: the reply was cut while acknowledged"
-            );
-        }
-
-        // Once it stops, our FIN follows within two periods.
-        pass(timeout * 2).await;
-        assert_eq!(fins_written(&mut up_rx).await.first(), Some(&(local_seq + 2)));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        let original = fins_written(&mut up_rx).await;
+        assert_eq!(original, [local_seq]);
+        pass(TcpConfig::default().last_ack_timeout).await;
+        assert_eq!(
+            fins_written(&mut up_rx).await,
+            original,
+            "the retried FIN moved its sequence number"
+        );
     }
 
     /// A writer waiting for window when the connection closes under it is woken to see the close.
@@ -2158,9 +2105,12 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         assert!(Pin::new(&mut stream).poll_write(&mut cx, b"reply").is_pending());
 
-        // The backstop sends our FIN, which is never acknowledged, and the connection ends.
-        let config = TcpConfig::default();
-        pass(config.close_wait_timeout + config.last_ack_timeout * (config.last_ack_max_retries as u32 + 1)).await;
+        // The peer resets the connection.
+        stream
+            .stream_sender()
+            .send(peer_segment(1002, local_seq, ACK | RST, 0, &[]))
+            .unwrap();
+        settle().await;
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
         assert!(woken.load(std::sync::atomic::Ordering::SeqCst), "the writer was left waiting");
         assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"reply"), Poll::Ready(Err(_))));
