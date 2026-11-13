@@ -12,7 +12,9 @@ readme = "README.md"
 [dependencies]
 atomic-waker = "1.1"
 ahash = { version = "0.8", default-features = false, features = ["std"] }
-etherparse = { version = "0.20", default-features = false, features = ["std"] }
+etherparse = { version = "0.21.0", default-features = false, features = [
+    "std",
+] }
 log = { version = "0.4", default-features = false }
 rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 thiserror = { version = "2.0", default-features = false }
