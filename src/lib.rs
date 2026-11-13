@@ -512,17 +512,18 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::{
         collections::VecDeque,
         pin::Pin,
         task::{Context, Poll},
-        time::Duration,
     };
 
-    use tokio::{
-        io::{AsyncRead, AsyncWrite, ReadBuf, duplex},
-        time::timeout,
-    };
+    use std::time::Duration;
+    use tokio::{io::duplex, time::timeout};
+
+    #[cfg(unix)]
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
     use super::*;
 
@@ -669,16 +670,19 @@ mod tests {
         udp_session_is_cleaned_without_more_traffic(true).await;
     }
 
+    #[cfg(unix)]
     struct ChunkedDevice {
         chunks: VecDeque<Vec<u8>>,
     }
 
+    #[cfg(unix)]
     impl ChunkedDevice {
         fn new(chunks: Vec<Vec<u8>>) -> Self {
             Self { chunks: chunks.into() }
         }
     }
 
+    #[cfg(unix)]
     impl AsyncRead for ChunkedDevice {
         fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
             if let Some(mut chunk) = self.chunks.pop_front() {
@@ -694,6 +698,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl AsyncWrite for ChunkedDevice {
         fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
             Poll::Ready(Ok(buf.len()))

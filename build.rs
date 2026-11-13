@@ -1,7 +1,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string());
 
-    if target_os == "windows" {
+    if target_os == "windows" && std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some() {
         let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
         let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
 
@@ -16,7 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dll_path = get_wintun_bin_relative_path()?;
         let src_path = crate_dir.join(dll_path);
 
-        let dst_path = cargo_target_dir.join("examples/wintun.dll");
+        let dst_dir = cargo_target_dir.join("examples");
+        std::fs::create_dir_all(&dst_dir)?;
+        let dst_path = dst_dir.join("wintun.dll");
 
         // Copy to the target directory
         std::fs::copy(src_path, &dst_path)?;
@@ -58,6 +60,10 @@ fn get_crate_dir(crate_name: &str) -> Result<std::path::PathBuf, Box<dyn std::er
         .arg("metadata")
         .arg("--format-version=1")
         .output()?;
+
+    if !output.status.success() {
+        return Err(format!("cargo metadata failed: {}", String::from_utf8_lossy(&output.stderr).trim()).into());
+    }
 
     let metadata = serde_json::from_slice::<serde_json::Value>(&output.stdout)?;
     let packages = metadata["packages"].as_array().ok_or("packages")?;

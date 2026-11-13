@@ -100,6 +100,8 @@ impl Tcb {
     ) -> Tcb {
         let rto = rto.max(RTO);
         #[cfg(debug_assertions)]
+        let _ = rand::rng;
+        #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::RngExt::random::<u32>(&mut rand::rng());
