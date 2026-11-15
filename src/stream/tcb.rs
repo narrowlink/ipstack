@@ -32,6 +32,7 @@ pub(crate) enum TcpState {
     Established,
     FinWait1, // act as a client, actively send a farewell packet to the other side, followed with FinWait2, TimeWait, Closed
     FinWait2,
+    Closing,
     TimeWait,
     CloseWait, // act as a server, followed with LastAck, Closed
     LastAck,
