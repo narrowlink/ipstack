@@ -326,7 +326,7 @@ impl AsyncRead for IpStackTcpStream {
             self.write_notify.wake();
             return Poll::Ready(Ok(()));
         }
-        if matches!(state, TcpState::CloseWait | TcpState::LastAck) {
+        if matches!(state, TcpState::CloseWait | TcpState::LastAck | TcpState::TimeWait) {
             // The peer's FIN came after every byte it sent, so what is on hand is the rest of the
             // stream. The lock keeps the main loop from moving bytes into the channel in between.
             let tcb = self.tcb.clone();
@@ -449,7 +449,8 @@ impl AsyncWrite for IpStackTcpStream {
         log::trace!("{nt} {state:?}: [poll_shutdown] seq = {seq}, ready = {is_ready}",);
         #[cfg(test)]
         tests::run_after_state_snapshot();
-        if state == TcpState::Closed {
+        // Once the peer has acknowledged our FIN, our direction is closed.
+        if matches!(state, TcpState::Closed | TcpState::FinWait2 | TcpState::TimeWait) {
             return Poll::Ready(Ok(()));
         }
         if is_ready && state == TcpState::Established {
@@ -906,80 +907,29 @@ async fn tcp_main_logic_loop(
                 let new_state = tcb.get_state();
                 log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
             }
-            TcpState::FinWait1 => {
-                if flags.contains(ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
-                    // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
-                    tcb.increase_ack();
+            TcpState::FinWait1 | TcpState::FinWait2 if flags.contains(ACK) => {
+                // Our direction is closed, the peer's is not: it may still send data, then its FIN,
+                // in one segment or several, before or after it acknowledges our FIN.
+                if pkt_type == PacketType::KeepAlive {
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    tcb.change_state(TcpState::TimeWait);
-
-                    tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Final ACK|FIN received too early, transitioned to {new_state:?} directly");
-                } else if flags.contains(ACK) {
+                } else if len > 0 {
+                    let nt = network_tuple;
+                    receive_segment(&up_packet_sender, &mut tcb, nt, incoming_seq, payload, &data_tx, &read_notify)?;
+                    write_notify.wake();
+                }
+                if state == TcpState::FinWait1 && incoming_ack == tcb.get_seq() {
                     tcb.change_state(TcpState::FinWait2);
-                    if len > 0 {
-                        // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                        receive_segment(
-                            &up_packet_sender,
-                            &mut tcb,
-                            network_tuple,
-                            incoming_seq,
-                            payload,
-                            &data_tx,
-                            &read_notify,
-                        )?;
-                        write_notify.wake();
-                    }
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received ACK, transitioned to {new_state:?}");
-                } else {
-                    // unnormal case, we do nothing here
-                    log::trace!("{network_tuple} {state:?}: Some unnormal case, we do nothing here");
                 }
-            }
-            TcpState::FinWait2 => {
-                if flags.contains(ACK | FIN) && len == 0 && tcb.get_ack() == incoming_seq {
+                // RFC 9293 §3.10.7.4: the FIN is taken once every byte before it has arrived.
+                if flags.contains(FIN) && tcb.get_ack() == incoming_seq + len as u32 {
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     tcb.change_state(TcpState::TimeWait);
                     tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                    let new_state = tcb.get_state();
-                    log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
-                } else if flags.contains(ACK) && len == 0 {
-                    // unnormal case, we do nothing here
-                    let l_ack = tcb.get_ack();
-                    if incoming_seq < l_ack {
-                        log::trace!("{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {l_ack}");
-                    }
-                } else if flags.contains(ACK) && len > 0 {
-                    if pkt_type == PacketType::KeepAlive {
-                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                    } else {
-                        // if the other side is still sending data, we need to deal with it like PacketStatus::NewPacket
-                        receive_segment(
-                            &up_packet_sender,
-                            &mut tcb,
-                            network_tuple,
-                            incoming_seq,
-                            payload,
-                            &data_tx,
-                            &read_notify,
-                        )?;
-                        write_notify.wake();
-                    }
-                    if flags.contains(FIN) && tcb.get_ack() == incoming_seq + len as u32 {
-                        tcb.increase_ack();
-                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                        tcb.change_state(TcpState::TimeWait);
-                        tokio::spawn(task_wait_to_close(tcb_clone.clone(), exit_notifier, network_tuple, config.two_msl));
-                        let new_state = tcb.get_state();
-                        log::trace!("{network_tuple} {state:?}: Received final ACK|FIN, transitioned to {new_state:?}");
-                    }
-                } else {
-                    // unnormal case, we do nothing here
-                    log::trace!("{network_tuple} {state:?}: Some unnormal case, we do nothing here");
+                    read_notify.wake();
                 }
+                let new_state = tcb.get_state();
+                log::trace!("{network_tuple} {state:?}: {l_info}, {pkt_type:?}, now in {new_state:?}");
             }
             TcpState::TimeWait if flags.contains(ACK | FIN) => {
                 write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
@@ -993,7 +943,10 @@ async fn tcp_main_logic_loop(
         tcb.update_send_window(tcp_header);
         // ACKs with or without data can retire the last outstanding bytes. The
         // shutdown waiter may belong to a different task than the writer.
-        if flags.contains(ACK) && matches!(tcb.get_state(), TcpState::Established | TcpState::CloseWait) && tcb.is_inflight_queue_empty() {
+        let state = tcb.get_state();
+        if flags.contains(ACK) && matches!(state, TcpState::Established | TcpState::CloseWait) && tcb.is_inflight_queue_empty()
+            || matches!(state, TcpState::FinWait2 | TcpState::TimeWait)
+        {
             shutdown.wake();
         }
     } // end of loop
@@ -2084,6 +2037,42 @@ mod tests {
             original,
             "the retried FIN moved its sequence number"
         );
+    }
+
+    /// A shutdown completes when the peer acknowledges our FIN, not on an earlier ACK, and the
+    /// acknowledgement wakes it; the peer's reply after that still reaches the reader.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_completes_when_our_fin_is_acknowledged() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        assert_eq!(fins_written(&mut up_rx).await, [local_seq]);
+
+        // Data that does not acknowledge the FIN leaves the shutdown waiting.
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, ACK | PSH, u16::MAX, b"re"))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        woken.store(false, Ordering::SeqCst);
+
+        stream
+            .stream_sender()
+            .send(peer_segment(1003, local_seq + 1, ACK | PSH, u16::MAX, b"ply"))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert!(woken.load(Ordering::SeqCst), "the ACK of our FIN did not wake the shutdown");
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+
+        stream
+            .stream_sender()
+            .send(peer_segment(1006, local_seq + 1, ACK | FIN, u16::MAX, &[]))
+            .unwrap();
+        assert_eq!(acks_written(&mut up_rx).await.last(), Some(&1007));
+        assert_eq!(read_to_end_now(&mut stream).await, b"reply");
     }
 
     /// A writer waiting for window when the connection closes under it is woken to see the close.
