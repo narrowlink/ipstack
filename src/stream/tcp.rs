@@ -1051,6 +1051,7 @@ fn receive_segment(
     read_notify: &AtomicWaker,
 ) -> std::io::Result<()> {
     tcb.add_unordered_packet(seq, payload);
+    tcb.acknowledge_unordered_packets();
     if !extract_data_n_write_upstream(up_packet_sender, tcb, network_tuple, data_tx, read_notify)? {
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
@@ -1102,8 +1103,6 @@ fn extract_data_n_write_upstream(
         log::debug!("{network_tuple} {state:?}: {l_info} session closed, exiting \"data extraction task\"...");
         return Ok(true);
     }
-
-    tcb.acknowledge_unordered_packets();
 
     // Reserve the handoff slot before taking acknowledged data.
     let permit = match data_tx.try_reserve() {
@@ -2027,6 +2026,7 @@ mod tests {
         tcb.change_state(TcpState::Established);
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]);
         tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]);
+        tcb.acknowledge_unordered_packets();
 
         // first extract fills the single channel slot and advances ack over the first chunk
         extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
@@ -2034,6 +2034,7 @@ mod tests {
 
         // channel is full: extract advances ack over the tail and holds it for the reader
         tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
+        tcb.acknowledge_unordered_packets();
         extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
         assert_eq!(tcb.get_ack(), SeqNum(2500));
         assert_eq!(tcb.get_available_read_buffer_size(), READ_BUFFER_SIZE - 500);
