@@ -24,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// 2 * MSL (Maximum Segment Lifetime) is the maximum time a TCP connection can be in the TIME_WAIT state.
 const TWO_MSL: Duration = Duration::from_secs(2);
 
-const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const LAST_ACK_MAX_RETRIES: usize = 3;
 const LAST_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -43,7 +43,7 @@ pub struct TcpConfig {
     pub last_ack_max_retries: usize,
     /// Timeout for the last ACK in the LAST_ACK state. Default is 500ms.
     pub last_ack_timeout: Duration,
-    /// Idle backstop timeout in CLOSE_WAIT after the last write before forcing FIN. Default is 5 seconds.
+    /// Idle backstop timeout in CLOSE_WAIT after the last write before forcing FIN. Default is 60 seconds.
     pub close_wait_timeout: Duration,
     /// Timeout for TCP connections. Default is 60 seconds.
     pub timeout: Duration,
@@ -1141,8 +1141,8 @@ fn receive_segment(
 
 /// Like `receive_segment`, for a segment carrying FIN; returns whether the FIN was taken.
 /// The FIN is taken, and ACKed together with the payload, only once every byte before it is in.
-/// A FIN segment after a gap gets a duplicate ACK and is not buffered, so the gap-filling segment
-/// cannot advance `ack` past an unseen FIN.
+/// A FIN segment after a gap buffers its payload and gets a duplicate ACK, so the gap-filling
+/// segment advances `ack` to the end of the data without taking the unseen FIN.
 fn receive_segment_with_fin(
     up_packet_sender: &PacketSender,
     tcb: &mut Tcb,
@@ -1153,10 +1153,6 @@ fn receive_segment_with_fin(
     read_notify: &AtomicWaker,
 ) -> std::io::Result<bool> {
     let fin_seq = seq + payload.len() as u32;
-    if seq > tcb.get_ack() {
-        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
-        return Ok(false);
-    }
     tcb.add_unordered_packet(seq, payload);
     tcb.acknowledge_unordered_packets();
     let fin_taken = tcb.get_ack() == fin_seq;
@@ -1841,12 +1837,12 @@ mod tests {
                 "flags {flags:?}: out-of-order FIN segment got no duplicate ACK"
             );
 
-            // The gap fills; the FIN was not seen yet, so ACK stops at the end of the data.
+            // The gap fills; the FIN was not seen yet, so ACK stops at the end of the buffered data.
             stream
                 .stream_sender()
                 .send(peer_segment(1001, local_seq, ACK, u16::MAX, b"head"))
                 .unwrap();
-            assert_eq!(acks(&mut up_rx).await.last(), Some(&1005), "flags {flags:?}");
+            assert_eq!(acks(&mut up_rx).await.last(), Some(&1009), "flags {flags:?}");
             assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
 
             // The peer retransmits the FIN segment.
@@ -2549,20 +2545,21 @@ mod tests {
             .unwrap();
         written(&mut up_rx).await;
 
-        // Write after 3s (and peer ACKs it), resetting the 5s CloseWait backstop.
-        tokio::time::advance(Duration::from_secs(3)).await;
+        // Write after half of CLOSE_WAIT_TIMEOUT (and peer ACKs it), resetting the backstop.
+        let half = CLOSE_WAIT_TIMEOUT / 2;
+        tokio::time::advance(half).await;
         stream.write_all(b"chunk").await.unwrap();
         up_rx.recv().await.unwrap();
         stream.stream_sender().send(peer_ack(1002, local_seq + 5)).unwrap();
         tokio::task::yield_now().await;
 
-        // 3s later (6s since FIN, 3s since last write): still in CloseWait, no FIN sent yet.
-        tokio::time::advance(Duration::from_secs(3)).await;
+        // Advance another half: past the original timeout from FIN, but before timeout from last write.
+        tokio::time::advance(half).await;
         tokio::task::yield_now().await;
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::CloseWait);
 
-        // 2s more (5s since last write): backstop sends FIN -> LastAck; further writes fail with BrokenPipe.
-        tokio::time::advance(Duration::from_secs(2)).await;
+        // Advance the remaining half: backstop sends FIN -> LastAck; further writes fail with BrokenPipe.
+        tokio::time::advance(half).await;
         tokio::task::yield_now().await;
         let packets = written(&mut up_rx).await;
         assert!(packets.iter().any(|p| tcp_header_of(p).fin));
