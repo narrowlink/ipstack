@@ -83,6 +83,7 @@ pub(crate) struct Tcb {
     /// returns to it rather than being recomputed from a measurement.
     current_rto: std::time::Duration,
     max_retransmit_count: usize,
+    pub(super) last_write: tokio::time::Instant,
 }
 
 impl Tcb {
@@ -143,6 +144,7 @@ impl Tcb {
             rto,
             current_rto: rto,
             max_retransmit_count,
+            last_write: tokio::time::Instant::now(),
         }
     }
 
