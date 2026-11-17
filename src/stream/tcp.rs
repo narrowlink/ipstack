@@ -452,11 +452,11 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Ready(Ok(()));
         }
         if is_ready && matches!(state, TcpState::Established | TcpState::CloseWait) {
-            let new_state = {
+            let last_ack_fin = {
                 let mut tcb = self.tcb.lock().unwrap();
-                send_fin("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?.then(|| tcb.get_state())
+                send_fin("[poll_shutdown]", nt, &self.up_packet_sender, &mut tcb)?.filter(|_| tcb.get_state() == TcpState::LastAck)
             };
-            if new_state == Some(TcpState::LastAck)
+            if let Some(fin_seq) = last_ack_fin
                 && let Some(exit_notifier) = self.exit_notifier.clone()
             {
                 tokio::spawn(task_last_ack(
@@ -464,6 +464,7 @@ impl AsyncWrite for IpStackTcpStream {
                     exit_notifier,
                     nt,
                     self.up_packet_sender.clone(),
+                    fin_seq,
                     self.config.last_ack_timeout,
                     self.config.last_ack_max_retries,
                 ));
@@ -474,28 +475,29 @@ impl AsyncWrite for IpStackTcpStream {
     }
 }
 
-fn send_fin(hint: &str, nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<bool> {
+fn send_fin(hint: &str, nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -> std::io::Result<Option<SeqNum>> {
     let state = tcb.get_state();
     let next_state = match state {
         TcpState::Established => TcpState::FinWait1,
         TcpState::CloseWait => TcpState::LastAck,
         _ => {
             log::debug!("{nt} {state:?}: {hint} session is not in a valid state to send FIN, skipping...");
-            return Ok(false);
+            return Ok(None);
         }
     };
     if tcb.get_inflight_packets_total_len() != 0 {
         log::debug!("{nt} {state:?}: {hint} session has inflight data, skipping FIN...");
-        return Ok(false);
+        return Ok(None);
     }
 
     log::debug!("{nt} {state:?}: {hint} actively send a farewell packet to the other side...");
-    write_packet_to_device(sender, nt, tcb, None, ACK | FIN, None, None)?;
+    let fin_seq = tcb.get_seq();
+    write_packet_to_device(sender, nt, tcb, None, ACK | FIN, Some(fin_seq), None)?;
     tcb.increase_seq();
     tcb.change_state(next_state);
     log::debug!("{nt} {next_state:?}: {hint} now in {next_state:?} state");
 
-    Ok(true)
+    Ok(Some(fin_seq))
 }
 
 async fn task_last_ack(
@@ -503,6 +505,7 @@ async fn task_last_ack(
     exit_notifier: tokio::sync::mpsc::Sender<()>,
     nt: NetworkTuple,
     pkt_sdr: PacketSender,
+    fin_seq: SeqNum,
     last_ack_timeout: Duration,
     last_ack_max_retries: usize,
 ) {
@@ -524,7 +527,7 @@ async fn task_last_ack(
                 return;
             }
             log::debug!("{nt} {state:?}: {hint} timer expired, resending ACK|FIN (retry {idx}/{last_ack_max_retries})");
-            _ = write_packet_to_device(&pkt_sdr, nt, &tcb, None, ACK | FIN, Some(tcb.get_seq() - 1), None);
+            _ = write_packet_to_device(&pkt_sdr, nt, &tcb, None, ACK | FIN, Some(fin_seq), None);
         }
     }
     {
@@ -538,65 +541,79 @@ async fn task_last_ack(
 
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
+        enum DropAction {
+            Abort,
+            KeepAlive,
+            LastAck(SeqNum),
+        }
+
         let (nt, state) = (self.network_tuple(), self.tcb.lock().unwrap().get_state());
         log::trace!("{nt} {state:?}: [drop] session dropping, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
                 // The farewell packet reaches the device through an unbounded channel, so it
                 // is sent here rather than left to the task.
-                let (keep_task, spawn_last_ack) = {
+                let action = {
                     let mut tcb = self.tcb.lock().unwrap();
                     self.shutdown.drop_requested.store(true, Ordering::Release);
                     match send_fin("[drop]", nt, &self.up_packet_sender, &mut tcb) {
-                        Ok(sent_fin) => {
-                            let new_state = tcb.get_state();
-                            let keep = !matches!(new_state, TcpState::Listen | TcpState::SynReceived | TcpState::Closed);
-                            (keep, sent_fin && new_state == TcpState::LastAck)
+                        Ok(Some(fin_seq)) if tcb.get_state() == TcpState::LastAck => DropAction::LastAck(fin_seq),
+                        Ok(_) if matches!(tcb.get_state(), TcpState::Listen | TcpState::SynReceived | TcpState::Closed) => {
+                            DropAction::Abort
                         }
+                        Ok(_) => DropAction::KeepAlive,
                         Err(e) => {
                             log::debug!("{nt} {state:?}: [drop] cannot send the farewell packet: {e}");
-                            (false, false)
+                            DropAction::Abort
                         }
                     }
                 };
-                if spawn_last_ack && let Some(exit_notifier) = self.exit_notifier.clone() {
+                if let DropAction::LastAck(fin_seq) = action
+                    && let Some(exit_notifier) = self.exit_notifier.clone()
+                {
                     tokio::spawn(task_last_ack(
                         self.tcb.clone(),
                         exit_notifier,
                         nt,
                         self.up_packet_sender.clone(),
+                        fin_seq,
                         self.config.last_ack_timeout,
                         self.config.last_ack_max_retries,
                     ));
                 }
-                if keep_task && let Some(exit) = self.exit_notifier.clone() {
-                    let tcb = self.tcb.clone();
-                    let up = self.up_packet_sender.clone();
-                    let timeout = self.config.timeout;
-                    tokio::spawn(async move {
-                        tokio::select! {
-                            _ = exit.closed() => return,
-                            _ = tokio::time::sleep(timeout) => {}
+                match action {
+                    DropAction::Abort => {
+                        if let Some(notifier) = self.exit_notifier.take() {
+                            // The channel holds ten slots and one signal ends the task, so the send
+                            // needs no runtime of its own.
+                            _ = notifier.try_send(());
                         }
-                        {
-                            let mut tcb = tcb.lock().unwrap();
-                            if tcb.get_state() == TcpState::Closed {
-                                return;
-                            }
-                            _ = write_packet_to_device(&up, nt, &tcb, None, ACK | RST, None, None);
-                            tcb.change_state(TcpState::Closed);
-                        }
-                        _ = exit.send(()).await;
-                    });
-                } else if !keep_task {
-                    if let Some(notifier) = self.exit_notifier.take() {
-                        // The channel holds ten slots and one signal ends the task, so the send
-                        // needs no runtime of its own.
-                        _ = notifier.try_send(());
+                        // Dropping the task drops its `destroy_messenger`, which wakes the watcher
+                        // that removes this session from the stack.
+                        task_handle.abort();
                     }
-                    // Dropping the task drops its `destroy_messenger`, which wakes the watcher
-                    // that removes this session from the stack.
-                    task_handle.abort();
+                    DropAction::KeepAlive | DropAction::LastAck(_) => {
+                        if let Some(exit) = self.exit_notifier.clone() {
+                            let tcb = self.tcb.clone();
+                            let up = self.up_packet_sender.clone();
+                            let timeout = self.config.timeout;
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    _ = exit.closed() => return,
+                                    _ = tokio::time::sleep(timeout) => {}
+                                }
+                                {
+                                    let mut tcb = tcb.lock().unwrap();
+                                    if tcb.get_state() == TcpState::Closed {
+                                        return;
+                                    }
+                                    _ = write_packet_to_device(&up, nt, &tcb, None, ACK | RST, None, None);
+                                    tcb.change_state(TcpState::Closed);
+                                }
+                                _ = exit.send(()).await;
+                            });
+                        }
+                    }
                 }
             } else {
                 log::trace!("{nt} {state:?}: [drop] task already finished, no need to wait exiting");
@@ -745,21 +762,17 @@ async fn tcp_main_logic_loop(
                 continue;
             }
             log::warn!("{nt} {state:?}: Upstream timeout, forcing FIN");
-            write_packet_to_device(&up_packet_sender, nt, &tcb, None, ACK | FIN, None, None)?;
-            tcb.increase_seq();
-            tcb.change_state(TcpState::LastAck);
-            let new_state = tcb.get_state();
-            log::debug!("{nt} {state:?}: Forced transition to {new_state:?}");
-
-            // Here we set a timer to wait for the last ACK from the other side.
-            tokio::spawn(task_last_ack(
-                tcb_clone,
-                exit_notifier,
-                nt,
-                up_packet_sender,
-                last_ack_timeout,
-                last_ack_max_retries,
-            ));
+            if let Some(fin_seq) = send_fin("[close_wait_timeout]", nt, &up_packet_sender, &mut tcb)? {
+                tokio::spawn(task_last_ack(
+                    tcb_clone,
+                    exit_notifier,
+                    nt,
+                    up_packet_sender,
+                    fin_seq,
+                    last_ack_timeout,
+                    last_ack_max_retries,
+                ));
+            }
 
             return Ok::<(), std::io::Error>(());
         }
@@ -1055,7 +1068,7 @@ async fn tcp_main_logic_loop(
         // shutdown waiter may belong to a different task than the writer.
         if flags.contains(ACK) && matches!(tcb.get_state(), TcpState::Established | TcpState::CloseWait) && tcb.is_inflight_queue_empty() {
             if shutdown.drop_requested.load(Ordering::Acquire)
-                && send_fin("[drop]", network_tuple, &up_packet_sender, &mut tcb)?
+                && let Some(fin_seq) = send_fin("[drop]", network_tuple, &up_packet_sender, &mut tcb)?
                 && tcb.get_state() == TcpState::LastAck
             {
                 tokio::spawn(task_last_ack(
@@ -1063,6 +1076,7 @@ async fn tcp_main_logic_loop(
                     exit_notifier,
                     network_tuple,
                     up_packet_sender.clone(),
+                    fin_seq,
                     config.last_ack_timeout,
                     config.last_ack_max_retries,
                 ));
