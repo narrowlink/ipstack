@@ -737,8 +737,8 @@ async fn tcp_main_logic_loop(
         }
 
         tcb.increase_ack();
-        let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
-        let l_info = LocalInfo(seq, ack);
+        let (syn_seq, ack) = (tcb.get_seq(), tcb.get_ack());
+        let l_info = LocalInfo(syn_seq.0, ack.0);
         log::trace!("{network_tuple} {state:?}: {l_info} session begins");
         write_packet_to_device(
             &up_packet_sender,
@@ -746,11 +746,12 @@ async fn tcp_main_logic_loop(
             &tcb,
             config.options.as_ref(),
             ACK | SYN,
-            None,
+            Some(syn_seq),
             None,
         )?;
         tcb.increase_seq();
         tcb.change_state(TcpState::SynReceived);
+        tcb.arm_inflight_syn(syn_seq);
         let state = tcb.get_state();
         log::trace!("{network_tuple} {state:?}: session now in {state:?} state");
     }
@@ -852,18 +853,32 @@ async fn tcp_main_logic_loop(
                     break;
                 }
                 let (packets, packets_exhausted) = tcb.collect_timed_out_inflight_packets();
+                let (syn_seq, syn_exhausted) = tcb.collect_timed_out_inflight_syn();
                 let (fin_seq, fin_exhausted) = tcb.collect_timed_out_inflight_fin();
-                if packets_exhausted || fin_exhausted {
+                if packets_exhausted || syn_exhausted || fin_exhausted {
                     // RFC 9293 §3.8.3: R2 transmissions of the same segment close the connection.
                     log::warn!("{network_tuple} segment reached R2 transmissions, closing session");
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
                     tcb.change_state(TcpState::Closed);
+                    tcb.clear_inflight_syn();
                     tcb.clear_inflight_fin();
                     drop(tcb);
                     shutdown.complete();
                     write_notify.wake();
                     read_notify.wake();
                     break;
+                }
+                if let Some(seq) = syn_seq {
+                    log::debug!("{network_tuple} {state:?}: SYN|ACK retransmission timeout: {seq:?}");
+                    write_packet_to_device(
+                        &up_packet_sender,
+                        network_tuple,
+                        &tcb,
+                        config.options.as_ref(),
+                        ACK | SYN,
+                        Some(seq),
+                        None,
+                    )?;
                 }
                 for packet in packets {
                     let (seq, count) = (packet.seq, packet.retransmit_count);
@@ -914,6 +929,8 @@ async fn tcp_main_logic_loop(
         }
 
         if flags.contains(RST) {
+            tcb.clear_inflight_syn();
+            tcb.clear_inflight_fin();
             tcb.change_state(TcpState::Closed);
             drop(tcb);
             write_notify.wake();
@@ -921,6 +938,28 @@ async fn tcp_main_logic_loop(
             // Finish the task so its destroy notification and shutdown waker are delivered
             // even if the peer never sends another packet.
             break;
+        }
+
+        // A retransmitted SYN carries no ACK (typically ack = 0), so handle it before
+        // ACK-based sequence validation (`check_pkt_type`) which would reject it as Invalid.
+        if state == TcpState::SynReceived && flags.contains(SYN) && !flags.contains(ACK) && !flags.contains(FIN) {
+            if incoming_seq == tcb.get_ack() - 1
+                && let Some(syn_seq) = tcb.inflight_syn_seq()
+            {
+                log::trace!("{network_tuple} {state:?}: retransmitted SYN received, resending SYN|ACK seq = {syn_seq}");
+                write_packet_to_device(
+                    &up_packet_sender,
+                    network_tuple,
+                    &tcb,
+                    config.options.as_ref(),
+                    ACK | SYN,
+                    Some(syn_seq),
+                    None,
+                )?;
+            } else {
+                log::trace!("{network_tuple} {state:?}: ignoring unexpected SYN seq = {incoming_seq}");
+            }
+            continue;
         }
 
         tcb.update_duplicate_ack_count(incoming_ack);
@@ -941,20 +980,25 @@ async fn tcp_main_logic_loop(
         }
 
         match state {
-            TcpState::SynReceived if flags.contains(ACK) => {
-                if len > 0 {
-                    receive_segment(
-                        &up_packet_sender,
-                        &mut tcb,
-                        network_tuple,
-                        incoming_seq,
-                        payload,
-                        &data_tx,
-                        &read_notify,
-                    )?;
+            TcpState::SynReceived => {
+                if flags.contains(ACK) && incoming_ack == tcb.get_seq() {
+                    tcb.clear_inflight_syn();
+                    if len > 0 {
+                        receive_segment(
+                            &up_packet_sender,
+                            &mut tcb,
+                            network_tuple,
+                            incoming_seq,
+                            payload,
+                            &data_tx,
+                            &read_notify,
+                        )?;
+                    }
+                    tcb.change_state(TcpState::Established);
+                    write_notify.wake();
+                } else {
+                    continue;
                 }
-                tcb.change_state(TcpState::Established);
-                write_notify.wake();
             }
             TcpState::Established => {
                 if flags == ACK {
@@ -1741,6 +1785,223 @@ mod tests {
             Pin::new(&mut stream).poll_write(&mut cx, b"hello"),
             Poll::Ready(Err(err)) if err.kind() == BrokenPipe
         ));
+    }
+
+    fn mss_of(header: &TcpHeader) -> Option<u16> {
+        header.options_iterator().flatten().find_map(|option| match option {
+            TcpOptionElement::MaximumSegmentSize(mss) => Some(mss),
+            _ => None,
+        })
+    }
+
+    /// RFC 9293 §3.8.3 / RFC 6298: an unacknowledged SYN|ACK is retransmitted with exponential
+    /// backoff (preserving its sequence number and options) until R2 transmissions close the
+    /// connection.
+    #[tokio::test(start_paused = true)]
+    async fn syn_received_retransmits_syn_ack_with_backoff_and_closes_at_r2() {
+        let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let config = TcpConfig {
+            options: Some(vec![TcpOptions::MaximumSegmentSize(1380)]),
+            ..TcpConfig::default()
+        };
+        let mut syn = TcpHeader::new(12345, 80, 1000, 0);
+        syn.syn = true;
+        syn.set_options(&[TcpOptionElement::WindowScale(7)]).unwrap();
+
+        let mut stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, Some(destroy_tx), Arc::new(config)).unwrap();
+        let initial = up_rx.recv().await.unwrap();
+        let initial_hdr = tcp_header_of(&initial).clone();
+        assert!(initial_hdr.syn && initial_hdr.ack);
+        assert_eq!(mss_of(&initial_hdr), Some(1380));
+        assert_eq!(window_scale_of(&initial_hdr), Some(0));
+
+        let opened = tokio::time::Instant::now();
+        let just_before = |seconds: u64| Duration::from_secs(seconds) - Duration::from_millis(1);
+
+        for seconds in BACKOFF.iter().take(MAX_RETRANSMIT_COUNT - 1) {
+            assert!(advance(just_before(*seconds), &mut up_rx).await.is_none());
+            let retry = advance(Duration::from_millis(1), &mut up_rx)
+                .await
+                .expect("expected SYN|ACK retransmission");
+            let hdr = tcp_header_of(&retry);
+            assert!(hdr.syn && hdr.ack && !hdr.rst);
+            assert_eq!(hdr.sequence_number, initial_hdr.sequence_number);
+            assert_eq!(hdr.acknowledgment_number, initial_hdr.acknowledgment_number);
+            assert_eq!(hdr.window_size, initial_hdr.window_size);
+            assert_eq!(mss_of(hdr), Some(1380));
+            assert_eq!(window_scale_of(hdr), Some(0));
+            assert!(destroy_rx.try_recv().is_err());
+        }
+
+        assert!(advance(just_before(BACKOFF[MAX_RETRANSMIT_COUNT - 1]), &mut up_rx).await.is_none());
+
+        stream.reset_timeout();
+        let (reader_woken, reader_waker) = recording_waker();
+        let mut read_cx = Context::from_waker(&reader_waker);
+        let mut bytes = [0; 1];
+        let mut read_buf = tokio::io::ReadBuf::new(&mut bytes);
+        assert!(Pin::new(&mut stream).poll_read(&mut read_cx, &mut read_buf).is_pending());
+
+        let (writer_woken, writer_waker) = recording_waker();
+        let mut write_cx = Context::from_waker(&writer_waker);
+        assert!(Pin::new(&mut stream).poll_write(&mut write_cx, b"hi").is_pending());
+
+        let (shutdown_woken, shutdown_waker) = recording_waker();
+        let mut shutdown_cx = Context::from_waker(&shutdown_waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
+
+        let reset = advance(Duration::from_millis(1), &mut up_rx).await.expect("expected RST at R2");
+        assert!(tcp_header_of(&reset).rst);
+        assert!(up_rx.try_recv().is_err());
+        assert!((tokio::time::Instant::now() - opened).as_secs() > 100);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+        assert!(reader_woken.load(Ordering::SeqCst));
+        assert!(writer_woken.load(Ordering::SeqCst));
+        assert!(shutdown_woken.load(Ordering::SeqCst));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut read_cx, &mut read_buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(read_buf.filled().is_empty());
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut write_cx, b"hi"),
+            Poll::Ready(Err(err)) if err.kind() == BrokenPipe
+        ));
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx), Poll::Ready(Ok(()))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn syn_ack_retransmission_stops_on_handshake_ack() {
+        let (mut stream, syn_ack, mut up_rx) = open(u16::MAX, &[]).await;
+
+        for seconds in BACKOFF.iter().take(2) {
+            let retry = advance(Duration::from_secs(*seconds), &mut up_rx)
+                .await
+                .expect("expected SYN|ACK retransmission");
+            assert!(tcp_header_of(&retry).syn && tcp_header_of(&retry).ack);
+            assert_eq!(tcp_header_of(&retry).sequence_number, syn_ack.sequence_number);
+        }
+
+        let local_seq = syn_ack.sequence_number.wrapping_add(1);
+        stream
+            .stream_sender()
+            .send(peer_ack(syn_ack.acknowledgment_number, local_seq))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+        assert!(stream.tcb.lock().unwrap().get_retransmission_deadline().is_none());
+        assert!(advance(Duration::from_secs(BACKOFF[2]), &mut up_rx).await.is_none());
+
+        stream.write_all(b"hello").await.unwrap();
+        let data = up_rx.recv().await.unwrap();
+        assert_eq!(tcp_header_of(&data).sequence_number, local_seq);
+        assert_eq!(data.payload.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn syn_received_responds_to_retransmitted_syn_and_ignores_wrong_seq() {
+        let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let config = TcpConfig {
+            options: Some(vec![TcpOptions::MaximumSegmentSize(1400)]),
+            ..TcpConfig::default()
+        };
+        let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
+        syn.syn = true;
+        syn.set_options(&[TcpOptionElement::WindowScale(4)]).unwrap();
+
+        let mut stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, None, Arc::new(config)).unwrap();
+        let initial = up_rx.recv().await.unwrap();
+        let initial_hdr = tcp_header_of(&initial).clone();
+
+        // Wrong-ISN SYN must be ignored without emitting SYN|ACK.
+        stream.stream_sender().send(peer_segment(999, 0, SYN, u16::MAX, &[])).unwrap();
+        assert!(written(&mut up_rx).await.is_empty());
+
+        // Retransmitted SYN with matching ISN and ack = 0 triggers immediate SYN|ACK resend.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        stream.stream_sender().send(peer_segment(1000, 0, SYN, u16::MAX, &[])).unwrap();
+        let responses = written(&mut up_rx).await;
+        assert_eq!(responses.len(), 1);
+        let hdr = tcp_header_of(&responses[0]);
+        assert!(hdr.syn && hdr.ack);
+        assert_eq!(hdr.sequence_number, initial_hdr.sequence_number);
+        assert_eq!(hdr.acknowledgment_number, initial_hdr.acknowledgment_number);
+        assert_eq!(mss_of(hdr), Some(1400));
+        assert_eq!(window_scale_of(hdr), Some(0));
+
+        // Peer's final ACK completes the handshake and leaves send window / last_received_ack intact.
+        let local_seq = initial_hdr.sequence_number.wrapping_add(1);
+        stream
+            .stream_sender()
+            .send(peer_ack(initial_hdr.acknowledgment_number, local_seq))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+
+        stream.write_all(b"after-retransmitted-syn").await.unwrap();
+        let sent = up_rx.recv().await.unwrap();
+        assert_eq!(tcp_header_of(&sent).sequence_number, local_seq);
+        assert_eq!(sent.payload.as_deref(), Some(&b"after-retransmitted-syn"[..]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retransmitted_syns_do_not_stall_r2_closure() {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (stream, _syn_ack, mut up_rx) = {
+            let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+            let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+            let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
+            syn.syn = true;
+            let stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, Some(destroy_tx), Arc::new(TcpConfig::default())).unwrap();
+            let syn_ack = up_rx.recv().await.unwrap();
+            (stream, tcp_header_of(&syn_ack).clone(), up_rx)
+        };
+
+        // Keep sending duplicate SYNs every 500ms; the RTO timer must still reach R2 and close.
+        for _ in 0..300 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            let _ = written(&mut up_rx).await;
+            if stream.tcb.lock().unwrap().get_state() == TcpState::Closed {
+                break;
+            }
+            let _ = stream.stream_sender().send(peer_segment(1000, 0, SYN, u16::MAX, &[]));
+        }
+
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn syn_received_ignores_unacceptable_ack_and_rst_stops_retransmission() {
+        let (stream, syn_ack, mut up_rx) = open(u16::MAX, &[]).await;
+
+        // ACK that does not cover our SYN|ACK (syn_seq instead of syn_seq + 1) keeps SynReceived.
+        stream
+            .stream_sender()
+            .send(peer_ack(syn_ack.acknowledgment_number, syn_ack.sequence_number))
+            .unwrap();
+        assert!(written(&mut up_rx).await.is_empty());
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::SynReceived);
+
+        // RST closes the session and stops further SYN|ACK retransmissions.
+        stream
+            .stream_sender()
+            .send(peer_segment(
+                syn_ack.acknowledgment_number,
+                syn_ack.sequence_number.wrapping_add(1),
+                RST,
+                0,
+                &[],
+            ))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert!(advance(Duration::from_secs(BACKOFF[0]), &mut up_rx).await.is_none());
     }
 
     // --- Window scaling, MSS & send-window flow-control tests ---
