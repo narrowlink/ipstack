@@ -32,6 +32,7 @@ pub(crate) enum TcpState {
     Established,
     FinWait1, // act as a client, actively send a farewell packet to the other side, followed with FinWait2, TimeWait, Closed
     FinWait2,
+    Closing,
     TimeWait,
     CloseWait, // act as a server, followed with LastAck, Closed
     LastAck,
@@ -69,6 +70,8 @@ pub(crate) struct Tcb {
     recv_window_shift: Option<u8>,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
+    inflight_fin: Option<InflightFin>,
+    time_wait_deadline: Option<tokio::time::Instant>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
     received: VecDeque<u8>,
     duplicate_ack_count: usize,
@@ -134,6 +137,8 @@ impl Tcb {
             recv_window_shift,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
+            inflight_fin: None,
+            time_wait_deadline: None,
             unordered_packets: BTreeMap::new(),
             received: VecDeque::new(),
             duplicate_ack_count: 0,
@@ -293,6 +298,11 @@ impl Tcb {
     }
     pub(super) fn update_send_window(&mut self, tcp_header: &TcpHeader) {
         self.send_window = self.honoured_window(tcp_header);
+        if self.send_window > 0
+            && let Some(fin) = self.inflight_fin.as_mut()
+        {
+            fin.window_opened = true;
+        }
     }
     pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
@@ -413,13 +423,86 @@ impl Tcb {
         self.inflight_packets.get(&seq)
     }
 
-    /// The deadline the connection waits on: the earliest send time in the inflight queue plus the
-    /// current retransmission timeout, present while data is outstanding and the sum fits the clock.
+    pub(crate) fn arm_inflight_fin(&mut self, seq: SeqNum) {
+        self.inflight_fin = Some(InflightFin {
+            seq,
+            send_time: tokio::time::Instant::now(),
+            retransmit_count: 0,
+            unanswered_probes: 0,
+            window_opened: self.send_window > 0,
+        });
+    }
+
+    pub(crate) fn reset_unanswered_fin_probes(&mut self) {
+        if let Some(fin) = self.inflight_fin.as_mut() {
+            fin.unanswered_probes = 0;
+        }
+    }
+
+    pub(crate) fn inflight_fin_seq(&self) -> Option<SeqNum> {
+        self.inflight_fin.map(|fin| fin.seq)
+    }
+
+    pub(crate) fn clear_inflight_fin(&mut self) {
+        self.inflight_fin = None;
+    }
+
+    pub(crate) fn restart_time_wait(&mut self, two_msl: Duration) {
+        self.time_wait_deadline = tokio::time::Instant::now().checked_add(two_msl);
+    }
+
+    pub(crate) fn time_wait_deadline(&self) -> Option<tokio::time::Instant> {
+        self.time_wait_deadline
+    }
+
+    pub(crate) fn clear_time_wait_deadline(&mut self) {
+        self.time_wait_deadline = None;
+    }
+
+    /// The deadline the connection waits on: the earliest send time in the inflight queue (or an
+    /// active-close FIN, including zero-window probes) plus the current retransmission timeout,
+    /// when the sum fits the clock.
     pub(crate) fn get_retransmission_deadline(&self) -> Option<tokio::time::Instant> {
-        self.inflight_packets
-            .values()
-            .next()
-            .and_then(|p| p.send_time.checked_add(self.current_rto))
+        if let Some(packet) = self.inflight_packets.values().next() {
+            return packet.send_time.checked_add(self.current_rto);
+        }
+        if matches!(self.state, TcpState::FinWait1 | TcpState::Closing)
+            && let Some(fin) = self.inflight_fin
+        {
+            return fin.send_time.checked_add(self.current_rto);
+        }
+        None
+    }
+
+    /// Returns the unacknowledged FIN sequence number if its RTO elapsed, or `exhausted = true`
+    /// once R2 transmissions are reached with an open window (or `max_retransmit_count`
+    /// unanswered zero-window probes pass). Answered zero-window probes never exhaust R2.
+    #[must_use]
+    pub(crate) fn collect_timed_out_inflight_fin(&mut self) -> (Option<SeqNum>, bool) {
+        if !matches!(self.state, TcpState::FinWait1 | TcpState::Closing) {
+            return (None, false);
+        }
+        let Some(fin) = self.inflight_fin.as_mut() else {
+            return (None, false);
+        };
+        if fin.send_time.elapsed() < self.current_rto {
+            return (None, false);
+        }
+        if self.send_window > 0 || fin.window_opened {
+            if fin.retransmit_count + 1 >= self.max_retransmit_count {
+                return (None, true);
+            }
+            fin.retransmit_count += 1;
+            fin.window_opened = self.send_window > 0;
+        } else {
+            if fin.unanswered_probes + 1 >= self.max_retransmit_count {
+                return (None, true);
+            }
+            fin.unanswered_probes += 1;
+        }
+        fin.send_time = tokio::time::Instant::now();
+        self.current_rto = self.current_rto.saturating_mul(2).min(MAX_RTO.max(self.rto));
+        (Some(fin.seq), false)
     }
 
     #[must_use]
@@ -473,6 +556,15 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         self.get_usable_send_window() == 0
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InflightFin {
+    seq: SeqNum,
+    send_time: tokio::time::Instant,
+    retransmit_count: usize,
+    unanswered_probes: usize,
+    window_opened: bool,
 }
 
 #[derive(Debug, Clone)]
