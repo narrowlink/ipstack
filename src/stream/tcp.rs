@@ -552,6 +552,9 @@ impl Drop for IpStackTcpStream {
                 let action = {
                     let mut tcb = self.tcb.lock().unwrap();
                     self.shutdown.drop_requested.store(true, Ordering::Release);
+                    // Unread acknowledged bytes are unreachable once the stream drops; free them
+                    // now so the farewell packet and closing handshake see an open receive window.
+                    tcb.take_received(usize::MAX);
                     match send_fin("[drop]", nt, &self.up_packet_sender, &mut tcb) {
                         Ok(Some(_)) => DropAction::FinSent,
                         Ok(_) if matches!(tcb.get_state(), TcpState::Listen | TcpState::SynReceived | TcpState::Closed) => {
@@ -1305,7 +1308,9 @@ fn extract_data_n_write_upstream(
             return Ok(true);
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
-            return Err(std::io::Error::new(BrokenPipe, "data channel closed"));
+            // The stream was dropped; discard unreachable data so the closing handshake can finish.
+            tcb.take_received(usize::MAX);
+            return Ok(false);
         }
     };
 
@@ -4425,5 +4430,132 @@ mod tests {
         tokio::io::AsyncReadExt::read_exact(&mut stream, &mut received).await.unwrap();
         assert_eq!(&received[..199], &[0x11; 199]);
         assert_eq!(&received[199..], &expected_600[..]);
+    }
+
+    #[rstest]
+    #[case::fin_after_data(false, true)]
+    #[case::fin_with_payload(true, true)]
+    #[case::simultaneous_close_with_payload(true, false)]
+    #[tokio::test(start_paused = true)]
+    async fn drop_in_fin_wait_acknowledges_peer_data_and_fin(#[case] fin_with_payload: bool, #[case] peer_acks_our_fin_first: bool) {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+        let sender = stream.stream_sender();
+
+        drop(stream);
+        let fin = up_rx.recv().await.unwrap();
+        assert!(tcp_header_of(&fin).fin);
+
+        if peer_acks_our_fin_first {
+            sender.send(peer_ack(1001, local_seq + 1)).unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        let peer_ack_num = if peer_acks_our_fin_first { local_seq + 1 } else { local_seq };
+        if fin_with_payload {
+            sender
+                .send(peer_segment(1001, peer_ack_num, ACK | PSH | FIN, u16::MAX, b"tail"))
+                .unwrap();
+            assert_eq!(acks(&mut up_rx).await, [1006]);
+        } else {
+            sender.send(peer_segment(1001, peer_ack_num, ACK | PSH, u16::MAX, b"late")).unwrap();
+            assert_eq!(acks(&mut up_rx).await, [1005]);
+            sender.send(peer_segment(1005, peer_ack_num, ACK | FIN, u16::MAX, &[])).unwrap();
+            assert_eq!(acks(&mut up_rx).await, [1006]);
+        }
+
+        if !peer_acks_our_fin_first {
+            assert!(destroy_rx.try_recv().is_err());
+            sender.send(peer_ack(1006, local_seq + 1)).unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        assert!(destroy_rx.try_recv().is_err(), "session must stay in TimeWait for 2 MSL");
+        tokio::time::advance(TWO_MSL).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drop_with_full_unread_buffer_reopens_window_for_peer_fin() {
+        let config = TcpConfig {
+            read_buffer_size: READ_CHUNK,
+            ..TcpConfig::default()
+        };
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (stream, mut up_rx, local_seq) = established_with(Some(destroy_tx), config).await;
+        let sender = stream.stream_sender();
+
+        let chunk = vec![0xAB; READ_CHUNK];
+        sender.send(peer_segment(1001, local_seq, ACK | PSH, u16::MAX, &chunk)).unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1001 + READ_CHUNK as u32]);
+
+        // Second chunk fills tcb.received completely so the receive window drops to zero.
+        let end_seq = 1001 + (READ_CHUNK as u32) * 2;
+        sender
+            .send(peer_segment(1001 + READ_CHUNK as u32, local_seq, ACK | PSH, u16::MAX, &chunk))
+            .unwrap();
+        let zero_win_ack = up_rx.recv().await.unwrap();
+        assert_eq!(tcp_header_of(&zero_win_ack).acknowledgment_number, end_seq);
+        assert_eq!(tcp_header_of(&zero_win_ack).window_size, 0);
+
+        drop(stream);
+        let fin = up_rx.recv().await.unwrap();
+        let fin_hdr = tcp_header_of(&fin);
+        assert!(fin_hdr.fin);
+        assert_eq!(fin_hdr.window_size as usize, READ_CHUNK);
+
+        sender.send(peer_segment(end_seq, local_seq + 1, ACK | FIN, u16::MAX, &[])).unwrap();
+        assert_eq!(acks(&mut up_rx).await, [end_seq + 1]);
+        assert!(destroy_rx.try_recv().is_err());
+
+        tokio::time::advance(TWO_MSL).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drop_after_drain_notify_does_not_abort_closing_handshake() {
+        let config = TcpConfig {
+            read_buffer_size: READ_CHUNK,
+            ..TcpConfig::default()
+        };
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with(Some(destroy_tx), config).await;
+        let sender = stream.stream_sender();
+
+        let chunk = vec![0xCD; READ_CHUNK];
+        sender.send(peer_segment(1001, local_seq, ACK | PSH, u16::MAX, &chunk)).unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1001 + READ_CHUNK as u32]);
+
+        let end_seq = 1001 + (READ_CHUNK as u32) * 2;
+        sender
+            .send(peer_segment(1001 + READ_CHUNK as u32, local_seq, ACK | PSH, u16::MAX, &chunk))
+            .unwrap();
+        assert_eq!(acks(&mut up_rx).await, [end_seq]);
+
+        // Read one chunk to trigger drain_notify, then drop before the loop services it.
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut storage = vec![0u8; READ_CHUNK];
+        let mut buf = tokio::io::ReadBuf::new(&mut storage);
+        assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf), Poll::Ready(Ok(()))));
+        assert_eq!(buf.filled().len(), READ_CHUNK);
+
+        drop(stream);
+        let fin = up_rx.recv().await.unwrap();
+        assert!(tcp_header_of(&fin).fin);
+
+        tokio::task::yield_now().await;
+        assert!(destroy_rx.try_recv().is_err(), "drain_notify must not abort the task after drop");
+
+        sender.send(peer_segment(end_seq, local_seq + 1, ACK | FIN, u16::MAX, &[])).unwrap();
+        assert_eq!(acks(&mut up_rx).await, [end_seq + 1]);
+        tokio::time::advance(TWO_MSL).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
     }
 }
