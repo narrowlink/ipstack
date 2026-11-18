@@ -67,6 +67,8 @@ pub(crate) struct Tcb {
     /// The largest segment the peer announced in the MSS option of its SYN, unbounded without one.
     peer_mss: u16,
     last_received_ack: SeqNum,
+    snd_wl1: SeqNum,
+    snd_wl2: SeqNum,
     send_window: u32,
     send_window_shift: u8,
     recv_window_shift: Option<u8>,
@@ -136,6 +138,8 @@ impl Tcb {
             mtu,
             peer_mss: u16::MAX,
             last_received_ack: seq.into(),
+            snd_wl1: ack,
+            snd_wl2: seq.into(),
             send_window: peer_window as u32,
             send_window_shift,
             recv_window_shift,
@@ -318,6 +322,43 @@ impl Tcb {
             fin.window_opened = true;
         }
     }
+
+    /// RFC 9293 §3.10.7.4: update `SND.WND` only when the segment is not older than the
+    /// one that last updated it (`SND.WL1 < SEG.SEQ` or `(SND.WL1 == SEG.SEQ && SND.WL2 <= SEG.ACK)`).
+    pub(super) fn update_send_window_if_newer(&mut self, tcp_header: &TcpHeader) {
+        let seg_seq = SeqNum(tcp_header.sequence_number);
+        let seg_ack = SeqNum(tcp_header.acknowledgment_number);
+        if self.snd_wl1 < seg_seq || (self.snd_wl1 == seg_seq && self.snd_wl2 <= seg_ack) {
+            self.update_send_window(tcp_header);
+            self.snd_wl1 = seg_seq;
+            self.snd_wl2 = seg_ack;
+        }
+    }
+
+    /// RFC 9293 §3.10.7.4: returns whether `seq` falls within `[RCV.NXT, RCV.NXT + RCV.WND)`.
+    pub(super) fn is_seq_in_recv_window(&self, seq: SeqNum) -> bool {
+        let rcv_wnd = self.get_available_read_buffer_size().min(i32::MAX as usize) as u32;
+        rcv_wnd > 0 && seq.0.wrapping_sub(self.ack.0) < rcv_wnd
+    }
+
+    /// RFC 9293 §3.10.7.4 Table 5: checks whether an incoming segment overlaps the receive window
+    /// `[RCV.NXT, RCV.NXT + RCV.WND)`.
+    pub(super) fn is_segment_acceptable(&self, seq: SeqNum, seg_len: usize) -> bool {
+        let rcv_wnd = self.get_available_read_buffer_size().min(i32::MAX as usize) as u32;
+        if seg_len == 0 {
+            if rcv_wnd == 0 {
+                seq == self.ack
+            } else {
+                seq.0.wrapping_sub(self.ack.0) < rcv_wnd
+            }
+        } else if rcv_wnd == 0 {
+            false
+        } else if seq >= self.ack {
+            seq.0.wrapping_sub(self.ack.0) < rcv_wnd
+        } else {
+            (self.ack.distance(seq) as usize) < seg_len
+        }
+    }
     pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
     }
@@ -354,7 +395,13 @@ impl Tcb {
             PacketType::Invalid
         } else {
             match rcvd_ack.cmp(&self.get_last_received_ack()) {
-                std::cmp::Ordering::Less => PacketType::Invalid,
+                std::cmp::Ordering::Less => {
+                    if payload.is_empty() {
+                        PacketType::Ack
+                    } else {
+                        PacketType::NewPacket
+                    }
+                }
                 std::cmp::Ordering::Equal => {
                     if self.ack - 1 == rcvd_seq && payload.len() <= 1 {
                         PacketType::KeepAlive

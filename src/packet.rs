@@ -78,18 +78,48 @@ pub struct NetworkPacket {
     pub(crate) payload: Option<Vec<u8>>,
 }
 
+pub(crate) enum ParseError {
+    InvalidChecksum(IpStackError),
+    Other(IpStackError),
+}
+
 impl NetworkPacket {
     pub fn parse(buf: &[u8]) -> Result<Self, IpStackError> {
-        let p = SlicedPacket::from_ip(buf).map_err(|_| IpStackError::InvalidPacket)?;
-        let ip = p.net.ok_or(IpStackError::InvalidPacket)?;
+        Self::parse_checked(buf).map_err(|e| match e {
+            ParseError::InvalidChecksum(err) | ParseError::Other(err) => err,
+        })
+    }
+
+    pub(crate) fn parse_checked(buf: &[u8]) -> Result<Self, ParseError> {
+        let p = SlicedPacket::from_ip(buf).map_err(|_| ParseError::Other(IpStackError::InvalidPacket))?;
+        let ip = p.net.ok_or(ParseError::Other(IpStackError::InvalidPacket))?;
 
         let (ip, ip_payload) = match ip {
-            NetSlice::Ipv4(ip) => (IpHeader::Ipv4(ip.header().to_header()), ip.payload().payload),
+            NetSlice::Ipv4(ip) => {
+                let header = ip.header().to_header();
+                if header.header_checksum != header.calc_header_checksum() {
+                    return Err(ParseError::InvalidChecksum(IpStackError::InvalidPacket));
+                }
+                (IpHeader::Ipv4(header), ip.payload().payload)
+            }
             NetSlice::Ipv6(ip) => (IpHeader::Ipv6(ip.header().to_header()), ip.payload().payload),
-            NetSlice::Arp(_) => return Err(IpStackError::UnsupportedTransportProtocol),
+            NetSlice::Arp(_) => return Err(ParseError::Other(IpStackError::UnsupportedTransportProtocol)),
         };
         let (transport, payload) = match p.transport {
-            Some(etherparse::TransportSlice::Tcp(h)) => (TransportHeader::Tcp(h.to_header()), h.payload()),
+            Some(etherparse::TransportSlice::Tcp(h)) => {
+                let expected_checksum = match &ip {
+                    IpHeader::Ipv4(ip) => h
+                        .calc_checksum_ipv4(ip.source, ip.destination)
+                        .map_err(|e| ParseError::Other(e.into()))?,
+                    IpHeader::Ipv6(ip) => h
+                        .calc_checksum_ipv6(ip.source, ip.destination)
+                        .map_err(|e| ParseError::Other(e.into()))?,
+                };
+                if h.checksum() != expected_checksum {
+                    return Err(ParseError::InvalidChecksum(IpStackError::InvalidTcpPacket));
+                }
+                (TransportHeader::Tcp(h.to_header()), h.payload())
+            }
             Some(etherparse::TransportSlice::Udp(u)) => (TransportHeader::Udp(u.to_header()), u.payload()),
             _ => (TransportHeader::Unknown, ip_payload),
         };
@@ -343,5 +373,49 @@ pub mod tests {
         benchmarks(&mut c);
 
         Criterion::default().final_summary();
+    }
+
+    #[test]
+    fn parse_verifies_ipv4_and_tcp_checksums() {
+        let mut ipv4_tcp = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [10, 0, 0, 1], 64)
+            .tcp(40000, 80, 1000, u16::MAX)
+            .syn()
+            .write(&mut ipv4_tcp, b"hello")
+            .unwrap();
+        assert!(NetworkPacket::parse(&ipv4_tcp).is_ok());
+
+        // Corrupt IPv4 header checksum (bytes 10..12).
+        let mut bad_ip = ipv4_tcp.clone();
+        bad_ip[10] ^= 0xff;
+        assert!(matches!(NetworkPacket::parse(&bad_ip), Err(IpStackError::InvalidPacket)));
+
+        // Corrupt TCP checksum (bytes 20 + 16..18).
+        let mut bad_tcp_v4 = ipv4_tcp.clone();
+        bad_tcp_v4[36] ^= 0xff;
+        assert!(matches!(NetworkPacket::parse(&bad_tcp_v4), Err(IpStackError::InvalidTcpPacket)));
+
+        // Corrupt TCP payload without updating TCP checksum.
+        let mut bad_payload = ipv4_tcp;
+        *bad_payload.last_mut().unwrap() ^= 0x01;
+        assert!(matches!(NetworkPacket::parse(&bad_payload), Err(IpStackError::InvalidTcpPacket)));
+
+        // IPv6 + TCP checksum verification.
+        let mut ipv6_tcp = Vec::new();
+        etherparse::PacketBuilder::ipv6(
+            [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            [0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            64,
+        )
+        .tcp(40000, 80, 1000, u16::MAX)
+        .ack(2000)
+        .write(&mut ipv6_tcp, b"v6")
+        .unwrap();
+        assert!(NetworkPacket::parse(&ipv6_tcp).is_ok());
+
+        // IPv6 header is 40 bytes; TCP checksum is at 40 + 16 = 56.
+        let mut bad_tcp_v6 = ipv6_tcp;
+        bad_tcp_v6[56] ^= 0xff;
+        assert!(matches!(NetworkPacket::parse(&bad_tcp_v6), Err(IpStackError::InvalidTcpPacket)));
     }
 }

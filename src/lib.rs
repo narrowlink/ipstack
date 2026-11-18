@@ -373,10 +373,17 @@ async fn process_device_read(
     config: &IpStackConfig,
     accept_sender: &UnboundedSender<IpStackStream>,
 ) -> Result<()> {
-    let Ok(packet) = NetworkPacket::parse(data) else {
-        let stream = IpStackStream::UnknownNetwork(data.to_owned());
-        accept_sender.send(stream)?;
-        return Ok(());
+    let packet = match NetworkPacket::parse_checked(data) {
+        Ok(packet) => packet,
+        Err(packet::ParseError::InvalidChecksum(err)) => {
+            log::debug!("Dropping packet with invalid checksum: {err}");
+            return Ok(());
+        }
+        Err(packet::ParseError::Other(_)) => {
+            let stream = IpStackStream::UnknownNetwork(data.to_owned());
+            accept_sender.send(stream)?;
+            return Ok(());
+        }
     };
 
     if let TransportHeader::Unknown = packet.transport_header() {
@@ -858,5 +865,38 @@ mod tests {
         };
         assert!(hdr.rst);
         assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupted_ipv4_and_tcp_checksums_are_silently_dropped() {
+        let mut sessions = SessionCollection::new();
+        let (remove_tx, _remove_rx) = mpsc::unbounded_channel();
+        let (up_tx, _up_rx) = mpsc::unbounded_channel();
+        let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
+        let config = IpStackConfig::default();
+
+        let valid_syn = tcp_packet(1000, None, true, false, &[]);
+
+        let mut bad_ip = valid_syn.clone();
+        bad_ip[10] ^= 0xff;
+        process_device_read(&bad_ip, &mut sessions, &remove_tx, &up_tx, &config, &accept_tx)
+            .await
+            .unwrap();
+
+        let mut bad_tcp = valid_syn;
+        bad_tcp[36] ^= 0xff;
+        process_device_read(&bad_tcp, &mut sessions, &remove_tx, &up_tx, &config, &accept_tx)
+            .await
+            .unwrap();
+
+        assert!(sessions.is_empty());
+        assert!(accept_rx.try_recv().is_err(), "bad checksum packets must be dropped silently");
+
+        // Non-IP traffic still produces UnknownNetwork.
+        let non_ip = vec![0x00; 24];
+        process_device_read(&non_ip, &mut sessions, &remove_tx, &up_tx, &config, &accept_tx)
+            .await
+            .unwrap();
+        assert!(matches!(accept_rx.try_recv(), Ok(IpStackStream::UnknownNetwork(_))));
     }
 }

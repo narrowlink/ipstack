@@ -928,20 +928,37 @@ async fn tcp_main_logic_loop(
             break;
         }
 
+        // RFC 9293 §3.10.7.4 / RFC 5961 §3.2: validate RST sequence number against RCV.NXT
+        // and the receive window before resetting the connection.
         if flags.contains(RST) {
-            tcb.clear_inflight_syn();
-            tcb.clear_inflight_fin();
-            tcb.change_state(TcpState::Closed);
-            drop(tcb);
-            write_notify.wake();
-            read_notify.wake();
-            // Finish the task so its destroy notification and shutdown waker are delivered
-            // even if the peer never sends another packet.
-            break;
+            if incoming_seq == tcb.get_ack() {
+                tcb.clear_inflight_syn();
+                tcb.clear_inflight_fin();
+                tcb.change_state(TcpState::Closed);
+                drop(tcb);
+                write_notify.wake();
+                read_notify.wake();
+                // Finish the task so its destroy notification and shutdown waker are delivered
+                // even if the peer never sends another packet.
+                break;
+            }
+            if tcb.is_seq_in_recv_window(incoming_seq) {
+                log::trace!(
+                    "{network_tuple} {state:?}: in-window RST seq = {incoming_seq} != RCV.NXT {}, sending challenge ACK",
+                    tcb.get_ack()
+                );
+                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+            } else {
+                log::trace!(
+                    "{network_tuple} {state:?}: ignoring out-of-window RST seq = {incoming_seq}, RCV.NXT = {}",
+                    tcb.get_ack()
+                );
+            }
+            continue;
         }
 
         // A retransmitted SYN carries no ACK (typically ack = 0), so handle it before
-        // ACK-based sequence validation (`check_pkt_type`) which would reject it as Invalid.
+        // sequence and ACK validation.
         if state == TcpState::SynReceived && flags.contains(SYN) && !flags.contains(ACK) && !flags.contains(FIN) {
             if incoming_seq == tcb.get_ack() - 1
                 && let Some(syn_seq) = tcb.inflight_syn_seq()
@@ -962,9 +979,76 @@ async fn tcp_main_logic_loop(
             continue;
         }
 
-        tcb.update_duplicate_ack_count(incoming_ack);
+        // RFC 9293 §3.10.7.4 Step 1: check sequence number against the receive window.
+        // In states after the peer's FIN has been accepted, a retransmitted duplicate of that FIN
+        // ends at RCV.NXT (`incoming_seq + payload.len() + 1 == RCV.NXT`) and still needs an ACK
+        // (and 2MSL restart in TimeWait, or final ACK handling in LastAck/Closing).
+        let seg_len = payload.len() + usize::from(flags.contains(SYN)) + usize::from(flags.contains(FIN));
+        let is_retransmitted_fin = matches!(
+            state,
+            TcpState::CloseWait | TcpState::LastAck | TcpState::Closing | TcpState::TimeWait
+        ) && flags.contains(FIN)
+            && !flags.contains(SYN)
+            && incoming_seq + (payload.len() as u32) + 1 == tcb.get_ack();
 
-        tcb.update_inflight_packet_queue(incoming_ack);
+        if !tcb.is_segment_acceptable(incoming_seq, seg_len) && !is_retransmitted_fin {
+            log::trace!(
+                "{network_tuple} {state:?}: unacceptable segment seq = {incoming_seq}, len = {seg_len}, RCV.NXT = {}, sending ACK",
+                tcb.get_ack()
+            );
+            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+            continue;
+        }
+
+        // RFC 9293 §3.10.7.4 Step 4 / RFC 5961 §4.2: reject segments carrying SYN in
+        // synchronized states (and unexpected SYN variants in SynReceived) with a challenge ACK.
+        if flags.contains(SYN) {
+            log::trace!("{network_tuple} {state:?}: unexpected SYN segment seq = {incoming_seq}, sending challenge ACK");
+            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+            continue;
+        }
+
+        // RFC 9293 §3.10.7.4 Step 5: if the ACK bit is off, drop the segment and return.
+        if !flags.contains(ACK) {
+            log::trace!("{network_tuple} {state:?}: dropping segment without ACK flag");
+            continue;
+        }
+
+        // Validate SEG.ACK before mutating any ACK-dependent TCB state.
+        if state == TcpState::SynReceived {
+            if incoming_ack == tcb.get_last_received_ack() {
+                log::trace!(
+                    "{network_tuple} {state:?}: ignoring ACK {incoming_ack} not covering SYN|ACK (expected {})",
+                    tcb.get_seq()
+                );
+                continue;
+            }
+            if incoming_ack != tcb.get_seq() {
+                // RFC 9293 §3.10.7.4: unacceptable ACK in SYN-RECEIVED triggers <SEQ=SEG.ACK><CTL=RST>.
+                log::trace!(
+                    "{network_tuple} {state:?}: unacceptable ACK {incoming_ack} != {}, sending RST",
+                    tcb.get_seq()
+                );
+                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, RST, Some(incoming_ack), None)?;
+                continue;
+            }
+        } else if incoming_ack > tcb.get_seq() {
+            // RFC 9293 §3.10.7.4: SEG.ACK > SND.NXT -> send ACK and drop the segment.
+            log::trace!(
+                "{network_tuple} {state:?}: ACK {incoming_ack} > SND.NXT {}, sending ACK and dropping segment",
+                tcb.get_seq()
+            );
+            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+            continue;
+        }
+
+        let is_old_ack = incoming_ack < tcb.get_last_received_ack();
+        if !is_old_ack {
+            tcb.update_duplicate_ack_count(incoming_ack);
+            if incoming_ack > tcb.get_last_received_ack() {
+                tcb.update_inflight_packet_queue(incoming_ack);
+            }
+        }
 
         let pkt_type = tcb.check_pkt_type(tcp_header, &payload);
 
@@ -1153,9 +1237,11 @@ async fn tcp_main_logic_loop(
         } // end of match state
 
         let prev_send_window = tcb.get_send_window();
-        tcb.update_last_received_ack(incoming_ack);
-        tcb.update_send_window(tcp_header);
-        if flags.contains(ACK) {
+        if !is_old_ack {
+            if incoming_ack > tcb.get_last_received_ack() {
+                tcb.update_last_received_ack(incoming_ack);
+            }
+            tcb.update_send_window_if_newer(tcp_header);
             tcb.reset_unanswered_fin_probes();
         }
         // RFC 9293 §3.8.6.1: a peer with a zero receive window may have dropped our FIN; resend it when the window reopens.
@@ -3400,5 +3486,193 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
         assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    // --- Segment validation & security tests ---
+
+    #[tokio::test(start_paused = true)]
+    async fn out_of_window_and_in_window_rst_are_validated_against_rcv_nxt() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        stream.write_all(b"keepalive").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        // Out-of-window RST (below RCV.NXT and beyond RCV.NXT + RCV.WND) is silently dropped.
+        for bad_seq in [1000, 1001 + READ_BUFFER_SIZE as u32] {
+            stream
+                .stream_sender()
+                .send(peer_segment(bad_seq, local_seq, RST | ACK, u16::MAX, &[]))
+                .unwrap();
+            assert!(
+                written(&mut up_rx).await.is_empty(),
+                "out-of-window RST seq {bad_seq} must not emit ACK"
+            );
+            assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+        }
+
+        // In-window RST not matching RCV.NXT triggers a challenge ACK and keeps the connection open.
+        stream
+            .stream_sender()
+            .send(peer_segment(1005, local_seq, RST | ACK, u16::MAX, &[]))
+            .unwrap();
+        let responses = written(&mut up_rx).await;
+        assert_eq!(responses.len(), 1);
+        let hdr = tcp_header_of(&responses[0]);
+        assert!(hdr.ack && !hdr.rst);
+        assert_eq!(hdr.acknowledgment_number, 1001);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+
+        // Exact RCV.NXT RST closes the connection immediately.
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, RST | ACK, u16::MAX, &[]))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn segment_without_ack_flag_does_not_mutate_inflight_or_ack_state() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        stream.write_all(b"secret").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        // Forged segment without ACK flag carrying acknowledgment_number past our data and win = 0.
+        for flags in [TcpFlags::PSH, TcpFlags::FIN, TcpFlags::PSH | TcpFlags::FIN] {
+            stream
+                .stream_sender()
+                .send(peer_segment(1001, local_seq + 6, flags, 0, b"inject"))
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        let tcb = stream.tcb.lock().unwrap();
+        assert_eq!(tcb.get_state(), TcpState::Established);
+        assert_eq!(tcb.get_last_received_ack(), SeqNum(local_seq));
+        assert_eq!(tcb.get_inflight_packets_total_len(), 6);
+        assert_eq!(tcb.get_send_window(), u16::MAX as u32);
+        assert_eq!(tcb.get_ack(), SeqNum(1001));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_ack_below_snd_una_still_delivers_data_and_fin() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        stream.write_all(b"first").await.unwrap();
+        up_rx.recv().await.unwrap();
+        stream.stream_sender().send(peer_ack(1001, local_seq + 5)).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(stream.tcb.lock().unwrap().get_last_received_ack(), SeqNum(local_seq + 5));
+
+        // Segment arrives with SEG.ACK < SND.UNA (stale ACK = local_seq, stale win = 0) and new data.
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, ACK | PSH, 0, b"payload"))
+            .unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1008]);
+
+        let mut buf = [0u8; 7];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"payload");
+        {
+            let tcb = stream.tcb.lock().unwrap();
+            assert_eq!(tcb.get_last_received_ack(), SeqNum(local_seq + 5));
+            assert_eq!(tcb.get_send_window(), u16::MAX as u32);
+        }
+
+        // Segment with SEG.ACK < SND.UNA and FIN still transitions Established -> CloseWait.
+        stream
+            .stream_sender()
+            .send(peer_segment(1008, local_seq, ACK | FIN, 0, &[]))
+            .unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1009]);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::CloseWait);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ack_above_snd_nxt_sends_ack_and_drops_segment() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        stream.write_all(b"data").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        // SEG.ACK > SND.NXT in Established sends an ACK and drops the segment (no payload, no inflight clear).
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq + 100, ACK | PSH, 0, b"ignored"))
+            .unwrap();
+        let responses = written(&mut up_rx).await;
+        assert_eq!(responses.len(), 1);
+        let hdr = tcp_header_of(&responses[0]);
+        assert!(hdr.ack && !hdr.rst);
+        assert_eq!(hdr.sequence_number, local_seq + 4);
+        assert_eq!(hdr.acknowledgment_number, 1001);
+        {
+            let tcb = stream.tcb.lock().unwrap();
+            assert_eq!(tcb.get_ack(), SeqNum(1001));
+            assert_eq!(tcb.get_inflight_packets_total_len(), 4);
+            assert_eq!(tcb.get_last_received_ack(), SeqNum(local_seq));
+            assert_eq!(tcb.get_send_window(), u16::MAX as u32);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn syn_received_rejects_ack_above_snd_nxt_with_rst() {
+        let (stream, syn_ack, mut up_rx) = open(u16::MAX, &[]).await;
+
+        stream
+            .stream_sender()
+            .send(peer_ack(syn_ack.acknowledgment_number, syn_ack.sequence_number.wrapping_add(50)))
+            .unwrap();
+        let responses = written(&mut up_rx).await;
+        assert_eq!(responses.len(), 1);
+        let hdr = tcp_header_of(&responses[0]);
+        assert!(hdr.rst && !hdr.ack);
+        assert_eq!(hdr.sequence_number, syn_ack.sequence_number.wrapping_add(50));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::SynReceived);
+    }
+
+    #[rstest]
+    #[case::syn(SYN)]
+    #[case::syn_ack(SYN | ACK)]
+    #[case::syn_ack_fin(SYN | ACK | FIN)]
+    #[tokio::test(start_paused = true)]
+    async fn syn_in_synchronized_states_is_rejected_with_challenge_ack(#[case] flags: TcpFlags) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        stream.write_all(b"stay").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        // SYN in Established triggers a challenge ACK and drops payload/ACK/FIN.
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq + 4, flags, 0, b"rogue"))
+            .unwrap();
+        let responses = written(&mut up_rx).await;
+        assert_eq!(responses.len(), 1);
+        let hdr = tcp_header_of(&responses[0]);
+        assert!(hdr.ack && !hdr.rst && !hdr.syn);
+        assert_eq!(hdr.acknowledgment_number, 1001);
+        {
+            let tcb = stream.tcb.lock().unwrap();
+            assert_eq!(tcb.get_state(), TcpState::Established);
+            assert_eq!(tcb.get_ack(), SeqNum(1001));
+            assert_eq!(tcb.get_inflight_packets_total_len(), 4);
+            assert_eq!(tcb.get_send_window(), u16::MAX as u32);
+        }
+
+        // Also verify SYN|ACK in FinWait1 does not transition to FinWait2.
+        stream.stream_sender().send(peer_ack(1001, local_seq + 4)).unwrap();
+        tokio::task::yield_now().await;
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        assert!(tcp_header_of(&up_rx.recv().await.unwrap()).fin);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
+
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq + 5, flags, u16::MAX, &[]))
+            .unwrap();
+        let responses = written(&mut up_rx).await;
+        assert_eq!(responses.len(), 1);
+        assert!(tcp_header_of(&responses[0]).ack && !tcp_header_of(&responses[0]).rst);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
     }
 }
