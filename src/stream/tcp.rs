@@ -434,6 +434,9 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         if send_window == 0 || is_full {
+            if send_window == 0 && !buf.is_empty() && tcb.arm_persist_probe() {
+                self.arm_notify.notify_one();
+            }
             log::trace!(
                 "{nt} {state:?}: [poll_write] current send window: {send_window}, send buffer full: {is_full}, waiting for the other side to send ACK..."
             );
@@ -764,7 +767,8 @@ async fn tcp_main_logic_loop(
                 let (packet, packets_exhausted) = tcb.collect_timed_out_inflight_packet();
                 let (syn_seq, syn_exhausted) = tcb.collect_timed_out_inflight_syn();
                 let (fin_seq, fin_exhausted) = tcb.collect_timed_out_inflight_fin();
-                if packets_exhausted || syn_exhausted || fin_exhausted {
+                let (probe_seq, probe_exhausted) = tcb.collect_timed_out_persist_probe();
+                if packets_exhausted || syn_exhausted || fin_exhausted || probe_exhausted {
                     // RFC 9293 §3.8.3: R2 transmissions of the same segment close the connection.
                     log::warn!("{network_tuple} segment reached R2 transmissions, closing session");
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
@@ -791,20 +795,29 @@ async fn tcp_main_logic_loop(
                 }
                 if let Some(packet) = packet {
                     let (seq, count) = (packet.seq, packet.retransmit_count);
-                    log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
-                    write_packet_to_device(
-                        &up_packet_sender,
-                        network_tuple,
-                        &tcb,
-                        None,
-                        ACK | PSH,
-                        Some(seq),
-                        Some(packet.payload),
-                    )?;
+                    if tcb.get_send_window() == 0 {
+                        log::debug!("{network_tuple} {state:?}: zero-window probe for inflight packet: {seq:?}");
+                        write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, Some(seq - 1), None)?;
+                    } else {
+                        log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
+                        write_packet_to_device(
+                            &up_packet_sender,
+                            network_tuple,
+                            &tcb,
+                            None,
+                            ACK | PSH,
+                            Some(seq),
+                            Some(packet.payload),
+                        )?;
+                    }
                 }
                 if let Some(seq) = fin_seq {
                     log::debug!("{network_tuple} {state:?}: FIN retransmission timeout: {seq:?}");
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, Some(seq), None)?;
+                }
+                if let Some(seq) = probe_seq {
+                    log::debug!("{network_tuple} {state:?}: persist zero-window probe: {seq:?}");
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, Some(seq), None)?;
                 }
                 continue;
             }
@@ -1147,16 +1160,29 @@ async fn tcp_main_logic_loop(
                 tcb.update_last_received_ack(incoming_ack);
             }
             tcb.update_send_window_if_newer(tcp_header);
-            tcb.reset_unanswered_fin_probes();
+            tcb.reset_unanswered_probes();
         }
-        // RFC 9293 §3.8.6.1: a peer with a zero receive window may have dropped our FIN; resend it when the window reopens.
-        if prev_send_window == 0
-            && tcb.get_send_window() > 0
-            && matches!(tcb.get_state(), TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck)
-            && incoming_ack != tcb.get_seq()
-            && let Some(fin_seq) = tcb.inflight_fin_seq()
-        {
-            write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, Some(fin_seq), None)?;
+        // RFC 9293 §3.8.6.1: a peer with a zero receive window may have dropped our FIN or data;
+        // resend it and wake parked writers when the window reopens.
+        if prev_send_window == 0 && tcb.get_send_window() > 0 {
+            write_notify.wake();
+            if matches!(tcb.get_state(), TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck)
+                && incoming_ack != tcb.get_seq()
+                && let Some(fin_seq) = tcb.inflight_fin_seq()
+            {
+                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | FIN, Some(fin_seq), None)?;
+            }
+            if let Some(packet) = tcb.take_probed_inflight_packet() {
+                write_packet_to_device(
+                    &up_packet_sender,
+                    network_tuple,
+                    &tcb,
+                    None,
+                    ACK | PSH,
+                    Some(packet.seq),
+                    Some(packet.payload),
+                )?;
+            }
         }
         // ACKs with or without data can retire the last outstanding bytes. The
         // shutdown waiter may belong to a different task than the writer.
@@ -4127,5 +4153,237 @@ mod tests {
         let mut buf = [0u8; 11];
         tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
         assert_eq!(&buf, b"urgent-data");
+    }
+
+    #[rstest]
+    #[case::established(false)]
+    #[case::close_wait(true)]
+    #[tokio::test(start_paused = true)]
+    async fn empty_inflight_zero_window_probes_and_recovers_on_reopen(#[case] close_wait: bool) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let sender = stream.stream_sender();
+
+        let mut peer_seq = 1001;
+        if close_wait {
+            sender.send(peer_segment(peer_seq, local_seq, ACK | FIN, 0, &[])).unwrap();
+            peer_seq += 1;
+            assert_eq!(acks(&mut up_rx).await, [peer_seq]);
+            assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::CloseWait);
+        } else {
+            sender.send(peer_segment(peer_seq, local_seq, ACK, 0, &[])).unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_write(&mut cx, b"hello").is_pending());
+
+        // Peer answers probes with window = 0 over many intervals without resetting the session.
+        let mut probe_count = 0;
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            let sent = written(&mut up_rx).await;
+            assert!(!sent.is_empty());
+            assert!(sent.iter().all(|p| {
+                let h = tcp_header_of(p);
+                h.ack && !h.rst && h.sequence_number == local_seq - 1 && p.payload.as_deref().unwrap_or_default().is_empty()
+            }));
+            probe_count += sent.len();
+            sender.send(peer_segment(peer_seq, local_seq, ACK, 0, &[])).unwrap();
+            tokio::task::yield_now().await;
+            assert!(Pin::new(&mut stream).poll_write(&mut cx, b"hello").is_pending());
+        }
+        assert!(probe_count >= 20);
+        woken.store(false, Ordering::SeqCst);
+
+        // Next probe triggers a peer ACK carrying a reopened window (recovering from a lost update).
+        let probe = advance(Duration::from_secs(60), &mut up_rx).await.expect("expected persist probe");
+        assert_eq!(tcp_header_of(&probe).sequence_number, local_seq - 1);
+        sender.send(peer_segment(peer_seq, local_seq, ACK, 4096, &[])).unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(woken.load(Ordering::SeqCst));
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"hello"), Poll::Ready(Ok(5))));
+        let pkt = up_rx.recv().await.unwrap();
+        assert_eq!(tcp_header_of(&pkt).sequence_number, local_seq);
+        assert_eq!(pkt.payload.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_inflight_zero_window_dead_peer_closes_after_unanswered_probes() {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+        let sender = stream.stream_sender();
+
+        sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+        tokio::task::yield_now().await;
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_write(&mut cx, b"blocked").is_pending());
+
+        let mut rto = RTO;
+        for _ in 1..MAX_RETRANSMIT_COUNT {
+            let probe = advance(rto, &mut up_rx).await.expect("expected persist probe");
+            let hdr = tcp_header_of(&probe);
+            assert!(hdr.ack && !hdr.rst);
+            assert_eq!(hdr.sequence_number, local_seq - 1);
+            assert!(destroy_rx.try_recv().is_err());
+            rto = (rto * 2).min(Duration::from_secs(60));
+        }
+
+        let rst = advance(rto, &mut up_rx)
+            .await
+            .expect("expected RST after unanswered persist probes");
+        assert!(tcp_header_of(&rst).rst);
+        tokio::task::yield_now().await;
+        assert!(woken.load(Ordering::SeqCst));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"blocked"),
+            Poll::Ready(Err(ref e)) if e.kind() == BrokenPipe
+        ));
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inflight_data_with_zero_window_probes_without_r2_reset_and_recovers() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let sender = stream.stream_sender();
+
+        stream.write_all(b"hello").await.unwrap();
+        let first = up_rx.recv().await.unwrap();
+        assert_eq!(first.payload.as_deref(), Some(&b"hello"[..]));
+
+        // Peer closes its window without acknowledging the inflight segment.
+        sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+        tokio::task::yield_now().await;
+
+        let mut probe_count = 0;
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            let sent = written(&mut up_rx).await;
+            assert!(!sent.is_empty());
+            assert!(sent.iter().all(|p| {
+                let h = tcp_header_of(p);
+                h.ack && !h.rst && h.sequence_number == local_seq - 1 && p.payload.as_deref().unwrap_or_default().is_empty()
+            }));
+            probe_count += sent.len();
+            sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+            tokio::task::yield_now().await;
+        }
+        assert!(probe_count >= 20);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+
+        // Reopening the window immediately resends the inflight segment.
+        sender.send(peer_segment(1001, local_seq, ACK, 4096, &[])).unwrap();
+        let resent = up_rx.recv().await.unwrap();
+        assert_eq!(tcp_header_of(&resent).sequence_number, local_seq);
+        assert_eq!(resent.payload.as_deref(), Some(&b"hello"[..]));
+
+        sender.send(peer_ack(1001, local_seq + 5)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(stream.tcb.lock().unwrap().is_inflight_queue_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inflight_data_with_zero_window_dead_peer_closes_after_unanswered_probes() {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+        let sender = stream.stream_sender();
+
+        stream.write_all(b"hello").await.unwrap();
+        up_rx.recv().await.unwrap();
+        sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+        tokio::task::yield_now().await;
+
+        let mut rto = RTO;
+        // First expiry transitions window_opened -> false; next MAX_RETRANSMIT_COUNT - 1 probes
+        // go unanswered before the final expiry sends RST.
+        for _ in 0..MAX_RETRANSMIT_COUNT {
+            let probe = advance(rto, &mut up_rx).await.expect("expected zero-window probe");
+            let hdr = tcp_header_of(&probe);
+            assert!(hdr.ack && !hdr.rst);
+            assert_eq!(hdr.sequence_number, local_seq - 1);
+            assert!(destroy_rx.try_recv().is_err());
+            rto = (rto * 2).min(Duration::from_secs(60));
+        }
+
+        let rst = advance(rto, &mut up_rx).await.expect("expected RST after unanswered probes");
+        assert!(tcp_header_of(&rst).rst);
+        tokio::task::yield_now().await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reordered_segment_with_older_seq_does_not_overwrite_send_window() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let sender = stream.stream_sender();
+
+        // Newer segment arrives out of order with window = 4096.
+        sender.send(peer_segment(1005, local_seq, ACK | PSH, 4096, b"tail")).unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1001]);
+
+        // Delayed older segment arrives with same ACK and window = 0; must not clobber 4096.
+        sender.send(peer_segment(1001, local_seq, ACK | PSH, 0, b"head")).unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1009]);
+        assert_eq!(stream.tcb.lock().unwrap().get_send_window(), 4096);
+
+        let mut buf = [0u8; 8];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"headtail");
+
+        stream.write_all(b"ok").await.unwrap();
+        let pkt = up_rx.recv().await.unwrap();
+        assert_eq!(pkt.payload.as_deref(), Some(&b"ok"[..]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_out_of_order_segments_do_not_exhaust_window_or_corrupt_data() {
+        let config = TcpConfig {
+            read_buffer_size: 4000,
+            ..TcpConfig::default()
+        };
+        let (mut stream, mut up_rx, local_seq) = established_with(None, config).await;
+        let sender = stream.stream_sender();
+
+        // Buffer [1200, 1800) (600 bytes).
+        let expected_600: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+        sender
+            .send(peer_segment(1200, local_seq, ACK | PSH, u16::MAX, &expected_600))
+            .unwrap();
+        let ack1 = up_rx.recv().await.unwrap();
+        assert_eq!(tcp_header_of(&ack1).acknowledgment_number, 1001);
+        assert_eq!(tcp_header_of(&ack1).window_size, 3400);
+
+        // Shorter retransmission at same seq [1200, 1300) and overlapping segments at distinct keys
+        // must not overwrite [1200, 1800) or shrink the advertised window below 3400.
+        sender
+            .send(peer_segment(1200, local_seq, ACK | PSH, u16::MAX, &[0xAA; 100]))
+            .unwrap();
+        let ack2 = up_rx.recv().await.unwrap();
+        assert_eq!(tcp_header_of(&ack2).window_size, 3400);
+
+        for start in [1200u32, 1250, 1300, 1350, 1400, 1450, 1500] {
+            sender
+                .send(peer_segment(start, local_seq, ACK | PSH, u16::MAX, &[0xBB; 300]))
+                .unwrap();
+            let ack = up_rx.recv().await.unwrap();
+            assert_eq!(tcp_header_of(&ack).window_size, 3400);
+        }
+
+        // Fill the gap [1001, 1200) -> full 799 bytes arrive intact.
+        sender
+            .send(peer_segment(1001, local_seq, ACK | PSH, u16::MAX, &[0x11; 199]))
+            .unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1800]);
+
+        let mut received = vec![0u8; 799];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut received).await.unwrap();
+        assert_eq!(&received[..199], &[0x11; 199]);
+        assert_eq!(&received[199..], &expected_600[..]);
     }
 }

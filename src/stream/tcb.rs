@@ -76,6 +76,7 @@ pub(crate) struct Tcb {
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     inflight_syn: Option<InflightSyn>,
     inflight_fin: Option<InflightFin>,
+    persist_probe: Option<PersistProbe>,
     time_wait_deadline: Option<tokio::time::Instant>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
     unordered_fin_seq: Option<SeqNum>,
@@ -147,6 +148,7 @@ impl Tcb {
             inflight_packets: BTreeMap::new(),
             inflight_syn: None,
             inflight_fin: None,
+            persist_probe: None,
             time_wait_deadline: None,
             unordered_packets: BTreeMap::new(),
             unordered_fin_seq: None,
@@ -187,10 +189,11 @@ impl Tcb {
             self.duplicate_ack_count = 0; // reset duplicate ACK count
             return;
         }
-        // RFC 5681 §2: count only duplicate ACKs (no data, SYN/FIN off, same window, not keepalive, outstanding data).
+        // RFC 5681 §2: count only duplicate ACKs (no data, SYN/FIN off, open window, same window, not keepalive, outstanding data).
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
         if rcvd_ack < self.seq
             && !self.inflight_packets.is_empty()
+            && self.get_send_window() > 0
             && payload.is_empty()
             && !tcp_header.syn
             && !tcp_header.fin
@@ -228,10 +231,46 @@ impl Tcb {
             return false;
         }
         // Bytes past the right edge of the receive window are dropped for the peer to resend.
+        // Bound the sequence-space right edge using bytes already queued for the application.
+        // Out-of-order bytes are accounted for after overlap trimming below; subtracting them
+        // here would incorrectly truncate retransmissions that overlap buffered data.
         let window = self.read_buffer_size.saturating_sub(self.received.len());
         let max_len = window.saturating_sub(seq.distance(self.ack) as usize);
         let accepted = buf.len() <= max_len && (!buf.is_empty() || max_len > 0);
         buf.truncate(max_len);
+        if buf.is_empty() {
+            return accepted;
+        }
+        // Trim against existing disjoint entries so overlapping segments neither overwrite buffered
+        // data nor double-count sequence space in `get_unordered_packets_total_len`.
+        let end = seq + buf.len() as u32;
+        if let Some((&prev_seq, prev_buf)) = self.unordered_packets.range(..seq).next_back() {
+            let prev_end = prev_seq + prev_buf.len() as u32;
+            if prev_end > seq {
+                if prev_end >= end {
+                    return accepted;
+                }
+                let overlap = prev_end.distance(seq) as usize;
+                buf.drain(..overlap);
+                seq = prev_end;
+            }
+        }
+        while let Some((&next_seq, next_buf)) = self.unordered_packets.range(seq..).next() {
+            if next_seq >= end {
+                break;
+            }
+            let next_end = next_seq + next_buf.len() as u32;
+            if next_seq > seq {
+                let head_len = next_seq.distance(seq) as usize;
+                self.unordered_packets.insert(seq, buf[..head_len].to_vec());
+            }
+            if next_end >= end {
+                return accepted;
+            }
+            let trim = next_end.distance(seq) as usize;
+            buf.drain(..trim);
+            seq = next_end;
+        }
         if !buf.is_empty() {
             self.unordered_packets.insert(seq, buf);
         }
@@ -349,6 +388,9 @@ impl Tcb {
     }
     pub(super) fn change_state(&mut self, state: TcpState) {
         self.state = state;
+        if !matches!(state, TcpState::Established | TcpState::CloseWait) {
+            self.persist_probe = None;
+        }
     }
     pub(super) fn get_state(&self) -> TcpState {
         self.state
@@ -361,10 +403,16 @@ impl Tcb {
     }
     pub(super) fn update_send_window(&mut self, tcp_header: &TcpHeader) {
         self.send_window = self.honoured_window(tcp_header);
-        if self.send_window > 0
-            && let Some(fin) = self.inflight_fin.as_mut()
-        {
-            fin.window_opened = true;
+        if self.send_window > 0 {
+            if self.persist_probe.take().is_some() && self.inflight_packets.is_empty() && self.inflight_fin.is_none() {
+                self.current_rto = self.rto;
+            }
+            if let Some(fin) = self.inflight_fin.as_mut() {
+                fin.window_opened = true;
+            }
+            for packet in self.inflight_packets.values_mut() {
+                packet.window_opened = true;
+            }
         }
     }
 
@@ -453,6 +501,7 @@ impl Tcb {
                     } else if !payload.is_empty() {
                         PacketType::NewPacket
                     } else if !tcp_header.fin
+                        && self.get_send_window() > 0
                         && self.get_send_window() == rcvd_window
                         && self.seq != rcvd_ack
                         && !self.inflight_packets.is_empty()
@@ -482,7 +531,10 @@ impl Tcb {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty payload"));
         }
         let buf_len = buf.len() as u32;
-        self.inflight_packets.insert(self.seq, InflightPacket::new(self.seq, buf));
+        let mut packet = InflightPacket::new(self.seq, buf);
+        packet.window_opened = self.send_window > 0;
+        self.inflight_packets.insert(self.seq, packet);
+        self.persist_probe = None;
         self.seq += buf_len;
         Ok(())
     }
@@ -564,10 +616,42 @@ impl Tcb {
         });
     }
 
-    pub(crate) fn reset_unanswered_fin_probes(&mut self) {
+    pub(crate) fn arm_persist_probe(&mut self) -> bool {
+        if self.persist_probe.is_none()
+            && self.send_window == 0
+            && self.inflight_packets.is_empty()
+            && matches!(self.state, TcpState::Established | TcpState::CloseWait)
+        {
+            self.persist_probe = Some(PersistProbe {
+                send_time: tokio::time::Instant::now(),
+                unanswered_probes: 0,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn reset_unanswered_probes(&mut self) {
         if let Some(fin) = self.inflight_fin.as_mut() {
             fin.unanswered_probes = 0;
         }
+        if let Some(probe) = self.persist_probe.as_mut() {
+            probe.unanswered_probes = 0;
+        }
+        if let Some(packet) = self.inflight_packets.values_mut().next() {
+            packet.unanswered_probes = 0;
+        }
+    }
+
+    pub(crate) fn take_probed_inflight_packet(&mut self) -> Option<InflightPacket> {
+        let packet = self.inflight_packets.values_mut().next()?;
+        if !packet.probed_zero_window {
+            return None;
+        }
+        packet.probed_zero_window = false;
+        packet.send_time = tokio::time::Instant::now();
+        Some(packet.clone())
     }
 
     pub(crate) fn inflight_fin_seq(&self) -> Option<SeqNum> {
@@ -611,6 +695,13 @@ impl Tcb {
         {
             return fin.send_time.checked_add(self.current_rto);
         }
+        if matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            && self.send_window == 0
+            && self.inflight_packets.is_empty()
+            && let Some(probe) = self.persist_probe
+        {
+            return probe.send_time.checked_add(self.current_rto);
+        }
         None
     }
 
@@ -651,22 +742,42 @@ impl Tcb {
         if fin.send_time.elapsed() < self.current_rto {
             return (None, false);
         }
-        if self.send_window > 0 || fin.window_opened {
-            if fin.retransmit_count + 1 >= self.max_retransmit_count {
-                return (None, true);
-            }
-            fin.retransmit_count += 1;
-            fin.window_opened = self.send_window > 0;
-        } else {
-            if fin.unanswered_probes + 1 >= self.max_retransmit_count {
-                return (None, true);
-            }
-            fin.unanswered_probes += 1;
+        if advance_r2_or_probe(
+            self.send_window,
+            self.max_retransmit_count,
+            &mut fin.retransmit_count,
+            &mut fin.unanswered_probes,
+            &mut fin.window_opened,
+        ) {
+            return (None, true);
         }
         fin.send_time = tokio::time::Instant::now();
         let seq = fin.seq;
         self.backoff_rto();
         (Some(seq), false)
+    }
+
+    /// Returns the probe sequence number if the persist timer elapsed while waiting on a zero
+    /// window with an empty inflight queue, or `exhausted = true` once `max_retransmit_count`
+    /// unanswered probes pass.
+    #[must_use]
+    pub(crate) fn collect_timed_out_persist_probe(&mut self) -> (Option<SeqNum>, bool) {
+        if !matches!(self.state, TcpState::Established | TcpState::CloseWait) || self.send_window > 0 || !self.inflight_packets.is_empty() {
+            return (None, false);
+        }
+        let Some(probe) = self.persist_probe.as_mut() else {
+            return (None, false);
+        };
+        if probe.send_time.elapsed() < self.current_rto {
+            return (None, false);
+        }
+        if probe.unanswered_probes + 1 >= self.max_retransmit_count {
+            return (None, true);
+        }
+        probe.unanswered_probes += 1;
+        probe.send_time = tokio::time::Instant::now();
+        self.backoff_rto();
+        (Some(self.seq - 1), false)
     }
 
     #[must_use]
@@ -679,10 +790,18 @@ impl Tcb {
         if !packet.is_timed_out(self.current_rto) {
             return (None, false);
         }
-        if packet.retransmit_count + 1 >= self.max_retransmit_count {
+        if advance_r2_or_probe(
+            self.send_window,
+            self.max_retransmit_count,
+            &mut packet.retransmit_count,
+            &mut packet.unanswered_probes,
+            &mut packet.window_opened,
+        ) {
             return (None, true);
         }
-        packet.retransmit_count += 1;
+        if self.send_window == 0 {
+            packet.probed_zero_window = true;
+        }
         packet.send_time = tokio::time::Instant::now(); // restart the timer, per RFC 6298 §5.6
         let packet = packet.clone();
         self.backoff_rto(); // back off the timer, per RFC 6298 §5.5
@@ -714,6 +833,28 @@ impl Tcb {
     }
 }
 
+fn advance_r2_or_probe(
+    send_window: u32,
+    max_retransmit_count: usize,
+    retransmit_count: &mut usize,
+    unanswered_probes: &mut usize,
+    window_opened: &mut bool,
+) -> bool {
+    if send_window > 0 || *window_opened {
+        if *retransmit_count + 1 >= max_retransmit_count {
+            return true;
+        }
+        *retransmit_count += 1;
+        *window_opened = send_window > 0;
+    } else {
+        if *unanswered_probes + 1 >= max_retransmit_count {
+            return true;
+        }
+        *unanswered_probes += 1;
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy)]
 struct InflightSyn {
     seq: SeqNum,
@@ -730,12 +871,21 @@ struct InflightFin {
     window_opened: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PersistProbe {
+    send_time: tokio::time::Instant,
+    unanswered_probes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct InflightPacket {
     pub seq: SeqNum,
     pub payload: Vec<u8>,
     pub send_time: tokio::time::Instant,
     pub retransmit_count: usize,
+    unanswered_probes: usize,
+    window_opened: bool,
+    probed_zero_window: bool,
 }
 
 impl InflightPacket {
@@ -745,6 +895,9 @@ impl InflightPacket {
             payload,
             send_time: tokio::time::Instant::now(),
             retransmit_count: 0,
+            unanswered_probes: 0,
+            window_opened: false,
+            probed_zero_window: false,
         }
     }
     pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
@@ -1237,5 +1390,114 @@ mod tests {
         tcb.update_inflight_packet_queue(first_seq + 100);
         tcb.update_last_received_ack(first_seq + 100);
         assert_eq!(tcb.duplicate_ack_count, 0);
+
+        // Reaching threshold while open, then closing the window to 0, must not fire
+        // RetransmissionRequest on subsequent zero-window probe responses.
+        for _ in 0..MAX_COUNT_FOR_DUP_ACK {
+            let hdr = make_hdr(1001, (first_seq + 100).0, u16::MAX, false);
+            tcb.update_duplicate_ack_count(&hdr, &[]);
+        }
+        assert!(tcb.is_duplicate_ack_threshold_reached());
+        let close_win_hdr = make_hdr(1001, (first_seq + 100).0, 0, false);
+        tcb.update_send_window_if_newer(&close_win_hdr);
+        tcb.update_duplicate_ack_count(&close_win_hdr, &[]);
+        assert_eq!(tcb.check_pkt_type(&close_win_hdr, &[]), PacketType::WindowUpdate);
+    }
+
+    #[test]
+    fn test_add_unordered_packet_preserves_longer_segment_and_deduplicates_overlaps() {
+        let mut tcb = window_tcb(u16::MAX, None, 1000);
+
+        // Longer segment [1100, 1500) is not overwritten by a shorter retransmission [1100, 1200).
+        let long_seg: Vec<u8> = (0..400).map(|i| (i % 251) as u8).collect();
+        assert!(tcb.add_unordered_packet(SeqNum(1100), long_seg.clone()));
+        assert!(tcb.add_unordered_packet(SeqNum(1100), vec![0xAA; 100]));
+        assert_eq!(tcb.get_unordered_packets_total_len(), 400);
+        assert_eq!(tcb.get_available_read_buffer_size(), 600);
+
+        // Overlapping segments at distinct keys never double-count in the receive window.
+        assert!(tcb.add_unordered_packet(SeqNum(1200), vec![0xBB; 200])); // strictly inside [1100, 1500)
+        assert_eq!(tcb.get_unordered_packets_total_len(), 400);
+        assert!(tcb.add_unordered_packet(SeqNum(1300), vec![0xCC; 300])); // extends to 1600
+        assert_eq!(tcb.get_unordered_packets_total_len(), 500);
+        assert!(tcb.add_unordered_packet(SeqNum(1050), vec![0xDD; 650])); // spans [1050, 1700)
+        assert_eq!(tcb.get_unordered_packets_total_len(), 650);
+        assert_eq!(tcb.get_available_read_buffer_size(), 350);
+
+        // Gap filler [1000, 1050) fits and delivers contiguous data with preserved [1100, 1500).
+        assert!(tcb.add_unordered_packet(SeqNum(1000), vec![0xEE; 50]));
+        let data = tcb.consume_unordered_packets(usize::MAX).unwrap();
+        assert_eq!(data.len(), 700);
+        assert_eq!(&data[0..50], &[0xEE; 50]);
+        assert_eq!(&data[50..100], &[0xDD; 50]);
+        assert_eq!(&data[100..500], &long_seg[..]);
+        assert_eq!(&data[500..600], &[0xCC; 100]);
+        assert_eq!(&data[600..700], &[0xDD; 100]);
+        assert_eq!(tcb.ack, SeqNum(1700));
+        assert!(tcb.unordered_packets.is_empty());
+    }
+
+    #[test]
+    fn test_update_send_window_if_newer_enforces_wl1_wl2() {
+        let mut tcb = default_tcb(SeqNum(1000));
+        let hdr = |seq: u32, ack: u32, win: u16| {
+            let mut h = TcpHeader::new(12345, 80, seq, win);
+            h.ack = true;
+            h.acknowledgment_number = ack;
+            h
+        };
+
+        tcb.update_send_window_if_newer(&hdr(1001, 101, 4096));
+        assert_eq!(tcb.get_send_window(), 4096);
+
+        // Older SEG.SEQ with same SEG.ACK must not overwrite send_window.
+        tcb.update_send_window_if_newer(&hdr(1000, 101, 0));
+        assert_eq!(tcb.get_send_window(), 4096);
+
+        // Same SEG.SEQ with older SEG.ACK must not overwrite send_window.
+        tcb.update_send_window_if_newer(&hdr(1001, 100, 512));
+        assert_eq!(tcb.get_send_window(), 4096);
+
+        // Same SEG.SEQ and equal SEG.ACK updates send_window.
+        tcb.update_send_window_if_newer(&hdr(1001, 101, 2048));
+        assert_eq!(tcb.get_send_window(), 2048);
+
+        // Newer SEG.SEQ updates even with same SEG.ACK.
+        tcb.update_send_window_if_newer(&hdr(1005, 101, 8192));
+        assert_eq!(tcb.get_send_window(), 8192);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_persist_probe_and_zero_window_inflight_packet_accounting() {
+        let mut tcb = window_tcb(0, None, READ_BUFFER_SIZE);
+        tcb.change_state(TcpState::Established);
+
+        assert!(tcb.arm_persist_probe());
+        assert!(!tcb.arm_persist_probe(), "re-arming must be idempotent");
+        assert!(tcb.get_retransmission_deadline().is_some());
+
+        // Answered probes never exhaust R2.
+        for _ in 0..(MAX_RETRANSMIT_COUNT * 2) {
+            let wait = tcb.get_retransmission_deadline().unwrap() - tokio::time::Instant::now();
+            tokio::time::advance(wait).await;
+            let (seq, exhausted) = tcb.collect_timed_out_persist_probe();
+            assert_eq!(seq, Some(tcb.get_seq() - 1));
+            assert!(!exhausted);
+            tcb.reset_unanswered_probes();
+        }
+
+        // Unanswered probes exhaust after MAX_RETRANSMIT_COUNT rounds.
+        for i in 0..MAX_RETRANSMIT_COUNT {
+            let wait = tcb.get_retransmission_deadline().unwrap() - tokio::time::Instant::now();
+            tokio::time::advance(wait).await;
+            let (seq, exhausted) = tcb.collect_timed_out_persist_probe();
+            if i + 1 < MAX_RETRANSMIT_COUNT {
+                assert_eq!(seq, Some(tcb.get_seq() - 1));
+                assert!(!exhausted);
+            } else {
+                assert_eq!(seq, None);
+                assert!(exhausted);
+            }
+        }
     }
 }
