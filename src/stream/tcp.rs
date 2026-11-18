@@ -408,9 +408,9 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
 
-        // The task that answers the SYN may not have run yet. Data written now would leave ahead of
-        // the SYN-ACK, under the initial sequence number.
-        if state == TcpState::Listen {
+        // Hold writes until the 3-way handshake completes (Established), so data cannot leave
+        // ahead of the SYN-ACK or before the peer's final ACK arrives.
+        if matches!(state, TcpState::Listen | TcpState::SynReceived) {
             return Poll::Pending;
         }
 
@@ -754,7 +754,6 @@ async fn tcp_main_logic_loop(
         let state = tcb.get_state();
         log::trace!("{network_tuple} {state:?}: session now in {state:?} state");
     }
-    write_notify.wake();
 
     let tcb_clone = tcb.clone();
 
@@ -1648,10 +1647,10 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
-    /// Data written before the task that answers the SYN has run must not leave ahead of the
-    /// SYN-ACK.
+    /// Data written before the 3-way handshake completes must wait through both `Listen` and
+    /// `SynReceived`, and only be transmitted once the connection enters `Established`.
     #[tokio::test]
-    async fn write_before_the_syn_ack_waits_for_it() {
+    async fn write_before_the_handshake_waits_for_it() {
         let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
         let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
@@ -1666,17 +1665,82 @@ mod tests {
         );
         let packets = written(&mut up_rx).await;
         assert!(
-            woken.load(std::sync::atomic::Ordering::SeqCst),
-            "the SYN-ACK did not wake the writer"
-        );
-        assert!(
             matches!(packets.as_slice(), [packet] if tcp_header_of(packet).syn),
             "the SYN-ACK is not the first packet"
         );
+        let syn_ack = tcp_header_of(&packets[0]).clone();
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::SynReceived);
+        assert!(
+            !woken.load(Ordering::SeqCst),
+            "entering SynReceived must not wake the writer before the handshake completes"
+        );
+        assert!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"early").is_pending(),
+            "a write was accepted in SynReceived before the 3-way handshake completed"
+        );
+        assert!(written(&mut up_rx).await.is_empty(), "data was transmitted in SynReceived");
+
+        let local_seq = syn_ack.sequence_number.wrapping_add(1);
+        stream.stream_sender().send(peer_ack(1001, local_seq)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(woken.load(Ordering::SeqCst), "completing the handshake did not wake the writer");
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+
         assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"early"), Poll::Ready(Ok(5))));
         let packets = written(&mut up_rx).await;
         assert_eq!(packets.len(), 1);
+        assert_eq!(tcp_header_of(&packets[0]).sequence_number, local_seq);
         assert_eq!(packets[0].payload.as_deref(), Some(&b"early"[..]));
+    }
+
+    #[tokio::test]
+    async fn write_in_syn_received_waits_for_handshake_ack() {
+        let (mut stream, syn_ack, mut up_rx) = open(u16::MAX, &[]).await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::SynReceived);
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"hello").is_pending(),
+            "a write was accepted in SynReceived"
+        );
+        assert!(written(&mut up_rx).await.is_empty(), "data was transmitted before handshake ACK");
+
+        let peer_seq = SeqNum(syn_ack.acknowledgment_number);
+        feed(&stream, &syn_ack, peer_seq, u16::MAX, &[]);
+        tokio::task::yield_now().await;
+        assert!(woken.load(Ordering::SeqCst), "handshake ACK did not wake the pending writer");
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"hello"), Poll::Ready(Ok(5))));
+        let packets = written(&mut up_rx).await;
+        assert_eq!(packets.len(), 1);
+        assert_eq!(tcp_header_of(&packets[0]).sequence_number, syn_ack.sequence_number.wrapping_add(1));
+        assert_eq!(packets[0].payload.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[tokio::test]
+    async fn write_in_syn_received_fails_with_broken_pipe_on_rst() {
+        let (mut stream, syn_ack, mut up_rx) = open(u16::MAX, &[]).await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::SynReceived);
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_write(&mut cx, b"hello").is_pending());
+
+        let local_seq = syn_ack.sequence_number.wrapping_add(1);
+        stream
+            .stream_sender()
+            .send(peer_segment(syn_ack.acknowledgment_number, local_seq, RST | ACK, 0, &[]))
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(woken.load(Ordering::SeqCst), "RST in SynReceived did not wake the pending writer");
+        assert!(written(&mut up_rx).await.is_empty());
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"hello"),
+            Poll::Ready(Err(err)) if err.kind() == BrokenPipe
+        ));
     }
 
     // --- Window scaling, MSS & send-window flow-control tests ---
