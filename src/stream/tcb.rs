@@ -92,8 +92,6 @@ pub(crate) struct Tcb {
     /// returns to it rather than being recomputed from a measurement.
     current_rto: std::time::Duration,
     max_retransmit_count: usize,
-    pub(super) last_write: tokio::time::Instant,
-    pub(super) write_parked: bool,
 }
 
 impl Tcb {
@@ -161,8 +159,6 @@ impl Tcb {
             rto,
             current_rto: rto,
             max_retransmit_count,
-            last_write: tokio::time::Instant::now(),
-            write_parked: false,
         }
     }
 
@@ -576,7 +572,7 @@ impl Tcb {
     }
 
     /// The deadline the connection waits on: the earliest send time in the inflight queue (or an
-    /// unacknowledged SYN|ACK or active-close FIN, including zero-window probes) plus the current
+    /// unacknowledged SYN|ACK or FIN, including zero-window probes) plus the current
     /// retransmission timeout, when the sum fits the clock.
     pub(crate) fn get_retransmission_deadline(&self) -> Option<tokio::time::Instant> {
         if let Some(packet) = self.inflight_packets.values().next() {
@@ -587,7 +583,7 @@ impl Tcb {
         {
             return syn.send_time.checked_add(self.current_rto);
         }
-        if matches!(self.state, TcpState::FinWait1 | TcpState::Closing)
+        if matches!(self.state, TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck)
             && let Some(fin) = self.inflight_fin
         {
             return fin.send_time.checked_add(self.current_rto);
@@ -623,7 +619,7 @@ impl Tcb {
     /// unanswered zero-window probes pass). Answered zero-window probes never exhaust R2.
     #[must_use]
     pub(crate) fn collect_timed_out_inflight_fin(&mut self) -> (Option<SeqNum>, bool) {
-        if !matches!(self.state, TcpState::FinWait1 | TcpState::Closing) {
+        if !matches!(self.state, TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck) {
             return (None, false);
         }
         let Some(fin) = self.inflight_fin.as_mut() else {
