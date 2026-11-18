@@ -78,6 +78,7 @@ pub(crate) struct Tcb {
     inflight_fin: Option<InflightFin>,
     time_wait_deadline: Option<tokio::time::Instant>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
+    unordered_fin_seq: Option<SeqNum>,
     received: VecDeque<u8>,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
@@ -150,6 +151,7 @@ impl Tcb {
             inflight_fin: None,
             time_wait_deadline: None,
             unordered_packets: BTreeMap::new(),
+            unordered_fin_seq: None,
             received: VecDeque::new(),
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
@@ -193,14 +195,18 @@ impl Tcb {
         self.duplicate_ack_count >= self.max_count_for_dup_ack
     }
 
-    pub(super) fn add_unordered_packet(&mut self, mut seq: SeqNum, mut buf: Vec<u8>) {
+    /// Buffers an incoming segment and returns whether its end sequence number fit within the receive window.
+    pub(super) fn add_unordered_packet(&mut self, mut seq: SeqNum, mut buf: Vec<u8>) -> bool {
         if seq < self.ack {
             // A retransmission re-segmented across the ack: keep the bytes past it.
             let received = self.ack.distance(seq) as usize;
             if received >= buf.len() {
+                if received == buf.len() {
+                    return self.get_available_read_buffer_size() > 0;
+                }
                 #[rustfmt::skip]
                 log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
-                return;
+                return false;
             }
             buf.drain(..received);
             seq = self.ack;
@@ -209,13 +215,33 @@ impl Tcb {
         if seq != self.ack && self.get_available_read_buffer_size() == 0 {
             #[rustfmt::skip]
             log::warn!("{:?}: Receive window full, dropping packet seq {seq}, len = {}", self.state, buf.len());
-            return;
+            return false;
         }
         // Bytes past the right edge of the receive window are dropped for the peer to resend.
         let window = self.read_buffer_size.saturating_sub(self.received.len());
-        buf.truncate(window.saturating_sub(seq.distance(self.ack) as usize));
+        let max_len = window.saturating_sub(seq.distance(self.ack) as usize);
+        let accepted = buf.len() <= max_len && (!buf.is_empty() || max_len > 0);
+        buf.truncate(max_len);
         if !buf.is_empty() {
             self.unordered_packets.insert(seq, buf);
+        }
+        accepted
+    }
+
+    pub(super) fn record_unordered_fin(&mut self, fin_seq: SeqNum) {
+        if self.unordered_fin_seq.is_none_or(|existing| fin_seq < existing) {
+            self.unordered_fin_seq = Some(fin_seq);
+        }
+    }
+
+    pub(super) fn take_unordered_fin(&mut self) -> bool {
+        if self.unordered_fin_seq == Some(self.ack) {
+            self.unordered_fin_seq = None;
+            self.unordered_packets.clear();
+            self.increase_ack();
+            true
+        } else {
+            false
         }
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
@@ -275,7 +301,14 @@ impl Tcb {
 
     /// Acknowledges the in-sequence data of the reassembly buffer, moving it to `received`.
     pub(super) fn acknowledge_unordered_packets(&mut self) {
-        if let Some(data) = self.consume_unordered_packets(usize::MAX) {
+        let max_bytes = self.unordered_fin_seq.map_or(usize::MAX, |fin_seq| {
+            if fin_seq <= self.ack {
+                0
+            } else {
+                fin_seq.distance(self.ack) as usize
+            }
+        });
+        if let Some(data) = self.consume_unordered_packets(max_bytes) {
             self.received.extend(data);
         }
     }
