@@ -92,6 +92,7 @@ pub(crate) struct Tcb {
     current_rto: std::time::Duration,
     max_retransmit_count: usize,
     pub(super) last_write: tokio::time::Instant,
+    pub(super) write_parked: bool,
 }
 
 impl Tcb {
@@ -159,6 +160,7 @@ impl Tcb {
             current_rto: rto,
             max_retransmit_count,
             last_write: tokio::time::Instant::now(),
+            write_parked: false,
         }
     }
 
