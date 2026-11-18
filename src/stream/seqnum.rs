@@ -139,38 +139,43 @@ impl SeqNum {
     }
 }
 
-#[test]
-fn test_seq_num_near_overflow() {
-    let a: SeqNum = (u32::MAX - 3).into();
-    let b = a + 8;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    assert_eq!(a, SeqNum(4294967292));
-    assert_eq!(b, SeqNum(4));
+    #[test]
+    fn test_seq_num_near_overflow() {
+        let a: SeqNum = (u32::MAX - 3).into();
+        let b = a + 8;
 
-    assert!(a < b);
-    assert!(b > a);
-    assert!(a <= b);
-    assert!(b >= a);
-    assert!(a != b);
+        assert_eq!(a, SeqNum(4294967292));
+        assert_eq!(b, SeqNum(4));
 
-    assert_eq!(a.distance(b), 8);
-    assert_eq!(b.distance(a), 8);
-}
+        assert!(a < b);
+        assert!(b > a);
+        assert!(a <= b);
+        assert!(b >= a);
+        assert!(a != b);
 
-#[test]
-fn test_seq_num_near_max_diff() {
-    let a = SeqNum(MAX_DIFF - 1);
-    let mut b = SeqNum(MAX_DIFF + 1);
+        assert_eq!(a.distance(b), 8);
+        assert_eq!(b.distance(a), 8);
+    }
 
-    assert!(a < b);
-    assert!(b > a);
-    assert_eq!(a.distance(b), 2);
+    #[test]
+    fn test_seq_num_near_max_diff() {
+        let a = SeqNum(MAX_DIFF - 1);
+        let mut b = SeqNum(MAX_DIFF + 1);
 
-    b += 3;
-    assert_eq!(b.distance(a), 5);
+        assert!(a < b);
+        assert!(b > a);
+        assert_eq!(a.distance(b), 2);
 
-    b -= 10;
-    assert_eq!(b.distance(a), 5);
+        b += 3;
+        assert_eq!(b.distance(a), 5);
 
-    assert_eq!(b, SeqNum(MAX_DIFF - 6));
+        b -= 10;
+        assert_eq!(b.distance(a), 5);
+
+        assert_eq!(b, SeqNum(MAX_DIFF - 6));
+    }
 }

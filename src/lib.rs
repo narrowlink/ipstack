@@ -512,6 +512,7 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     #[cfg(unix)]
     use std::{
         collections::VecDeque,
@@ -519,11 +520,10 @@ mod tests {
         task::{Context, Poll},
     };
 
-    use std::time::Duration;
-    use tokio::{io::duplex, time::timeout};
-
+    use rstest::rstest;
     #[cfg(unix)]
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::{io::duplex, time::timeout};
 
     use super::*;
 
@@ -541,40 +541,136 @@ mod tests {
         .unwrap()
     }
 
+    fn tcp_packet(seq: u32, ack: Option<u32>, syn: bool, fin: bool, payload: &[u8]) -> Vec<u8> {
+        let mut b = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [10, 0, 0, 1], 64).tcp(40000, 80, seq, u16::MAX);
+        if let Some(ack) = ack {
+            b = b.ack(ack);
+        }
+        if syn {
+            b = b.syn();
+        }
+        if fin {
+            b = b.fin();
+        }
+        let mut packet = Vec::new();
+        b.write(&mut packet, payload).unwrap();
+        packet
+    }
+
     #[cfg(unix)]
+    struct ChunkedDevice {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    #[cfg(unix)]
+    impl ChunkedDevice {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self { chunks: chunks.into() }
+        }
+    }
+
+    #[cfg(unix)]
+    impl AsyncRead for ChunkedDevice {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if let Some(mut chunk) = self.chunks.pop_front() {
+                let to_copy = buf.remaining().min(chunk.len());
+                buf.put_slice(&chunk[..to_copy]);
+                chunk.drain(..to_copy);
+                if !chunk.is_empty() {
+                    self.chunks.push_front(chunk);
+                }
+            }
+
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(unix)]
+    impl AsyncWrite for ChunkedDevice {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // --- Device framing & packet tests ---
+
+    #[cfg(unix)]
+    #[rstest]
     #[tokio::test]
-    async fn upstream_packet_information_precedes_serialized_ipv4_and_ipv6_packets() {
+    async fn upstream_packet_information_precedes_serialized_ipv4_and_ipv6_packets(
+        #[values(false, true)] ipv6: bool,
+        #[values(false, true)] packet_information: bool,
+    ) {
         use tokio::io::AsyncReadExt;
 
         let mut buffer = Vec::new();
-        for ipv6 in [false, true] {
+        let raw = if ipv6 {
             let mut raw = Vec::new();
-            if ipv6 {
-                etherparse::PacketBuilder::ipv6([0; 16], [1; 16], 64)
-                    .udp(1234, 5678)
-                    .write(&mut raw, b"payload")
-                    .unwrap();
-            } else {
-                raw = udp_packet(b"payload");
-            }
-            for packet_information in [false, true] {
-                let packet = NetworkPacket::parse(&raw).unwrap();
-                let mut expected = Vec::new();
-                if packet_information {
-                    expected.extend_from_slice(&TUN_FLAGS);
-                    expected.extend_from_slice(if ipv6 { &TUN_PROTO_IP6 } else { &TUN_PROTO_IP4 });
-                }
-                expected.extend_from_slice(&packet.to_bytes().unwrap());
-                let (mut device, mut peer) = duplex(256);
-                process_upstream_recv(packet, &mut device, &mut buffer, packet_information)
-                    .await
-                    .unwrap();
-                let mut actual = vec![0; expected.len()];
-                peer.read_exact(&mut actual).await.unwrap();
-                assert_eq!(actual, expected);
-            }
+            etherparse::PacketBuilder::ipv6([0; 16], [1; 16], 64)
+                .udp(1234, 5678)
+                .write(&mut raw, b"payload")
+                .unwrap();
+            raw
+        } else {
+            udp_packet(b"payload")
+        };
+        let packet = NetworkPacket::parse(&raw).unwrap();
+        let mut expected = Vec::new();
+        if packet_information {
+            expected.extend_from_slice(&TUN_FLAGS);
+            expected.extend_from_slice(if ipv6 { &TUN_PROTO_IP6 } else { &TUN_PROTO_IP4 });
         }
+        expected.extend_from_slice(&packet.to_bytes().unwrap());
+        let (mut device, mut peer) = duplex(256);
+        process_upstream_recv(packet, &mut device, &mut buffer, packet_information)
+            .await
+            .unwrap();
+        let mut actual = vec![0; expected.len()];
+        peer.read_exact(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn packet_smaller_than_header_offset_is_discarded_without_panic() {
+        let mut config = IpStackConfig::default();
+        config.packet_information(true);
+        let mut packet_data = vec![0u8; 4];
+        let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(1234, 5678);
+        builder.write(&mut packet_data, &[1, 2, 3, 4]).unwrap();
+
+        let device = ChunkedDevice::new(vec![vec![0x00, 0x01], packet_data]);
+        let mut ip_stack = IpStack::new(config, device);
+
+        let accepted = timeout(Duration::from_secs(1), ip_stack.accept())
+            .await
+            .expect("accept timed out")
+            .expect("accept returned error");
+        assert!(matches!(accepted, IpStackStream::Udp(_)));
+    }
+
+    #[tokio::test]
+    async fn device_eof_closes_accept_channel() {
+        let (device, peer) = duplex(64);
+        let mut ip_stack = IpStack::new(IpStackConfig::default(), device);
+
+        drop(peer);
+
+        let accept_result = timeout(Duration::from_secs(1), ip_stack.accept())
+            .await
+            .expect("accept should not hang after device EOF");
+        assert!(matches!(accept_result, Err(IpStackError::AcceptError)));
+    }
+
+    // --- UDP session table & cleanup tests ---
 
     /// Exercise dispatch before the old removal notification is consumed, then pass that
     /// notification through the same handler used by the event loop.
@@ -631,7 +727,11 @@ mod tests {
 
     /// Run the real event loop, send no more packets after drop/expiration, and observe
     /// that it releases its sender. The retained probe is the only remaining strong sender.
-    async fn udp_session_is_cleaned_without_more_traffic(expire: bool) {
+    #[rstest]
+    #[case::dropped(false)]
+    #[case::expired(true)]
+    #[tokio::test(start_paused = true)]
+    async fn udp_session_is_cleaned_without_more_traffic(#[case] expire: bool) {
         let (device, mut peer) = duplex(4096);
         let mut config = IpStackConfig::default();
         config.udp_timeout(Duration::from_secs(1));
@@ -660,88 +760,103 @@ mod tests {
         assert!(!stack.handle.is_finished(), "cleanup must not stop the IP stack");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn dropped_udp_session_is_cleaned_without_more_traffic() {
-        udp_session_is_cleaned_without_more_traffic(false).await;
-    }
+    // --- TCP session table & cleanup tests ---
 
-    #[tokio::test(start_paused = true)]
-    async fn expired_udp_session_is_cleaned_without_more_traffic() {
-        udp_session_is_cleaned_without_more_traffic(true).await;
-    }
+    #[tokio::test]
+    async fn closed_tcp_session_is_removed_and_late_segment_is_reset() {
+        let mut sessions = SessionCollection::new();
+        let (remove_tx, mut remove_rx) = mpsc::unbounded_channel();
+        let (up_tx, mut up_rx) = mpsc::unbounded_channel();
+        let (accept_tx, mut accept_rx) = mpsc::unbounded_channel();
+        let config = IpStackConfig::default();
 
-    #[cfg(unix)]
-    struct ChunkedDevice {
-        chunks: VecDeque<Vec<u8>>,
-    }
+        process_device_read(
+            &tcp_packet(1000, None, true, false, &[]),
+            &mut sessions,
+            &remove_tx,
+            &up_tx,
+            &config,
+            &accept_tx,
+        )
+        .await
+        .unwrap();
+        let IpStackStream::Tcp(mut stream) = accept_rx.recv().await.unwrap() else {
+            panic!("expected TCP stream");
+        };
+        let syn_ack = timeout(Duration::from_secs(1), up_rx.recv()).await.unwrap().unwrap();
+        let TransportHeader::Tcp(syn_ack_hdr) = syn_ack.transport_header() else {
+            panic!("expected TCP SYN-ACK");
+        };
+        assert!(syn_ack_hdr.syn);
+        let local_seq = syn_ack_hdr.sequence_number.wrapping_add(1);
 
-    #[cfg(unix)]
-    impl ChunkedDevice {
-        fn new(chunks: Vec<Vec<u8>>) -> Self {
-            Self { chunks: chunks.into() }
-        }
-    }
+        // Complete handshake and have the peer half-close immediately.
+        process_device_read(
+            &tcp_packet(1001, Some(local_seq), false, false, &[]),
+            &mut sessions,
+            &remove_tx,
+            &up_tx,
+            &config,
+            &accept_tx,
+        )
+        .await
+        .unwrap();
+        process_device_read(
+            &tcp_packet(1001, Some(local_seq), false, true, &[]),
+            &mut sessions,
+            &remove_tx,
+            &up_tx,
+            &config,
+            &accept_tx,
+        )
+        .await
+        .unwrap();
 
-    #[cfg(unix)]
-    impl AsyncRead for ChunkedDevice {
-        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-            if let Some(mut chunk) = self.chunks.pop_front() {
-                let to_copy = buf.remaining().min(chunk.len());
-                buf.put_slice(&chunk[..to_copy]);
-                chunk.drain(..to_copy);
-                if !chunk.is_empty() {
-                    self.chunks.push_front(chunk);
+        let app = async {
+            let mut buf = Vec::new();
+            assert_eq!(stream.read_to_end(&mut buf).await.unwrap(), 0);
+            stream.shutdown().await.unwrap();
+        };
+        let remote = async {
+            loop {
+                let pkt = timeout(Duration::from_secs(1), up_rx.recv()).await.unwrap().unwrap();
+                let TransportHeader::Tcp(hdr) = pkt.transport_header() else {
+                    panic!("expected TCP packet");
+                };
+                if hdr.fin {
+                    let fin_ack = tcp_packet(1002, Some(hdr.sequence_number.wrapping_add(1)), false, false, &[]);
+                    process_device_read(&fin_ack, &mut sessions, &remove_tx, &up_tx, &config, &accept_tx)
+                        .await
+                        .unwrap();
+                    break;
                 }
             }
+        };
+        timeout(Duration::from_secs(1), async { tokio::join!(app, remote) }).await.unwrap();
 
-            Poll::Ready(Ok(()))
-        }
-    }
+        drop(stream);
+        let removed = timeout(Duration::from_secs(1), remove_rx.recv()).await.unwrap().unwrap();
+        remove_closed_session(&mut sessions, removed);
+        assert!(sessions.is_empty());
+        while up_rx.try_recv().is_ok() {}
 
-    #[cfg(unix)]
-    impl AsyncWrite for ChunkedDevice {
-        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-            Poll::Ready(Ok(buf.len()))
-        }
+        let err = process_device_read(
+            &tcp_packet(1002, Some(local_seq.wrapping_add(1)), false, false, b"late"),
+            &mut sessions,
+            &remove_tx,
+            &up_tx,
+            &config,
+            &accept_tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, IpStackError::IoError(e) if e.kind() == std::io::ErrorKind::ConnectionRefused));
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn device_eof_closes_accept_channel() {
-        let (device, peer) = duplex(64);
-        let mut ip_stack = IpStack::new(IpStackConfig::default(), device);
-
-        drop(peer);
-
-        let accept_result = timeout(Duration::from_secs(1), ip_stack.accept())
-            .await
-            .expect("accept should not hang after device EOF");
-        assert!(matches!(accept_result, Err(IpStackError::AcceptError)));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn packet_smaller_than_header_offset_is_discarded_without_panic() {
-        let mut config = IpStackConfig::default();
-        config.packet_information(true);
-        let mut packet_data = vec![0u8; 4];
-        let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(1234, 5678);
-        builder.write(&mut packet_data, &[1, 2, 3, 4]).unwrap();
-
-        let device = ChunkedDevice::new(vec![vec![0x00, 0x01], packet_data]);
-        let mut ip_stack = IpStack::new(config, device);
-
-        let accepted = timeout(Duration::from_secs(1), ip_stack.accept())
-            .await
-            .expect("accept timed out")
-            .expect("accept returned error");
-        assert!(matches!(accepted, IpStackStream::Udp(_)));
+        let reset = timeout(Duration::from_secs(1), up_rx.recv()).await.unwrap().unwrap();
+        let TransportHeader::Tcp(hdr) = reset.transport_header() else {
+            panic!("expected TCP RST");
+        };
+        assert!(hdr.rst);
+        assert!(sessions.is_empty());
     }
 }
