@@ -1343,8 +1343,6 @@ pub(crate) fn write_packet_to_device(
 ) -> std::io::Result<usize> {
     use std::io::Error;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
-    // Silly-window-syndrome avoidance: advertise a real window only when a full segment fits,
-    // otherwise advertise zero so the peer enters persist mode until the reader frees space.
     let recv_window = tcb.get_recv_window();
     // RFC 7323 §2.2: the window field of a segment carrying SYN is not scaled.
     let advertised = if flags.contains(SYN) {
@@ -1352,7 +1350,7 @@ pub(crate) fn write_packet_to_device(
     } else {
         tcb.get_scaled_recv_window()
     };
-    let window_size = if recv_window >= tcb.get_mtu() { advertised } else { 0 };
+    let window_size = advertised;
     let ack = tcb.get_ack().0;
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let mut tcp_options = Vec::new();
@@ -1597,6 +1595,48 @@ mod tests {
             panic!("the emitted SYN-ACK is not a TCP packet");
         };
         (stream, syn_ack.clone(), up_rx)
+    }
+
+    #[tokio::test]
+    async fn mtu_larger_than_read_buffer_keeps_initial_window_open() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let (src, dst) = (SocketAddr::from(([10, 0, 0, 2], 40000)), SocketAddr::from(([10, 0, 0, 1], 80)));
+        let mut syn = TcpHeader::new(src.port(), dst.port(), 1000, u16::MAX);
+        syn.syn = true;
+
+        let config = TcpConfig {
+            read_buffer_size: 16 * 1024,
+            ..TcpConfig::default()
+        };
+        let _stream = IpStackTcpStream::new(src, dst, syn, 0, up_tx, u16::MAX, None, Arc::new(config)).unwrap();
+        let syn_ack = up_rx.recv().await.expect("the stack emitted no SYN-ACK");
+
+        assert_eq!(tcp_header_of(&syn_ack).window_size, 16 * 1024);
+    }
+
+    #[tokio::test]
+    async fn partially_available_window_is_not_advertised_as_zero() {
+        let (stream, _, mut up_rx) = open(u16::MAX, &[]).await;
+        {
+            let mut tcb = stream.tcb.lock().unwrap();
+            let ack = tcb.get_ack();
+            assert!(tcb.add_unordered_packet(ack, vec![0; 15 * 1024]));
+            tcb.acknowledge_unordered_packets();
+        }
+
+        write_packet_to_device(
+            &stream.up_packet_sender,
+            stream.network_tuple(),
+            &stream.tcb.lock().unwrap(),
+            None,
+            ACK,
+            None,
+            None,
+        )
+        .unwrap();
+        let ack = up_rx.recv().await.expect("the stack emitted no window update");
+
+        assert_eq!(tcp_header_of(&ack).window_size, 1024);
     }
 
     /// Feeds `stream` a segment advertising `window`, carrying `payload` at `seq`.
