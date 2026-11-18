@@ -653,10 +653,6 @@ impl Tcb {
         self.inflight_packets.is_empty()
     }
 
-    pub(crate) fn clear_inflight_packets(&mut self) {
-        self.inflight_packets.clear();
-    }
-
     #[allow(dead_code)]
     pub(crate) fn get_all_inflight_packets(&self) -> Vec<&InflightPacket> {
         self.inflight_packets.values().collect::<Vec<_>>()
