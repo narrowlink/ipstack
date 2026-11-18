@@ -470,7 +470,17 @@ fn create_stream(
     let dst_addr = packet.dst_addr();
     match packet.transport_header() {
         TransportHeader::Tcp(h) => {
-            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, msgr, cfg.tcp_config.clone())?;
+            let payload_len = packet.payload.as_ref().map_or(0, |p| p.len());
+            let stream = IpStackTcpStream::new(
+                src_addr,
+                dst_addr,
+                h.clone(),
+                payload_len,
+                up_pkt_sender,
+                cfg.mtu,
+                msgr,
+                cfg.tcp_config.clone(),
+            )?;
             Ok(IpStackStream::Tcp(stream))
         }
         TransportHeader::Udp(_) => {

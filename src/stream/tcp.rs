@@ -175,10 +175,12 @@ pub struct IpStackTcpStream {
 }
 
 impl IpStackTcpStream {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         tcp: TcpHeader,
+        payload_len: usize,
         up_packet_sender: PacketSender,
         mtu: u16,
         destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
@@ -190,17 +192,31 @@ impl IpStackTcpStream {
             let info = format!("Invalid TCP packet: {tuple} {}", tcp_header_fmt(&tcp));
             return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
         }
+        if tcp.ack || !tcp.syn {
+            let (flags, seq, ack) = if tcp.ack {
+                // RFC 9293 §3.10.7.2: any ACK-bearing segment in LISTEN triggers <SEQ=SEG.ACK><CTL=RST>.
+                (RST, tcp.acknowledgment_number, 0)
+            } else {
+                // RFC 9293 §3.10.7.1: a non-ACK segment triggers <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>.
+                let seg_len = (payload_len as u32)
+                    .wrapping_add(u32::from(tcp.syn))
+                    .wrapping_add(u32::from(tcp.fin));
+                (ACK | RST, 0, tcp.sequence_number.wrapping_add(seg_len))
+            };
+            let rst = create_raw_packet(tuple.dst, tuple.src, |_, _| 0, flags, TTL, seq, ack, 0, Vec::new(), &[])
+                .and_then(|pkt| up_packet_sender.send(pkt).map_err(|e| std::io::Error::new(UnexpectedEof, e)));
+            if let Err(err) = rst {
+                log::warn!("Error sending RST packet: {err}");
+            }
+            let info = format!("Invalid TCP packet: {tuple} {}", tcp_header_fmt(&tcp));
+            return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
+        }
 
-        let accept_syn = tcp.syn && !tcp.ack;
         // RFC 7323 §2.2: a window scale option is read only from a segment carrying SYN.
-        let peer_window_shift = accept_syn
-            .then(|| {
-                tcp.options_iterator().flatten().find_map(|option| match option {
-                    TcpOptionElement::WindowScale(shift) => Some(shift),
-                    _ => None,
-                })
-            })
-            .flatten();
+        let peer_window_shift = tcp.options_iterator().flatten().find_map(|option| match option {
+            TcpOptionElement::WindowScale(shift) => Some(shift),
+            _ => None,
+        });
         let mut tcb = Tcb::new(
             SeqNum(tcp.sequence_number),
             tcp.window_size,
@@ -212,19 +228,6 @@ impl IpStackTcpStream {
             config.rto,
             config.max_retransmit_count,
         );
-        if tcp.ack || !tcp.syn {
-            let (flags, seq) = if tcp.ack {
-                // RFC 9293 §3.10.7.2: any ACK-bearing segment in LISTEN triggers <SEQ=SEG.ACK><CTL=RST>.
-                (RST, Some(SeqNum(tcp.acknowledgment_number)))
-            } else {
-                (ACK | RST, Some(SeqNum(0)))
-            };
-            if let Err(err) = write_packet_to_device(&up_packet_sender, tuple, &tcb, None, flags, seq, None) {
-                log::warn!("Error sending RST packet: {err}");
-            }
-            let info = format!("Invalid TCP packet: {tuple} {}", tcp_header_fmt(&tcp));
-            return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
-        }
         // Like the window scale, the MSS option is read only from a segment carrying SYN.
         if let Some(mss) = tcp.options_iterator().flatten().find_map(|option| match option {
             TcpOptionElement::MaximumSegmentSize(mss) => Some(mss),
@@ -1107,27 +1110,17 @@ async fn tcp_main_logic_loop(
 
         match state {
             TcpState::Established => {
-                if flags.contains(FIN) {
-                    let nt = network_tuple;
-                    if receive_segment_with_fin(&up_packet_sender, &mut tcb, nt, incoming_seq, payload, &data_tx, &read_notify)? {
-                        // Peer half-closed: ACK was sent for the FIN, keep write side open in CloseWait.
-                        tcb.change_state(TcpState::CloseWait);
-                        write_notify.wake();
-                        log::debug!("{network_tuple} CloseWait: peer closed write side, waiting for upstream shutdown");
-
-                        tokio::spawn(task_timed_out_for_close_wait(
-                            tcb_clone.clone(),
-                            shutdown.clone(),
-                            exit_notifier.clone(),
-                            network_tuple,
-                            up_packet_sender.clone(),
-                            write_notify.clone(),
-                            config.clone(),
-                        ));
-                    } else {
-                        // FIN not taken yet (gap before it, or window full): ACK sent, wait for the retransmission.
-                        write_notify.wake();
-                    }
+                let fin_taken = if flags.contains(FIN) {
+                    receive_segment(
+                        &up_packet_sender,
+                        &mut tcb,
+                        network_tuple,
+                        incoming_seq,
+                        payload,
+                        true,
+                        &data_tx,
+                        &read_notify,
+                    )?
                 } else if pkt_type == PacketType::NewPacket {
                     // RFC 9293 §3.10.7.4: process accepted segment data regardless of PSH/URG/ECE/CWR flags.
                     if !payload.is_empty() {
@@ -1137,13 +1130,34 @@ async fn tcp_main_logic_loop(
                             network_tuple,
                             incoming_seq,
                             payload,
+                            false,
                             &data_tx,
                             &read_notify,
-                        )?;
+                        )?
+                    } else {
+                        false
                     }
-                    write_notify.wake();
                 } else {
                     handle_ack_packet(&up_packet_sender, &tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
+                    false
+                };
+                if fin_taken {
+                    // Peer half-closed: ACK was sent for the FIN, keep write side open in CloseWait.
+                    tcb.change_state(TcpState::CloseWait);
+                    log::debug!("{network_tuple} CloseWait: peer closed write side, waiting for upstream shutdown");
+
+                    tokio::spawn(task_timed_out_for_close_wait(
+                        tcb_clone.clone(),
+                        shutdown.clone(),
+                        exit_notifier.clone(),
+                        network_tuple,
+                        up_packet_sender.clone(),
+                        write_notify.clone(),
+                        config.clone(),
+                    ));
+                }
+                if flags.contains(FIN) || pkt_type == PacketType::NewPacket {
+                    write_notify.wake();
                 }
             }
             TcpState::CloseWait => {
@@ -1196,43 +1210,59 @@ async fn tcp_main_logic_loop(
                     tcb.clear_inflight_fin();
                     tcb.change_state(TcpState::FinWait2);
                 }
-                if flags.contains(FIN) {
-                    let nt = network_tuple;
-                    if receive_segment_with_fin(&up_packet_sender, &mut tcb, nt, incoming_seq, payload, &data_tx, &read_notify)? {
-                        if tcb.get_state() == TcpState::FinWait1 {
-                            tcb.change_state(TcpState::Closing);
-                        } else {
-                            tcb.change_state(TcpState::TimeWait);
-                            tcb.restart_time_wait(config.two_msl);
-                            tokio::spawn(task_wait_to_close(
-                                tcb_clone.clone(),
-                                exit_notifier.clone(),
-                                network_tuple,
-                                config.two_msl,
-                            ));
-                        }
-                    }
-                    if len > 0 {
-                        write_notify.wake();
-                    }
-                } else if pkt_type == PacketType::KeepAlive {
-                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
-                } else if len > 0 {
-                    receive_segment(
+                let fin_taken = if flags.contains(FIN) {
+                    let taken = receive_segment(
                         &up_packet_sender,
                         &mut tcb,
                         network_tuple,
                         incoming_seq,
                         payload,
+                        true,
+                        &data_tx,
+                        &read_notify,
+                    )?;
+                    if len > 0 {
+                        write_notify.wake();
+                    }
+                    taken
+                } else if pkt_type == PacketType::KeepAlive {
+                    write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
+                    false
+                } else if len > 0 {
+                    let taken = receive_segment(
+                        &up_packet_sender,
+                        &mut tcb,
+                        network_tuple,
+                        incoming_seq,
+                        payload,
+                        false,
                         &data_tx,
                         &read_notify,
                     )?;
                     write_notify.wake();
-                } else if state == TcpState::FinWait2 && incoming_seq < tcb.get_ack() {
-                    log::trace!(
-                        "{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {}",
-                        tcb.get_ack()
-                    );
+                    taken
+                } else {
+                    if state == TcpState::FinWait2 && incoming_seq < tcb.get_ack() {
+                        log::trace!(
+                            "{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {}",
+                            tcb.get_ack()
+                        );
+                    }
+                    false
+                };
+                if fin_taken {
+                    if tcb.get_state() == TcpState::FinWait1 {
+                        tcb.change_state(TcpState::Closing);
+                    } else {
+                        tcb.change_state(TcpState::TimeWait);
+                        tcb.restart_time_wait(config.two_msl);
+                        tokio::spawn(task_wait_to_close(
+                            tcb_clone.clone(),
+                            exit_notifier.clone(),
+                            network_tuple,
+                            config.two_msl,
+                        ));
+                    }
                 }
                 if acked_fin {
                     shutdown.complete();
@@ -1336,48 +1366,30 @@ async fn wait_retransmission_deadline(tcb: &TcbPtr, arm_notify: &tokio::sync::No
     }
 }
 
-/// Stores a data segment that arrived from the peer and acknowledges it.
+/// Stores a data/FIN segment that arrived from the peer and acknowledges it; returns whether a FIN was taken.
 ///
 /// The ACK goes out even when no new data reaches the reader: a segment that arrives out of order,
 /// or one already received, is answered with a duplicate ACK at once (RFC 5681 §4.2), which is
 /// what lets the peer fast-retransmit the segment in the gap instead of waiting out its timer.
+/// If the segment carries FIN and fits in the receive window, its FIN sequence number is persisted
+/// so filling a preceding gap takes the FIN immediately without requiring a FIN retransmission.
+#[allow(clippy::too_many_arguments)]
 fn receive_segment(
     up_packet_sender: &PacketSender,
     tcb: &mut Tcb,
     network_tuple: NetworkTuple,
     seq: SeqNum,
     payload: Vec<u8>,
-    data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-    read_notify: &AtomicWaker,
-) -> std::io::Result<()> {
-    tcb.add_unordered_packet(seq, payload);
-    tcb.acknowledge_unordered_packets();
-    if !extract_data_n_write_upstream(up_packet_sender, tcb, network_tuple, data_tx, read_notify)? {
-        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
-    }
-    Ok(())
-}
-
-/// Like `receive_segment`, for a segment carrying FIN; returns whether the FIN was taken.
-/// The FIN is taken, and ACKed together with the payload, only once every byte before it is in.
-/// A FIN segment after a gap buffers its payload and gets a duplicate ACK, so the gap-filling
-/// segment advances `ack` to the end of the data without taking the unseen FIN.
-fn receive_segment_with_fin(
-    up_packet_sender: &PacketSender,
-    tcb: &mut Tcb,
-    network_tuple: NetworkTuple,
-    seq: SeqNum,
-    payload: Vec<u8>,
+    has_fin: bool,
     data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     read_notify: &AtomicWaker,
 ) -> std::io::Result<bool> {
     let fin_seq = seq + payload.len() as u32;
-    tcb.add_unordered_packet(seq, payload);
-    tcb.acknowledge_unordered_packets();
-    let fin_taken = tcb.get_ack() == fin_seq;
-    if fin_taken {
-        tcb.increase_ack();
+    if tcb.add_unordered_packet(seq, payload) && has_fin {
+        tcb.record_unordered_fin(fin_seq);
     }
+    tcb.acknowledge_unordered_packets();
+    let fin_taken = tcb.take_unordered_fin();
     if !extract_data_n_write_upstream(up_packet_sender, tcb, network_tuple, data_tx, read_notify)? {
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
@@ -1656,7 +1668,7 @@ mod tests {
 
         let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
         syn.syn = true;
-        let stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, destroy, Arc::new(config)).unwrap();
+        let stream = IpStackTcpStream::new(peer, local, syn, 0, up_tx, 1500, destroy, Arc::new(config)).unwrap();
 
         let syn_ack = tokio::time::timeout(Duration::from_secs(1), up_rx.recv())
             .await
@@ -1697,7 +1709,7 @@ mod tests {
         syn.syn = true;
         syn.set_options(syn_options).unwrap();
 
-        let stream = IpStackTcpStream::new(src, dst, syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+        let stream = IpStackTcpStream::new(src, dst, syn, 0, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
         let packet = up_rx.recv().await.expect("the stack emitted no SYN-ACK");
         let TransportHeader::Tcp(syn_ack) = packet.transport_header() else {
             panic!("the emitted SYN-ACK is not a TCP packet");
@@ -1802,7 +1814,7 @@ mod tests {
         let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
         syn.syn = true;
-        let mut stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+        let mut stream = IpStackTcpStream::new(peer, local, syn, 0, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
 
         let (woken, waker) = recording_waker();
         let mut cx = Context::from_waker(&waker);
@@ -1913,7 +1925,7 @@ mod tests {
         syn.syn = true;
         syn.set_options(&[TcpOptionElement::WindowScale(7)]).unwrap();
 
-        let mut stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, Some(destroy_tx), Arc::new(config)).unwrap();
+        let mut stream = IpStackTcpStream::new(peer, local, syn, 0, up_tx, 1500, Some(destroy_tx), Arc::new(config)).unwrap();
         let initial = up_rx.recv().await.unwrap();
         let initial_hdr = tcp_header_of(&initial).clone();
         assert!(initial_hdr.syn && initial_hdr.ack);
@@ -2016,7 +2028,7 @@ mod tests {
         syn.syn = true;
         syn.set_options(&[TcpOptionElement::WindowScale(4)]).unwrap();
 
-        let mut stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, None, Arc::new(config)).unwrap();
+        let mut stream = IpStackTcpStream::new(peer, local, syn, 0, up_tx, 1500, None, Arc::new(config)).unwrap();
         let initial = up_rx.recv().await.unwrap();
         let initial_hdr = tcp_header_of(&initial).clone();
 
@@ -2059,7 +2071,7 @@ mod tests {
             let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
             let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
             syn.syn = true;
-            let stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, Some(destroy_tx), Arc::new(TcpConfig::default())).unwrap();
+            let stream = IpStackTcpStream::new(peer, local, syn, 0, up_tx, 1500, Some(destroy_tx), Arc::new(TcpConfig::default())).unwrap();
             let syn_ack = up_rx.recv().await.unwrap();
             (stream, tcp_header_of(&syn_ack).clone(), up_rx)
         };
@@ -2401,9 +2413,9 @@ mod tests {
         assert_eq!(&buf, b"tail", "flags {flags:?}");
     }
 
-    /// RFC 5681 §4.2: a FIN segment arriving after a gap is answered with a duplicate ACK. Its
-    /// payload is not buffered, so filling the gap cannot advance past the unseen FIN; the peer's
-    /// retransmission of the FIN segment then completes the stream.
+    /// RFC 5681 §4.2: a FIN segment arriving after a gap buffers its payload and FIN sequence
+    /// number and answers with a duplicate ACK. Filling the gap delivers the full stream and
+    /// immediately takes the buffered FIN without needing a retransmission.
     #[rstest]
     #[case::ack_fin(ACK | FIN)]
     #[case::ack_psh_fin(ACK | PSH | FIN)]
@@ -2420,24 +2432,25 @@ mod tests {
             [1001],
             "flags {flags:?}: out-of-order FIN segment got no duplicate ACK"
         );
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
 
-        // The gap fills; the FIN was not seen yet, so ACK stops at the end of the buffered data.
+        // The gap fills: ACK covers both segments and the buffered FIN, entering CloseWait.
         stream
             .stream_sender()
             .send(peer_segment(1001, local_seq, ACK, u16::MAX, b"head"))
             .unwrap();
-        assert_eq!(acks(&mut up_rx).await.last(), Some(&1009), "flags {flags:?}");
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+        assert_eq!(acks(&mut up_rx).await.last(), Some(&1010), "flags {flags:?}");
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::CloseWait);
 
-        // The peer retransmits the FIN segment.
+        // Any duplicate retransmission of the FIN segment in CloseWait is still ACKed at 1010.
         stream
             .stream_sender()
             .send(peer_segment(1005, local_seq, flags, u16::MAX, b"tail"))
             .unwrap();
         assert_eq!(acks(&mut up_rx).await, [1010], "flags {flags:?}");
 
-        let mut buf = [0u8; 8];
-        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf).await.unwrap();
         assert_eq!(&buf, b"headtail");
     }
 
@@ -2930,6 +2943,39 @@ mod tests {
         tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf).await.unwrap();
         assert_eq!(buf, b"tail");
         assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+    }
+
+    #[rstest]
+    #[case::fin_wait1_to_closing(false, TcpState::Closing)]
+    #[case::fin_wait2_to_time_wait(true, TcpState::TimeWait)]
+    #[tokio::test(start_paused = true)]
+    async fn fin_wait_out_of_order_fin_is_taken_when_gap_filled(#[case] ack_our_fin: bool, #[case] expected_state: TcpState) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let _ = Pin::new(&mut stream).poll_shutdown(&mut cx);
+        let sent = written(&mut up_rx).await;
+        assert!(sent.iter().any(|p| tcp_header_of(p).fin));
+
+        let peer_ack = if ack_our_fin { local_seq + 1 } else { local_seq };
+        // Out-of-order FIN segment after a 4-byte gap.
+        stream
+            .stream_sender()
+            .send(peer_segment(1005, peer_ack, ACK | FIN, u16::MAX, b"tail"))
+            .unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1001]);
+
+        // Gap-filling data segment without FIN must take the buffered FIN immediately.
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, peer_ack, ACK | PSH, u16::MAX, b"head"))
+            .unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1010]);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), expected_state);
+
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(buf, b"headtail");
     }
 
     #[tokio::test(start_paused = true)]
@@ -3909,16 +3955,25 @@ mod tests {
     }
 
     #[rstest]
-    #[case::syn_rst(SYN | RST, false, false)]
-    #[case::syn_rst_ack(SYN | RST | ACK, false, false)]
-    #[case::rst(RST, false, false)]
-    #[case::rst_ack(RST | ACK, false, false)]
-    #[case::syn_ack(SYN | ACK, true, false)]
-    #[case::ack(ACK, true, false)]
-    #[case::fin_ack(FIN | ACK, true, false)]
-    #[case::fin(FIN, true, true)]
+    #[case::syn_rst(SYN | RST, 0, false, false)]
+    #[case::syn_rst_ack(SYN | RST | ACK, 0, false, false)]
+    #[case::rst(RST, 0, false, false)]
+    #[case::rst_ack(RST | ACK, 0, false, false)]
+    #[case::syn_ack(SYN | ACK, 0, true, false)]
+    #[case::ack(ACK, 0, true, false)]
+    #[case::ack_payload(ACK | PSH, 5, true, false)]
+    #[case::fin_ack(FIN | ACK, 0, true, false)]
+    #[case::fin(FIN, 0, true, true)]
+    #[case::fin_payload(FIN | PSH, 4, true, true)]
+    #[case::psh_payload(PSH, 4, true, true)]
+    #[case::psh_empty(PSH, 0, true, true)]
     #[tokio::test]
-    async fn listen_rejects_invalid_initial_segments(#[case] flags: TcpFlags, #[case] expects_rst: bool, #[case] expects_ack_on_rst: bool) {
+    async fn listen_rejects_invalid_initial_segments(
+        #[case] flags: TcpFlags,
+        #[case] payload_len: usize,
+        #[case] expects_rst: bool,
+        #[case] expects_ack_on_rst: bool,
+    ) {
         let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
         let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
 
@@ -3927,9 +3982,10 @@ mod tests {
         hdr.rst = flags.contains(RST);
         hdr.ack = flags.contains(ACK);
         hdr.fin = flags.contains(FIN);
+        hdr.psh = flags.contains(PSH);
         hdr.acknowledgment_number = if hdr.ack { 7777 } else { 0 };
 
-        let err = match IpStackTcpStream::new(peer, local, hdr, up_tx, 1500, None, Arc::new(TcpConfig::default())) {
+        let err = match IpStackTcpStream::new(peer, local, hdr, payload_len, up_tx, 1500, None, Arc::new(TcpConfig::default())) {
             Ok(_) => panic!("expected invalid initial segment {flags:?} to be rejected"),
             Err(err) => err,
         };
@@ -3943,8 +3999,16 @@ mod tests {
             let rst_hdr = tcp_header_of(&responses[0]);
             assert!(rst_hdr.rst && !rst_hdr.syn);
             assert_eq!(rst_hdr.ack, expects_ack_on_rst);
-            if !expects_ack_on_rst {
+            if expects_ack_on_rst {
+                let expected_ack = 1000u32
+                    .wrapping_add(payload_len as u32)
+                    .wrapping_add(u32::from(flags.contains(SYN)))
+                    .wrapping_add(u32::from(flags.contains(FIN)));
+                assert_eq!(rst_hdr.sequence_number, 0);
+                assert_eq!(rst_hdr.acknowledgment_number, expected_ack);
+            } else {
                 assert_eq!(rst_hdr.sequence_number, 7777);
+                assert_eq!(rst_hdr.acknowledgment_number, 0);
             }
         }
     }
@@ -4052,14 +4116,15 @@ mod tests {
             assert!(tcb.get_retransmission_deadline().is_none());
         }
 
-        // Fill the gap, then deliver the FIN to reach CloseWait and EOF.
+        // Fill the gap: the previously buffered FIN is taken immediately to reach CloseWait and EOF.
         stream
             .stream_sender()
             .send(peer_segment(peer_seq, local_seq, ACK | PSH, u16::MAX, b"four"))
             .unwrap();
-        assert_eq!(acks(&mut up_rx).await, [peer_seq + 4]);
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+        assert_eq!(acks(&mut up_rx).await, [peer_seq + 5]);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::CloseWait);
 
+        // A duplicate FIN retransmission is still ACKed at peer_seq + 5.
         stream
             .stream_sender()
             .send(peer_segment(peer_seq + 4, local_seq, ACK | FIN, u16::MAX, &[]))
