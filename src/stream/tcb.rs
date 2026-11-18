@@ -393,7 +393,7 @@ impl Tcb {
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
         let rcvd_window = self.honoured_window(tcp_header);
         let len = payload.len();
-        let res = if rcvd_ack > self.seq {
+        let res = if rcvd_ack > self.seq || (self.state == TcpState::SynReceived && rcvd_ack != self.seq) {
             PacketType::Invalid
         } else {
             match rcvd_ack.cmp(&self.get_last_received_ack()) {
@@ -1096,5 +1096,23 @@ mod tests {
         // the advertised window shrinks as the buffer fills
         tcb.add_unordered_packet(SeqNum(1000), vec![0; buffer - 1000]);
         assert_eq!(usize::from(tcb.get_scaled_recv_window()), 1000 >> 5);
+    }
+
+    #[test]
+    fn test_check_pkt_type_rejects_unacceptable_ack_in_syn_received() {
+        let mut tcb = default_tcb(SeqNum(1000));
+        let isn = tcb.get_seq();
+        tcb.increase_seq();
+        tcb.change_state(TcpState::SynReceived);
+
+        let mut hdr = TcpHeader::new(12345, 80, 1001, u16::MAX);
+        hdr.ack = true;
+        hdr.acknowledgment_number = isn.0;
+        assert_eq!(tcb.check_pkt_type(&hdr, &[]), PacketType::Invalid);
+        assert_eq!(tcb.check_pkt_type(&hdr, b"early"), PacketType::Invalid);
+
+        hdr.acknowledgment_number = (isn + 1).0;
+        assert_eq!(tcb.check_pkt_type(&hdr, &[]), PacketType::Ack);
+        assert_eq!(tcb.check_pkt_type(&hdr, b"ok"), PacketType::NewPacket);
     }
 }
