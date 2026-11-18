@@ -761,7 +761,7 @@ async fn tcp_main_logic_loop(
                     log::debug!("{network_tuple} {state:?}: session finished, exiting task...");
                     break;
                 }
-                let (packets, packets_exhausted) = tcb.collect_timed_out_inflight_packets();
+                let (packet, packets_exhausted) = tcb.collect_timed_out_inflight_packet();
                 let (syn_seq, syn_exhausted) = tcb.collect_timed_out_inflight_syn();
                 let (fin_seq, fin_exhausted) = tcb.collect_timed_out_inflight_fin();
                 if packets_exhausted || syn_exhausted || fin_exhausted {
@@ -789,7 +789,7 @@ async fn tcp_main_logic_loop(
                         None,
                     )?;
                 }
-                for packet in packets {
+                if let Some(packet) = packet {
                     let (seq, count) = (packet.seq, packet.retransmit_count);
                     log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
                     write_packet_to_device(
@@ -957,7 +957,7 @@ async fn tcp_main_logic_loop(
 
         let is_old_ack = incoming_ack < tcb.get_last_received_ack();
         if !is_old_ack {
-            tcb.update_duplicate_ack_count(incoming_ack);
+            tcb.update_duplicate_ack_count(tcp_header, &payload);
             if incoming_ack > tcb.get_last_received_ack() {
                 tcb.update_inflight_packet_queue(incoming_ack);
             }
@@ -1006,7 +1006,7 @@ async fn tcp_main_logic_loop(
                         false
                     }
                 } else {
-                    handle_ack_packet(&up_packet_sender, &tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
+                    handle_ack_packet(&up_packet_sender, &mut tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
                     false
                 };
                 if fin_taken {
@@ -1023,7 +1023,7 @@ async fn tcp_main_logic_loop(
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                     write_notify.wake();
                 } else if flags == ACK || (flags == (ACK | PSH) && payload.is_empty()) {
-                    handle_ack_packet(&up_packet_sender, &tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
+                    handle_ack_packet(&up_packet_sender, &mut tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
                 }
             }
             TcpState::LastAck => {
@@ -1039,7 +1039,7 @@ async fn tcp_main_logic_loop(
                     break;
                 }
                 if tcb.inflight_fin_seq().is_none() && (flags == ACK || (flags == (ACK | PSH) && payload.is_empty())) {
-                    handle_ack_packet(&up_packet_sender, &tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
+                    handle_ack_packet(&up_packet_sender, &mut tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
                 }
             }
             TcpState::Closing => {
@@ -1060,7 +1060,7 @@ async fn tcp_main_logic_loop(
                     let new_state = tcb.get_state();
                     log::trace!("{network_tuple} {state:?}: Received final ACK, transitioned to {new_state:?}");
                 } else if tcb.inflight_fin_seq().is_none() && pkt_type == PacketType::RetransmissionRequest {
-                    handle_ack_packet(&up_packet_sender, &tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
+                    handle_ack_packet(&up_packet_sender, &mut tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
                 }
             }
             TcpState::FinWait1 | TcpState::FinWait2 if flags.contains(ACK) => {
@@ -1101,7 +1101,7 @@ async fn tcp_main_logic_loop(
                     write_notify.wake();
                     taken
                 } else if pkt_type == PacketType::RetransmissionRequest && tcb.inflight_fin_seq().is_none() {
-                    handle_ack_packet(&up_packet_sender, &tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
+                    handle_ack_packet(&up_packet_sender, &mut tcb, network_tuple, pkt_type, incoming_ack, &write_notify)?;
                     false
                 } else {
                     if state == TcpState::FinWait2 && incoming_seq < tcb.get_ack() {
@@ -1179,7 +1179,7 @@ async fn tcp_main_logic_loop(
 
 fn handle_ack_packet(
     up_packet_sender: &PacketSender,
-    tcb: &Tcb,
+    tcb: &mut Tcb,
     network_tuple: NetworkTuple,
     pkt_type: PacketType,
     incoming_ack: SeqNum,
@@ -1193,7 +1193,8 @@ fn handle_ack_packet(
             write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
         }
         PacketType::RetransmissionRequest => {
-            if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
+            if let Some(packet) = tcb.find_inflight_packet_mut(incoming_ack) {
+                packet.retransmit_count += 1;
                 let (s, p) = (packet.seq, packet.payload.clone());
                 let state = tcb.get_state();
                 let l_info = LocalInfo(tcb.get_seq(), tcb.get_ack());
@@ -2462,6 +2463,145 @@ mod tests {
             Pin::new(&mut stream).poll_write(&mut write_cx, b"waiting"),
             Poll::Ready(Err(err)) if err.kind() == BrokenPipe
         ));
+    }
+
+    /// RFC 6298 §5.4: RTO expiry retransmits only the earliest unacknowledged segment, even when
+    /// multiple segments are in flight and after multiple expiries.
+    #[tokio::test(start_paused = true)]
+    async fn rto_retransmits_only_earliest_inflight_segment() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream.write_all(b"first").await.unwrap();
+        let pkt1 = up_rx.recv().await.unwrap();
+        assert_eq!(pkt1.payload.as_deref(), Some(&b"first"[..]));
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        stream.write_all(b"second").await.unwrap();
+        let pkt2 = up_rx.recv().await.unwrap();
+        assert_eq!(pkt2.payload.as_deref(), Some(&b"second"[..]));
+
+        // First RTO (1s from first write): only "first" is retransmitted.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let sent = written(&mut up_rx).await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(tcp_header_of(&sent[0]).sequence_number, local_seq);
+        assert_eq!(sent[0].payload.as_deref(), Some(&b"first"[..]));
+
+        // Second RTO (2s later): still only "first" is retransmitted, not a burst of both.
+        assert!(
+            advance(Duration::from_secs(2) - Duration::from_millis(1), &mut up_rx)
+                .await
+                .is_none()
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let sent = written(&mut up_rx).await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(tcp_header_of(&sent[0]).sequence_number, local_seq);
+        assert_eq!(sent[0].payload.as_deref(), Some(&b"first"[..]));
+
+        // ACKing "first" leaves "second" with a restarted 4s timer (Karn's algorithm keeps RTO=4s).
+        stream.stream_sender().send(peer_ack(1001, local_seq + 5)).unwrap();
+        assert!(written(&mut up_rx).await.is_empty());
+        assert!(
+            advance(Duration::from_secs(4) - Duration::from_millis(1), &mut up_rx)
+                .await
+                .is_none()
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let sent = written(&mut up_rx).await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(tcp_header_of(&sent[0]).sequence_number, local_seq + 5);
+        assert_eq!(sent[0].payload.as_deref(), Some(&b"second"[..]));
+    }
+
+    /// RFC 5681 §2 / §3.2 & Karn's algorithm: data segments, window updates, and keepalives are not
+    /// counted as duplicate ACKs; Fast Retransmit fires once on the 3rd duplicate ACK and
+    /// increments `retransmit_count` so Karn's algorithm does not collapse backed-off RTO.
+    #[tokio::test(start_paused = true)]
+    async fn fast_retransmit_fires_once_ignores_non_dup_acks_and_preserves_backoff() {
+        let (mut stream, mut up_rx, mut local_seq) = established().await;
+
+        // Back off RTO to 2s via an RTO retransmission before testing Fast Retransmit.
+        stream.write_all(b"warm").await.unwrap();
+        up_rx.recv().await.unwrap();
+        let retry = advance(RTO, &mut up_rx).await.expect("expected RTO retry");
+        assert_eq!(retry.payload.as_deref(), Some(&b"warm"[..]));
+        local_seq += 4;
+        stream.stream_sender().send(peer_ack(1001, local_seq)).unwrap();
+        tokio::task::yield_now().await;
+
+        stream.write_all(b"lost").await.unwrap();
+        up_rx.recv().await.unwrap();
+        stream.write_all(b"tail").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        // Non-duplicate-ACK segments (data, window updates, keepalives) must not trigger Fast Retransmit.
+        let mut peer_seq = 1001;
+        for i in 0u16..4 {
+            stream
+                .stream_sender()
+                .send(peer_segment(peer_seq, local_seq, ACK | PSH, u16::MAX, b"x"))
+                .unwrap();
+            peer_seq += 1;
+            let _ = written(&mut up_rx).await;
+
+            stream
+                .stream_sender()
+                .send(peer_segment(peer_seq, local_seq, ACK, u16::MAX - 10 - i, &[]))
+                .unwrap();
+            assert!(written(&mut up_rx).await.is_empty());
+
+            stream
+                .stream_sender()
+                .send(peer_segment(peer_seq - 1, local_seq, ACK, u16::MAX - 10 - i, &[]))
+                .unwrap();
+            let ka_ack = written(&mut up_rx).await;
+            assert_eq!(ka_ack.len(), 1);
+            assert!(ka_ack[0].payload.as_deref().unwrap_or_default().is_empty());
+        }
+
+        let current_win = u16::MAX - 13;
+        // 1st and 2nd pure duplicate ACKs do not trigger Fast Retransmit.
+        for _ in 0..2 {
+            stream
+                .stream_sender()
+                .send(peer_segment(peer_seq, local_seq, ACK, current_win, &[]))
+                .unwrap();
+            assert!(written(&mut up_rx).await.is_empty());
+        }
+
+        // 3rd pure duplicate ACK triggers Fast Retransmit once.
+        stream
+            .stream_sender()
+            .send(peer_segment(peer_seq, local_seq, ACK, current_win, &[]))
+            .unwrap();
+        let fast = written(&mut up_rx).await;
+        assert_eq!(fast.len(), 1);
+        assert_eq!(tcp_header_of(&fast[0]).sequence_number, local_seq);
+        assert_eq!(fast[0].payload.as_deref(), Some(&b"lost"[..]));
+
+        // 4th and 5th pure duplicate ACKs must not retransmit again.
+        for _ in 0..2 {
+            stream
+                .stream_sender()
+                .send(peer_segment(peer_seq, local_seq, ACK, current_win, &[]))
+                .unwrap();
+            assert!(written(&mut up_rx).await.is_empty());
+        }
+
+        // ACKing only the fast-retransmitted segment must NOT collapse current_rto (still 2s).
+        stream
+            .stream_sender()
+            .send(peer_segment(peer_seq, local_seq + 4, ACK, current_win, &[]))
+            .unwrap();
+        assert!(written(&mut up_rx).await.is_empty());
+        assert!(
+            advance(RTO, &mut up_rx).await.is_none(),
+            "Karn's algorithm violated: RTO collapsed after Fast Retransmit"
+        );
+        let tail_retry = advance(RTO, &mut up_rx).await.expect("expected RTO retry for tail at 2s");
+        assert_eq!(tcp_header_of(&tail_retry).sequence_number, local_seq + 4);
+        assert_eq!(tail_retry.payload.as_deref(), Some(&b"tail"[..]));
     }
 
     // --- Reset (RST) handling tests ---

@@ -177,18 +177,32 @@ impl Tcb {
         send_window.min(mtu.saturating_sub(ip_header_size + tcp_header_size)).min(mss)
     }
 
-    pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
-        // If the received rcvd_ack is the same as duplicate_ack_count_helper and not all data has been acknowledged (rcvd_ack < self.seq), increment the count.
-        if rcvd_ack == self.duplicate_ack_count_helper && rcvd_ack < self.seq {
-            self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
-        } else {
+    pub(super) fn update_duplicate_ack_count(&mut self, tcp_header: &TcpHeader, payload: &[u8]) {
+        let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
+        if rcvd_ack < self.last_received_ack {
+            return;
+        }
+        if rcvd_ack != self.duplicate_ack_count_helper {
             self.duplicate_ack_count_helper = rcvd_ack;
             self.duplicate_ack_count = 0; // reset duplicate ACK count
+            return;
+        }
+        // RFC 5681 §2: count only duplicate ACKs (no data, SYN/FIN off, same window, not keepalive, outstanding data).
+        let rcvd_seq = SeqNum(tcp_header.sequence_number);
+        if rcvd_ack < self.seq
+            && !self.inflight_packets.is_empty()
+            && payload.is_empty()
+            && !tcp_header.syn
+            && !tcp_header.fin
+            && self.ack - 1 != rcvd_seq
+            && self.honoured_window(tcp_header) == self.get_send_window()
+        {
+            self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
         }
     }
 
-    pub fn is_duplicate_ack_count_exceeded(&self) -> bool {
-        self.duplicate_ack_count >= self.max_count_for_dup_ack
+    pub fn is_duplicate_ack_threshold_reached(&self) -> bool {
+        self.max_count_for_dup_ack > 0 && self.duplicate_ack_count == self.max_count_for_dup_ack
     }
 
     /// Buffers an incoming segment and returns whether its end sequence number fit within the receive window.
@@ -438,7 +452,12 @@ impl Tcb {
                         PacketType::KeepAlive
                     } else if !payload.is_empty() {
                         PacketType::NewPacket
-                    } else if self.get_send_window() == rcvd_window && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
+                    } else if !tcp_header.fin
+                        && self.get_send_window() == rcvd_window
+                        && self.seq != rcvd_ack
+                        && !self.inflight_packets.is_empty()
+                        && self.is_duplicate_ack_threshold_reached()
+                    {
                         PacketType::RetransmissionRequest
                     } else {
                         PacketType::WindowUpdate
@@ -475,7 +494,7 @@ impl Tcb {
     pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
         match self.inflight_packets.first_key_value() {
             None => return,
-            Some((&seq, _)) if ack < seq => return,
+            Some((&seq, _)) if ack <= seq => return,
             _ => {}
         }
         // RFC 6298 §3: a sample from a retransmitted segment is ambiguous, so only a segment sent
@@ -509,10 +528,14 @@ impl Tcb {
             // timeout back, collapsing whatever §5.5 backed it off to.
             self.current_rto = self.rto;
         }
+        if let Some(head) = self.inflight_packets.values_mut().next() {
+            // RFC 6298 §5.3: restart the retransmission timer when an ACK acknowledges new data.
+            head.send_time = tokio::time::Instant::now();
+        }
     }
 
-    pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
-        self.inflight_packets.get(&seq)
+    pub(crate) fn find_inflight_packet_mut(&mut self, seq: SeqNum) -> Option<&mut InflightPacket> {
+        self.inflight_packets.get_mut(&seq)
     }
 
     pub(crate) fn arm_inflight_syn(&mut self, seq: SeqNum) {
@@ -647,31 +670,23 @@ impl Tcb {
     }
 
     #[must_use]
-    /// The segments whose deadline has passed, and whether one of them reached R2, the transmission
-    /// count RFC 9293 §3.8.3 closes the connection at. At R2 the list is empty.
-    pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> (Vec<InflightPacket>, bool) {
-        let (rto, r2) = (self.current_rto, self.max_retransmit_count);
-        if self
-            .inflight_packets
-            .values()
-            .any(|p| p.is_timed_out(rto) && p.retransmit_count + 1 >= r2)
-        {
-            return (Vec::new(), true);
+    /// The earliest segment if its deadline has passed, and whether it reached R2, the transmission
+    /// count RFC 9293 §3.8.3 closes the connection at. At R2 the segment is `None`.
+    pub(crate) fn collect_timed_out_inflight_packet(&mut self) -> (Option<InflightPacket>, bool) {
+        let Some(packet) = self.inflight_packets.values_mut().next() else {
+            return (None, false);
+        };
+        if !packet.is_timed_out(self.current_rto) {
+            return (None, false);
         }
-
-        let mut retransmit_list = Vec::new();
-        for packet in self.inflight_packets.values_mut() {
-            if packet.is_timed_out(rto) {
-                packet.retransmit_count += 1;
-                retransmit_list.push(packet.clone());
-            }
+        if packet.retransmit_count + 1 >= self.max_retransmit_count {
+            return (None, true);
         }
-        if !retransmit_list.is_empty() {
-            let now = tokio::time::Instant::now();
-            self.inflight_packets.values_mut().for_each(|packet| packet.send_time = now); // restart the timer, per RFC 6298 §5.6
-            self.backoff_rto(); // back off the timer, per RFC 6298 §5.5
-        }
-        (retransmit_list, false)
+        packet.retransmit_count += 1;
+        packet.send_time = tokio::time::Instant::now(); // restart the timer, per RFC 6298 §5.6
+        let packet = packet.clone();
+        self.backoff_rto(); // back off the timer, per RFC 6298 §5.5
+        (Some(packet), false)
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
@@ -949,7 +964,7 @@ mod tests {
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
         tokio::time::advance(RTO).await;
-        assert_eq!(tcb.collect_timed_out_inflight_packets().0.len(), 1);
+        assert!(tcb.collect_timed_out_inflight_packet().0.is_some());
         assert_eq!(tcb.current_rto, RTO * 2);
 
         // the retransmitted segment cannot say which transmission the acknowledgement answers
@@ -985,25 +1000,47 @@ mod tests {
         assert!(tcb.get_retransmission_deadline().is_none());
     }
 
-    /// RFC 6298 §5.6: an expiry restarts the timer for every outstanding segment, so none is
-    /// retransmitted before the backed-off timeout has run from that expiry.
+    /// RFC 6298 §5.3/§5.4/§5.6: an expiry retransmits only the earliest segment and restarts its
+    /// timer without resetting later segments; an ACK for the earliest segment restarts the timer
+    /// for the new head.
     #[tokio::test(start_paused = true)]
-    async fn test_expiry_restarts_the_timer_for_every_segment() {
+    async fn test_expiry_retransmits_only_earliest_segment() {
         let mut tcb = default_tcb(SeqNum(1000));
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        let first_seq = tcb.inflight_packets.first_key_value().unwrap().0.to_owned();
         tokio::time::advance(Duration::from_millis(900)).await;
         tcb.add_inflight_packet(vec![2; 500]).unwrap();
+        let second_seq = tcb.inflight_packets.last_key_value().unwrap().0.to_owned();
+        let second_initial_send_time = tcb.inflight_packets.get(&second_seq).unwrap().send_time;
 
-        // the first segment expires, doubling the timeout to two seconds
+        // the first segment expires at 1s, doubling the timeout to two seconds
         tokio::time::advance(Duration::from_millis(100)).await;
-        assert_eq!(tcb.collect_timed_out_inflight_packets().0.len(), 1);
+        let first_retry = tcb.collect_timed_out_inflight_packet().0.unwrap();
+        assert_eq!(first_retry.seq, first_seq);
+        assert_eq!(first_retry.retransmit_count, 1);
+        assert_eq!(tcb.inflight_packets.get(&second_seq).unwrap().send_time, second_initial_send_time);
+        assert_eq!(tcb.inflight_packets.get(&second_seq).unwrap().retransmit_count, 0);
 
-        // nothing expires until two seconds after that expiry, and then both segments do
+        // nothing expires until two seconds after that expiry, and then only the earliest segment does
         tokio::time::advance(Duration::from_millis(1900)).await;
-        assert!(tcb.collect_timed_out_inflight_packets().0.is_empty());
+        assert!(tcb.collect_timed_out_inflight_packet().0.is_none());
         tokio::time::advance(Duration::from_millis(100)).await;
-        assert_eq!(tcb.collect_timed_out_inflight_packets().0.len(), 2);
+        let second_retry = tcb.collect_timed_out_inflight_packet().0.unwrap();
+        assert_eq!(second_retry.seq, first_seq);
+        assert_eq!(second_retry.retransmit_count, 2);
+        assert_eq!(tcb.inflight_packets.get(&second_seq).unwrap().send_time, second_initial_send_time);
+        assert_eq!(tcb.inflight_packets.get(&second_seq).unwrap().retransmit_count, 0);
+
+        // ACKing the first segment past second_initial_send_time + 4s restarts the timer on the second
+        tokio::time::advance(Duration::from_millis(2000)).await;
+        tcb.update_inflight_packet_queue(second_seq);
+        assert_eq!(tcb.current_rto, RTO * 4);
+        assert!(tcb.collect_timed_out_inflight_packet().0.is_none());
+        tokio::time::advance(RTO * 4).await;
+        let head_retry = tcb.collect_timed_out_inflight_packet().0.unwrap();
+        assert_eq!(head_retry.seq, second_seq);
+        assert_eq!(head_retry.retransmit_count, 1);
     }
 
     /// RFC 6298 §5.5: an expiry doubles the timeout, bounded above by the ceiling, so a configured
@@ -1015,7 +1052,7 @@ mod tests {
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
         tokio::time::advance(rto).await;
-        assert_eq!(tcb.collect_timed_out_inflight_packets().0.len(), 1);
+        assert!(tcb.collect_timed_out_inflight_packet().0.is_some());
         assert!(tcb.current_rto >= rto, "the backoff shortened the timeout to {:?}", tcb.current_rto);
     }
 
@@ -1037,13 +1074,13 @@ mod tests {
             previous_wait = wait;
             tokio::time::advance(wait).await;
 
-            let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+            let (packet, exhausted) = tcb.collect_timed_out_inflight_packet();
             if i + 1 < MAX_RETRANSMIT_COUNT {
-                assert_eq!(packets.len(), 1);
-                assert_eq!(packets[0].retransmit_count, i + 1);
+                let packet = packet.expect("expected retransmission");
+                assert_eq!(packet.retransmit_count, i + 1);
                 assert!(!exhausted);
             } else {
-                assert!(packets.is_empty());
+                assert!(packet.is_none());
                 assert!(exhausted);
             }
             assert!(tcb.current_rto > RTO);
@@ -1143,5 +1180,62 @@ mod tests {
         hdr.acknowledgment_number = (isn + 1).0;
         assert_eq!(tcb.check_pkt_type(&hdr, &[]), PacketType::Ack);
         assert_eq!(tcb.check_pkt_type(&hdr, b"ok"), PacketType::NewPacket);
+    }
+
+    #[test]
+    fn test_duplicate_ack_counting_ignores_non_dup_acks_and_fires_once() {
+        let mut tcb = default_tcb(SeqNum(1001));
+        tcb.change_state(TcpState::Established);
+        let first_seq = tcb.get_seq();
+        tcb.add_inflight_packet(vec![1; 100]).unwrap();
+        tcb.add_inflight_packet(vec![2; 100]).unwrap();
+
+        let make_hdr = |seq: u32, ack: u32, window: u16, fin: bool| {
+            let mut hdr = TcpHeader::new(12345, 80, seq, window);
+            hdr.ack = true;
+            hdr.fin = fin;
+            hdr.acknowledgment_number = ack;
+            hdr
+        };
+
+        // Data segments, window updates, FINs, and keepalives do not increment duplicate_ack_count.
+        for _ in 0..5 {
+            let data_hdr = make_hdr(1001, first_seq.0, u16::MAX, false);
+            tcb.update_duplicate_ack_count(&data_hdr, b"data");
+            assert_eq!(tcb.check_pkt_type(&data_hdr, b"data"), PacketType::NewPacket);
+
+            let win_hdr = make_hdr(1001, first_seq.0, 4096, false);
+            tcb.update_duplicate_ack_count(&win_hdr, &[]);
+            assert_eq!(tcb.check_pkt_type(&win_hdr, &[]), PacketType::WindowUpdate);
+
+            let fin_hdr = make_hdr(1001, first_seq.0, u16::MAX, true);
+            tcb.update_duplicate_ack_count(&fin_hdr, &[]);
+
+            let ka_hdr = make_hdr(1000, first_seq.0, u16::MAX, false);
+            tcb.update_duplicate_ack_count(&ka_hdr, &[]);
+            assert_eq!(tcb.check_pkt_type(&ka_hdr, &[]), PacketType::KeepAlive);
+        }
+        assert_eq!(tcb.duplicate_ack_count, 0);
+
+        // Pure duplicate ACKs fire RetransmissionRequest only on the 3rd duplicate ACK.
+        let dup_hdr = make_hdr(1001, first_seq.0, u16::MAX, false);
+        for expected in [
+            PacketType::WindowUpdate,
+            PacketType::WindowUpdate,
+            PacketType::RetransmissionRequest,
+            PacketType::WindowUpdate,
+            PacketType::WindowUpdate,
+        ] {
+            tcb.update_duplicate_ack_count(&dup_hdr, &[]);
+            assert_eq!(tcb.check_pkt_type(&dup_hdr, &[]), expected);
+        }
+        assert_eq!(tcb.duplicate_ack_count, 5);
+
+        // A new ACK resets the duplicate ACK count.
+        let new_ack_hdr = make_hdr(1001, (first_seq + 100).0, u16::MAX, false);
+        tcb.update_duplicate_ack_count(&new_ack_hdr, &[]);
+        tcb.update_inflight_packet_queue(first_seq + 100);
+        tcb.update_last_received_ack(first_seq + 100);
+        assert_eq!(tcb.duplicate_ack_count, 0);
     }
 }
