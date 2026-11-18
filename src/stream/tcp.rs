@@ -1620,7 +1620,7 @@ mod tests {
         {
             let mut tcb = stream.tcb.lock().unwrap();
             let ack = tcb.get_ack();
-            assert!(tcb.add_unordered_packet(ack, vec![0; 8 * 1024]));
+            assert!(tcb.add_unordered_packet(ack, vec![0; 15 * 1024]));
             tcb.acknowledge_unordered_packets();
         }
 
@@ -1636,7 +1636,7 @@ mod tests {
         .unwrap();
         let ack = up_rx.recv().await.expect("the stack emitted no window update");
 
-        assert_eq!(tcp_header_of(&ack).window_size, 8 * 1024);
+        assert_eq!(tcp_header_of(&ack).window_size, 1024);
     }
 
     /// Feeds `stream` a segment advertising `window`, carrying `payload` at `seq`.
