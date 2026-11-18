@@ -1425,7 +1425,51 @@ pub(crate) fn create_raw_packet(
 mod tests {
     use super::*;
     use crate::stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, READ_BUFFER_SIZE, RTO};
+    use rstest::rstest;
     use std::task::Waker;
+    use tokio::io::AsyncWriteExt;
+
+    const PEER: &str = "10.0.0.2:12345";
+    const LOCAL: &str = "10.0.0.1:80";
+    /// The intervals RFC 6298 §5.5 produces from a one-second timeout doubling to the §2.5 ceiling.
+    const BACKOFF: [u64; MAX_RETRANSMIT_COUNT] = [1, 2, 4, 8, 16, 32, 60];
+
+    thread_local! {
+        // Thread-local so unrelated tests and TCP workers cannot consume this hook.
+        static AFTER_STATE_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn run_after_state_snapshot() {
+        let hook = AFTER_STATE_SNAPSHOT.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Arrange for a real TCP worker to finish processing RST after a poll method has
+    /// read the old state. This exercises early read registration and the shutdown
+    /// state recheck after registration. No state is mocked.
+    fn reset_after_state_snapshot(stream: &mut IpStackTcpStream, local_seq: u32) {
+        let sender = stream.stream_sender();
+        let task = stream.task_handle.take().unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        AFTER_STATE_SNAPSHOT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    sender.send(peer_segment(1001, local_seq, RST | ACK, u16::MAX, &[])).unwrap();
+                    runtime.block_on(async {
+                        tokio::time::timeout(Duration::from_secs(1), task)
+                            .await
+                            .expect("RST did not finish the TCP task")
+                            .expect("TCP task panicked")
+                            .expect("TCP task failed");
+                    });
+                })
+                .join()
+                .expect("reset worker panicked");
+            }));
+        });
+    }
 
     /// A waker that records whether it was woken, and the flag it sets.
     fn recording_waker() -> (Arc<std::sync::atomic::AtomicBool>, Waker) {
@@ -1438,25 +1482,6 @@ mod tests {
         let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
         (woken.clone(), Waker::from(Arc::new(Recording(woken))))
     }
-
-    #[test]
-    fn shutdown_completion_is_remembered_before_any_waiter() {
-        let signal = ShutdownSignal::default();
-        signal.complete();
-        signal.complete();
-
-        // Completion stays ready across polls, including polls with a different task waker.
-        for _ in 0..2 {
-            let (_, waker) = recording_waker();
-            let mut cx = Context::from_waker(&waker);
-            assert!(signal.poll_ready(&mut cx).is_ready());
-        }
-    }
-
-    use tokio::io::AsyncWriteExt;
-
-    const PEER: &str = "10.0.0.2:12345";
-    const LOCAL: &str = "10.0.0.1:80";
 
     /// Takes the TCP header of a packet the stack wrote to the device.
     fn tcp_header_of(packet: &NetworkPacket) -> &TcpHeader {
@@ -1516,691 +1541,6 @@ mod tests {
         .await
     }
 
-    async fn shutdown_after_ack(same_task: bool, ack_flags: TcpFlags) {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-        let (write_woken, write_waker) = recording_waker();
-        let mut write_cx = Context::from_waker(&write_waker);
-        assert!(matches!(
-            Pin::new(&mut stream).poll_write(&mut write_cx, b"hello"),
-            Poll::Ready(Ok(5))
-        ));
-        up_rx.recv().await.unwrap();
-
-        let (shutdown_woken, shutdown_waker) = if same_task { (write_woken, write_waker) } else { recording_waker() };
-        let mut shutdown_cx = Context::from_waker(&shutdown_waker);
-        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
-        assert!(up_rx.try_recv().is_err(), "FIN must wait for outstanding data");
-
-        // A partial ACK must not send FIN or wake an independent shutdown waiter.
-        stream.stream_sender().send(peer_ack(1001, local_seq + 2)).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while stream.tcb.lock().unwrap().get_inflight_packets_total_len() != 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(up_rx.try_recv().is_err());
-        if !same_task {
-            assert!(!shutdown_woken.load(Ordering::SeqCst));
-        }
-        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
-        shutdown_woken.store(false, Ordering::SeqCst);
-
-        // The final ACK can also carry peer data; both paths must wake shutdown.
-        let payload: &[u8] = if ack_flags.contains(PSH) { b"reply" } else { b"" };
-        stream
-            .stream_sender()
-            .send(peer_segment(1001, local_seq + 5, ack_flags, u16::MAX, payload))
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !stream.tcb.lock().unwrap().is_inflight_queue_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(shutdown_woken.load(Ordering::SeqCst), "final ACK did not wake shutdown");
-
-        // Waking requests another poll; it must not mark shutdown complete.
-        assert!(!stream.shutdown.completed.load(Ordering::Acquire));
-        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
-        let packets = written(&mut up_rx).await;
-        let fins: Vec<_> = packets.iter().map(tcp_header_of).filter(|header| header.fin).collect();
-        assert_eq!(fins.len(), 1, "shutdown must send exactly one FIN");
-        assert_eq!(fins[0].sequence_number, local_seq + 5);
-    }
-
-    #[tokio::test]
-    async fn final_ack_wakes_shutdown_from_the_writing_task() {
-        for flags in [ACK, ACK | PSH] {
-            shutdown_after_ack(true, flags).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn final_ack_wakes_shutdown_from_a_different_task() {
-        for flags in [ACK, ACK | PSH] {
-            shutdown_after_ack(false, flags).await;
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn handshake_wait_times_out_without_peer_ack() {
-        let (stream, _syn_ack, _up_rx) = open(u16::MAX, &[]).await;
-        let started = tokio::time::Instant::now();
-        assert!(wait_for_handshake(&stream).await.is_err());
-        assert_eq!(started.elapsed(), Duration::from_secs(1));
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::SynReceived);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn handshake_wait_is_woken_by_peer_ack() {
-        let (stream, syn_ack, mut up_rx) = open(u16::MAX, &[]).await;
-        let started = tokio::time::Instant::now();
-        let wait = wait_for_handshake(&stream);
-        tokio::pin!(wait);
-        let (woken, waker) = recording_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(std::future::Future::poll(wait.as_mut(), &mut cx).is_pending());
-        stream
-            .stream_sender()
-            .send(peer_ack(syn_ack.acknowledgment_number, syn_ack.sequence_number.wrapping_add(1)))
-            .unwrap();
-        written(&mut up_rx).await;
-        assert!(woken.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(matches!(std::future::Future::poll(wait.as_mut(), &mut cx), Poll::Ready(Ok(()))));
-        assert_eq!(started.elapsed(), Duration::ZERO);
-    }
-
-    /// A reset wakes blocked operations and ends the session task without waiting for a timer
-    /// or a second packet. Exercise both RST and RST|ACK with no time advancement.
-    #[tokio::test(start_paused = true)]
-    async fn reset_wakes_pending_read_write_and_shutdown() {
-        for flags in [RST, RST | ACK] {
-            let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
-            let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
-            stream.write_all(b"outstanding").await.unwrap();
-            written(&mut up_rx).await;
-            stream.stream_sender().send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
-            written(&mut up_rx).await;
-
-            let (read_woken, read_waker) = recording_waker();
-            let mut read_cx = Context::from_waker(&read_waker);
-            let mut storage = [0; 16];
-            let mut read = tokio::io::ReadBuf::new(&mut storage);
-            assert!(Pin::new(&mut stream).poll_read(&mut read_cx, &mut read).is_pending());
-
-            let (write_woken, write_waker) = recording_waker();
-            let mut write_cx = Context::from_waker(&write_waker);
-            assert!(Pin::new(&mut stream).poll_write(&mut write_cx, b"blocked").is_pending());
-
-            let (shutdown_woken, shutdown_waker) = recording_waker();
-            let mut shutdown_cx = Context::from_waker(&shutdown_waker);
-            assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
-
-            let now = tokio::time::Instant::now();
-            stream.stream_sender().send(peer_segment(1001, local_seq, flags, 0, &[])).unwrap();
-            written(&mut up_rx).await;
-            assert_eq!(tokio::time::Instant::now(), now);
-            assert!(read_woken.load(std::sync::atomic::Ordering::SeqCst), "RST did not wake the reader");
-            assert!(write_woken.load(std::sync::atomic::Ordering::SeqCst), "RST did not wake the writer");
-            assert!(
-                shutdown_woken.load(std::sync::atomic::Ordering::SeqCst),
-                "RST did not wake shutdown"
-            );
-            assert!(
-                stream.task_handle.as_ref().unwrap().is_finished(),
-                "the reset session task is still running"
-            );
-            assert_eq!(destroy_rx.try_recv(), Ok(()), "RST must notify the stack to clean up the session");
-
-            let mut read = tokio::io::ReadBuf::new(&mut storage);
-            assert!(matches!(
-                Pin::new(&mut stream).poll_read(&mut read_cx, &mut read),
-                Poll::Ready(Ok(()))
-            ));
-            assert!(read.filled().is_empty());
-            assert!(matches!(
-                Pin::new(&mut stream).poll_write(&mut write_cx, b"blocked"),
-                Poll::Ready(Err(_))
-            ));
-            assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx), Poll::Ready(Ok(()))));
-        }
-    }
-
-    /// Closing on RST must not discard bytes already accepted for the application.
-    #[tokio::test(start_paused = true)]
-    async fn reset_preserves_queued_data_before_eof() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-        stream
-            .stream_sender()
-            .send(peer_segment(1001, local_seq, ACK | PSH, u16::MAX, b"hello"))
-            .unwrap();
-        written(&mut up_rx).await;
-        stream
-            .stream_sender()
-            .send(peer_segment(1006, local_seq, RST | ACK, u16::MAX, &[]))
-            .unwrap();
-        written(&mut up_rx).await;
-        assert!(stream.task_handle.as_ref().unwrap().is_finished());
-
-        let (_, waker) = recording_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut output = Vec::new();
-        // Small reads exercise both the queued data and the temporary read buffer.
-        loop {
-            let mut storage = [0; 2];
-            let mut read = tokio::io::ReadBuf::new(&mut storage);
-            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut read), Poll::Ready(Ok(()))));
-            if read.filled().is_empty() {
-                break;
-            }
-            output.extend_from_slice(read.filled());
-            assert!(output.len() <= 5);
-        }
-        assert_eq!(output, b"hello");
-    }
-
-    thread_local! {
-        // Thread-local so unrelated tests and TCP workers cannot consume this hook.
-        static AFTER_STATE_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reset_wakes_the_latest_shutdown_waiter() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-        let (old_woken, old_waker) = recording_waker();
-        let mut old_cx = Context::from_waker(&old_waker);
-        assert!(Pin::new(&mut stream).poll_shutdown(&mut old_cx).is_pending());
-        written(&mut up_rx).await;
-
-        let (new_woken, new_waker) = recording_waker();
-        let mut new_cx = Context::from_waker(&new_waker);
-        assert!(Pin::new(&mut stream).poll_shutdown(&mut new_cx).is_pending());
-        stream
-            .stream_sender()
-            .send(peer_segment(1001, local_seq, RST | ACK, u16::MAX, &[]))
-            .unwrap();
-        written(&mut up_rx).await;
-        assert!(new_woken.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(!old_woken.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut new_cx), Poll::Ready(Ok(()))));
-    }
-
-    pub(super) fn run_after_state_snapshot() {
-        let hook = AFTER_STATE_SNAPSHOT.with(|slot| slot.borrow_mut().take());
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-
-    /// Arrange for a real TCP worker to finish processing RST after a poll method has
-    /// read the old state. This exercises early read registration and the shutdown
-    /// state recheck after registration. No state is mocked.
-    fn reset_after_state_snapshot(stream: &mut IpStackTcpStream, local_seq: u32) {
-        let sender = stream.stream_sender();
-        let task = stream.task_handle.take().unwrap();
-        let runtime = tokio::runtime::Handle::current();
-        AFTER_STATE_SNAPSHOT.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move || {
-                std::thread::spawn(move || {
-                    sender.send(peer_segment(1001, local_seq, RST | ACK, u16::MAX, &[])).unwrap();
-                    runtime.block_on(async {
-                        tokio::time::timeout(Duration::from_secs(1), task)
-                            .await
-                            .expect("RST did not finish the TCP task")
-                            .expect("TCP task panicked")
-                            .expect("TCP task failed");
-                    });
-                })
-                .join()
-                .expect("reset worker panicked");
-            }));
-        });
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reset_during_read_registration_does_not_lose_wakeup() {
-        let (mut stream, _up_rx, local_seq) = established().await;
-        reset_after_state_snapshot(&mut stream, local_seq);
-        let (woken, waker) = recording_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut storage = [0; 16];
-        let mut read = tokio::io::ReadBuf::new(&mut storage);
-        let result = Pin::new(&mut stream).poll_read(&mut cx, &mut read);
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
-        if result.is_pending() {
-            assert!(
-                woken.load(std::sync::atomic::Ordering::SeqCst),
-                "read missed RST during registration"
-            );
-            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut read), Poll::Ready(Ok(()))));
-        } else {
-            assert!(matches!(result, Poll::Ready(Ok(()))));
-        }
-        assert!(read.filled().is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reset_during_shutdown_registration_does_not_lose_wakeup() {
-        let (mut stream, _up_rx, local_seq) = established().await;
-        reset_after_state_snapshot(&mut stream, local_seq);
-        let (_, waker) = recording_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
-        assert!(stream.shutdown.poll_ready(&mut cx).is_ready());
-    }
-
-    /// An acknowledgement from the peer, carrying no data.
-    fn peer_ack(seq: u32, ack: u32) -> NetworkPacket {
-        let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
-        create_raw_packet(src, dst, |_, _| usize::MAX, ACK, TTL, seq, ack, u16::MAX, Vec::new(), &[]).unwrap()
-    }
-
-    /// A segment from the peer carrying `payload` at `seq`, with `flags` and a raw `window`.
-    fn peer_segment(seq: u32, ack: u32, flags: TcpFlags, window: u16, payload: &[u8]) -> NetworkPacket {
-        let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
-        create_raw_packet(src, dst, |_, _| usize::MAX, flags, TTL, seq, ack, window, payload.to_vec(), &[]).unwrap()
-    }
-
-    /// Drains what the stack wrote to the device so far.
-    async fn written(up_rx: &mut PacketReceiver) -> Vec<NetworkPacket> {
-        tokio::task::yield_now().await;
-        let mut packets = Vec::new();
-        while let Ok(packet) = up_rx.try_recv() {
-            packets.push(packet);
-        }
-        packets
-    }
-
-    /// The acknowledgment numbers of the pure ACKs the stack wrote (our own FINs excluded).
-    async fn acks(up_rx: &mut PacketReceiver) -> Vec<u32> {
-        let packets = written(up_rx).await;
-        packets
-            .iter()
-            .map(tcp_header_of)
-            .filter(|h| !h.fin)
-            .map(|h| h.acknowledgment_number)
-            .collect()
-    }
-
-    /// RFC 5681 §4.2: an out-of-order segment is answered at once with a duplicate ACK, whether or
-    /// not it carries PSH, and is kept for when the gap fills.
-    #[tokio::test(start_paused = true)]
-    async fn out_of_order_segment_is_answered_with_a_duplicate_ack() {
-        for flags in [ACK, ACK | PSH] {
-            let (mut stream, mut up_rx, local_seq) = established().await;
-
-            // Bytes 1001..1009 are missing; 1009..1013 arrive first.
-            stream
-                .stream_sender()
-                .send(peer_segment(1009, local_seq, flags, u16::MAX, &[3; 4]))
-                .unwrap();
-            let acks: Vec<u32> = written(&mut up_rx)
-                .await
-                .iter()
-                .map(|p| tcp_header_of(p).acknowledgment_number)
-                .collect();
-            assert_eq!(acks, [1001], "flags {flags:?}: the out-of-order segment got no duplicate ACK");
-
-            // The gap fills: the ACK covers both segments and the reader sees them in order.
-            stream
-                .stream_sender()
-                .send(peer_segment(1001, local_seq, flags, u16::MAX, &[1; 8]))
-                .unwrap();
-            let acks: Vec<u32> = written(&mut up_rx)
-                .await
-                .iter()
-                .map(|p| tcp_header_of(p).acknowledgment_number)
-                .collect();
-            assert_eq!(acks.last(), Some(&1013), "flags {flags:?}: the buffered segment was not kept");
-            let mut buf = [0u8; 12];
-            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
-            assert_eq!(buf[..8], [1; 8]);
-            assert_eq!(buf[8..], [3; 4]);
-        }
-    }
-
-    /// RFC 9293 §3.10.7.4: a FIN may ride on the last data segment (Linux does this on
-    /// `shutdown(SHUT_WR)` with data queued). The payload must reach the reader and be
-    /// acknowledged together with the FIN, whether or not PSH is set.
-    #[tokio::test(start_paused = true)]
-    async fn data_segment_carrying_fin_keeps_its_payload() {
-        for flags in [ACK | FIN, ACK | PSH | FIN] {
-            let (mut stream, mut up_rx, local_seq) = established().await;
-
-            stream
-                .stream_sender()
-                .send(peer_segment(1001, local_seq, flags, u16::MAX, b"tail"))
-                .unwrap();
-            // One ACK covering the 4 payload bytes and the FIN together.
-            assert_eq!(
-                acks(&mut up_rx).await,
-                [1006],
-                "flags {flags:?}: payload and FIN must be acknowledged by one ACK"
-            );
-
-            let mut buf = [0u8; 4];
-            let read = tokio::time::timeout(Duration::from_secs(1), tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf)).await;
-            assert!(
-                matches!(read, Ok(Ok(_))),
-                "flags {flags:?}: payload of the FIN segment never reached the reader"
-            );
-            assert_eq!(&buf, b"tail", "flags {flags:?}");
-        }
-    }
-
-    /// RFC 5681 §4.2: a FIN segment arriving after a gap is answered with a duplicate ACK. Its
-    /// payload is not buffered, so filling the gap cannot advance past the unseen FIN; the peer's
-    /// retransmission of the FIN segment then completes the stream.
-    #[tokio::test(start_paused = true)]
-    async fn out_of_order_fin_segment_gets_duplicate_ack() {
-        for flags in [ACK | FIN, ACK | PSH | FIN] {
-            let (mut stream, mut up_rx, local_seq) = established().await;
-
-            stream
-                .stream_sender()
-                .send(peer_segment(1005, local_seq, flags, u16::MAX, b"tail"))
-                .unwrap();
-            assert_eq!(
-                acks(&mut up_rx).await,
-                [1001],
-                "flags {flags:?}: out-of-order FIN segment got no duplicate ACK"
-            );
-
-            // The gap fills; the FIN was not seen yet, so ACK stops at the end of the buffered data.
-            stream
-                .stream_sender()
-                .send(peer_segment(1001, local_seq, ACK, u16::MAX, b"head"))
-                .unwrap();
-            assert_eq!(acks(&mut up_rx).await.last(), Some(&1009), "flags {flags:?}");
-            assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
-
-            // The peer retransmits the FIN segment.
-            stream
-                .stream_sender()
-                .send(peer_segment(1005, local_seq, flags, u16::MAX, b"tail"))
-                .unwrap();
-            assert_eq!(acks(&mut up_rx).await, [1010], "flags {flags:?}");
-
-            let mut buf = [0u8; 8];
-            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
-            assert_eq!(&buf, b"headtail");
-        }
-    }
-
-    /// In FinWait1, a data segment carrying the peer's FIN must deliver its payload and take the
-    /// FIN (moving to TimeWait), not leave the connection waiting in FinWait2.
-    #[tokio::test(start_paused = true)]
-    async fn fin_wait1_data_segment_carrying_fin_is_taken() {
-        for flags in [ACK | FIN, ACK | PSH | FIN] {
-            let (mut stream, mut up_rx, local_seq) = established().await;
-            let (_, waker) = recording_waker();
-            let mut cx = Context::from_waker(&waker);
-            let _ = Pin::new(&mut stream).poll_shutdown(&mut cx);
-            let sent = written(&mut up_rx).await;
-            assert!(sent.iter().any(|p| tcp_header_of(p).fin), "shutdown did not send FIN");
-            assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
-
-            stream
-                .stream_sender()
-                .send(peer_segment(1001, local_seq + 1, flags, u16::MAX, b"tail"))
-                .unwrap();
-            assert_eq!(
-                acks(&mut up_rx).await,
-                [1006],
-                "flags {flags:?}: payload and FIN must be acknowledged by one ACK"
-            );
-            assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::TimeWait, "flags {flags:?}");
-
-            let mut buf = [0u8; 4];
-            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
-            assert_eq!(&buf, b"tail");
-        }
-    }
-
-    /// When the receive window takes only part of a FIN segment, the peer retransmits the whole
-    /// segment from its original sequence number, now behind our ACK. The overlap is trimmed and
-    /// the FIN is taken once the remaining payload fits.
-    #[tokio::test(start_paused = true)]
-    async fn retransmitted_fin_segment_after_partial_accept_is_taken() {
-        let config = TcpConfig {
-            read_buffer_size: 4,
-            ..TcpConfig::default()
-        };
-        let (mut stream, mut up_rx, local_seq) = established_with(None, config).await;
-        let payload = b"tail-data"; // 9 bytes: needs several rounds through a 4-byte window.
-
-        let (_, waker) = recording_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut received = Vec::new();
-        let mut last_ack = 0;
-        for _ in 0..10 {
-            stream
-                .stream_sender()
-                .send(peer_segment(1001, local_seq, ACK | PSH | FIN, u16::MAX, payload))
-                .unwrap();
-            last_ack = written(&mut up_rx)
-                .await
-                .iter()
-                .map(|p| tcp_header_of(p).acknowledgment_number)
-                .max()
-                .unwrap_or(last_ack);
-            // The application drains what has arrived, reopening the window.
-            loop {
-                let mut storage = [0u8; 16];
-                let mut read = tokio::io::ReadBuf::new(&mut storage);
-                match Pin::new(&mut stream).poll_read(&mut cx, &mut read) {
-                    Poll::Ready(Ok(())) if !read.filled().is_empty() => received.extend_from_slice(read.filled()),
-                    _ => break,
-                }
-            }
-            if last_ack == 1011 {
-                break;
-            }
-            assert!(last_ack < 1010, "FIN acknowledged before all payload was accepted: ack {last_ack}");
-        }
-        assert_eq!(last_ack, 1011, "retransmitted FIN segment was never taken, last ack {last_ack}");
-        assert_eq!(received, payload);
-    }
-
-    /// RFC 9293 §3.8.6.1: a sender keeps the data in flight within the peer's window, so the last
-    /// segment before the window fills is cut to the room left rather than sent whole.
-    #[tokio::test]
-    async fn segments_stay_inside_the_peers_window() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-        stream.stream_sender().send(peer_segment(1001, local_seq, ACK, 3000, &[])).unwrap();
-        written(&mut up_rx).await;
-
-        // More than the window: the write parks once the window is full.
-        let _ = tokio::time::timeout(Duration::from_millis(100), stream.write_all(&[7; 4000])).await;
-        let sent: Vec<usize> = written(&mut up_rx)
-            .await
-            .iter()
-            .filter_map(|p| p.payload.as_ref().map(Vec::len))
-            .collect();
-        assert_eq!(sent.iter().sum::<usize>(), 3000, "sent {sent:?} into a 3000-byte window");
-    }
-
-    /// The intervals RFC 6298 §5.5 produces from a one-second timeout doubling to the §2.5 ceiling.
-    const BACKOFF: [u64; MAX_RETRANSMIT_COUNT] = [1, 2, 4, 8, 16, 32, 60];
-
-    /// Advances the clock by `by` and returns what the stack wrote to the device.
-    async fn advance(by: Duration, up_rx: &mut PacketReceiver) -> Option<NetworkPacket> {
-        tokio::time::advance(by).await;
-        tokio::task::yield_now().await;
-        up_rx.try_recv().ok()
-    }
-
-    /// RFC 6298 §5.4: a segment with nothing behind it is retransmitted once its deadline passes,
-    /// with no packet arriving to prompt it.
-    #[tokio::test(start_paused = true)]
-    async fn lost_segment_is_retransmitted_without_an_arrival() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-
-        stream.write_all(b"hello").await.unwrap();
-        let sent = up_rx.recv().await.unwrap();
-        assert_eq!(tcp_header_of(&sent).sequence_number, local_seq);
-
-        let again = advance(Duration::from_secs(BACKOFF[0]), &mut up_rx)
-            .await
-            .expect("no retransmission");
-        assert_eq!(tcp_header_of(&again).sequence_number, local_seq);
-        assert_eq!(again.payload.as_deref(), Some(&b"hello"[..]));
-    }
-
-    /// RFC 9293 §3.8.3: the connection closes when a segment's transmissions reach R2, one timeout
-    /// after the last retransmission and past the 100 seconds SHLD-11 asks for.
-    #[tokio::test(start_paused = true)]
-    async fn unacknowledged_segment_closes_the_connection_at_r2() {
-        let (mut stream, mut up_rx, _) = established().await;
-        let opened = tokio::time::Instant::now();
-        let just_before = |seconds: u64| Duration::from_secs(seconds) - Duration::from_millis(1);
-
-        stream.write_all(b"hello").await.unwrap();
-        up_rx.recv().await.unwrap();
-
-        for seconds in BACKOFF.iter().take(MAX_RETRANSMIT_COUNT - 1) {
-            assert!(advance(just_before(*seconds), &mut up_rx).await.is_none());
-            let packet = advance(Duration::from_millis(1), &mut up_rx).await.expect("no retransmission");
-            assert!(!tcp_header_of(&packet).rst);
-        }
-
-        assert!(advance(just_before(BACKOFF[MAX_RETRANSMIT_COUNT - 1]), &mut up_rx).await.is_none());
-
-        // Leave both halves waiting immediately before the final timeout closes the connection.
-        stream.reset_timeout();
-        let (reader_woken, reader_waker) = recording_waker();
-        let mut read_cx = Context::from_waker(&reader_waker);
-        let mut bytes = [0; 1];
-        let mut read_buf = tokio::io::ReadBuf::new(&mut bytes);
-        assert!(Pin::new(&mut stream).poll_read(&mut read_cx, &mut read_buf).is_pending());
-        // The default window cap is 16 KiB; fill the remainder behind the initial five bytes.
-        let remaining = vec![0; MAX_UNACK as usize - 5];
-        stream.tcb.lock().unwrap().add_inflight_packet(remaining).unwrap();
-        let (writer_woken, writer_waker) = recording_waker();
-        let mut write_cx = Context::from_waker(&writer_waker);
-        assert!(Pin::new(&mut stream).poll_write(&mut write_cx, b"waiting").is_pending());
-
-        let reset = advance(Duration::from_millis(1), &mut up_rx).await.expect("no reset");
-        assert!(tcp_header_of(&reset).rst);
-        assert!(up_rx.try_recv().is_err());
-
-        assert!((tokio::time::Instant::now() - opened).as_secs() > 100);
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
-        assert!(reader_woken.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(writer_woken.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(matches!(
-            Pin::new(&mut stream).poll_read(&mut read_cx, &mut read_buf),
-            Poll::Ready(Ok(()))
-        ));
-        assert!(read_buf.filled().is_empty());
-        assert!(matches!(
-            Pin::new(&mut stream).poll_write(&mut write_cx, b"waiting"),
-            Poll::Ready(Err(err)) if err.kind() == BrokenPipe
-        ));
-    }
-
-    /// RFC 9293 §3.10.7.4: a reset closes the connection and ends its retransmission.
-    #[tokio::test(start_paused = true)]
-    async fn a_reset_stops_retransmission() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-
-        stream.write_all(b"hello").await.unwrap();
-        up_rx.recv().await.unwrap();
-
-        let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
-        let reset = create_raw_packet(src, dst, |_, _| usize::MAX, RST, TTL, 1001, local_seq, u16::MAX, Vec::new(), &[]).unwrap();
-        stream.stream_sender().send(reset).unwrap();
-        tokio::task::yield_now().await;
-
-        assert!(advance(Duration::from_secs(BACKOFF[0]), &mut up_rx).await.is_none());
-    }
-
-    /// RFC 6298 §5.4 retransmits the earliest unacknowledged segment, so every attempt carries the
-    /// sequence number and payload of the first.
-    #[tokio::test(start_paused = true)]
-    async fn retransmissions_carry_the_original_segment() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-
-        stream.write_all(b"hello").await.unwrap();
-        up_rx.recv().await.unwrap();
-
-        for seconds in BACKOFF.iter().take(4) {
-            let packet = advance(Duration::from_secs(*seconds), &mut up_rx).await.expect("no retransmission");
-            assert_eq!(tcp_header_of(&packet).sequence_number, local_seq);
-            assert_eq!(packet.payload.as_deref(), Some(&b"hello"[..]));
-        }
-    }
-
-    /// An acknowledgement retires the segment, so no deadline remains, the connection stays open,
-    /// and a further segment flows.
-    #[tokio::test(start_paused = true)]
-    async fn an_acknowledgement_stops_retransmission() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-
-        stream.write_all(b"hello").await.unwrap();
-        up_rx.recv().await.unwrap();
-
-        for seconds in BACKOFF.iter().take(5) {
-            advance(Duration::from_secs(*seconds), &mut up_rx).await.expect("no retransmission");
-        }
-
-        stream.stream_sender().send(peer_ack(1001, local_seq + 5)).unwrap();
-        tokio::task::yield_now().await;
-        assert!(stream.tcb.lock().unwrap().get_retransmission_deadline().is_none());
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
-
-        stream.write_all(b"more").await.unwrap();
-        let sent = up_rx.recv().await.unwrap();
-        assert_eq!(sent.payload.as_deref(), Some(&b"more"[..]));
-    }
-
-    #[tokio::test]
-    async fn extract_reserves_before_consuming() {
-        let (up_tx, _up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
-        let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let read_notify = Arc::new(AtomicWaker::new());
-        let nt = NetworkTuple::new("1.1.1.1:1".parse().unwrap(), "2.2.2.2:2".parse().unwrap(), true);
-
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
-        tcb.change_state(TcpState::Established);
-        tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]);
-        tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]);
-        tcb.acknowledge_unordered_packets();
-
-        // first extract fills the single channel slot and advances ack over the first chunk
-        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
-        assert_eq!(tcb.get_ack(), SeqNum(2000));
-
-        // channel is full: extract advances ack over the tail and holds it for the reader
-        tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
-        tcb.acknowledge_unordered_packets();
-        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
-        assert_eq!(tcb.get_ack(), SeqNum(2500));
-        assert_eq!(tcb.get_available_read_buffer_size(), READ_BUFFER_SIZE - 500);
-
-        // draining the reader frees a slot, and the next extract flushes the tail
-        let first = data_rx.recv().await.unwrap();
-        assert_eq!(first.len(), 1000);
-        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
-        assert_eq!(tcb.get_ack(), SeqNum(2500));
-        assert_eq!(tcb.get_available_read_buffer_size(), READ_BUFFER_SIZE);
-    }
-
     /// Opens a connection with a SYN advertising `window` and `syn_options`, returning the stream
     /// and the SYN-ACK the stack emitted.
     async fn open(window: u16, syn_options: &[TcpOptionElement]) -> (IpStackTcpStream, TcpHeader, PacketReceiver) {
@@ -2238,11 +1578,117 @@ mod tests {
         })
     }
 
-    /// A peer offering a shift of 7 gets this stack's shift of 0 back and has its windows honoured
-    /// shifted by 7.
+    /// An acknowledgement from the peer, carrying no data.
+    fn peer_ack(seq: u32, ack: u32) -> NetworkPacket {
+        let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        create_raw_packet(src, dst, |_, _| usize::MAX, ACK, TTL, seq, ack, u16::MAX, Vec::new(), &[]).unwrap()
+    }
+
+    /// A segment from the peer carrying `payload` at `seq`, with `flags` and a raw `window`.
+    fn peer_segment(seq: u32, ack: u32, flags: TcpFlags, window: u16, payload: &[u8]) -> NetworkPacket {
+        let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        create_raw_packet(src, dst, |_, _| usize::MAX, flags, TTL, seq, ack, window, payload.to_vec(), &[]).unwrap()
+    }
+
+    /// Drains what the stack wrote to the device so far.
+    async fn written(up_rx: &mut PacketReceiver) -> Vec<NetworkPacket> {
+        tokio::task::yield_now().await;
+        let mut packets = Vec::new();
+        while let Ok(packet) = up_rx.try_recv() {
+            packets.push(packet);
+        }
+        packets
+    }
+
+    /// The acknowledgment numbers of the pure ACKs the stack wrote (our own FINs excluded).
+    async fn acks(up_rx: &mut PacketReceiver) -> Vec<u32> {
+        let packets = written(up_rx).await;
+        packets
+            .iter()
+            .map(tcp_header_of)
+            .filter(|h| !h.fin)
+            .map(|h| h.acknowledgment_number)
+            .collect()
+    }
+
+    /// Advances the clock by `by` and returns what the stack wrote to the device.
+    async fn advance(by: Duration, up_rx: &mut PacketReceiver) -> Option<NetworkPacket> {
+        tokio::time::advance(by).await;
+        tokio::task::yield_now().await;
+        up_rx.try_recv().ok()
+    }
+
+    // --- Handshake & initial write tests ---
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_wait_times_out_without_peer_ack() {
+        let (stream, _syn_ack, _up_rx) = open(u16::MAX, &[]).await;
+        let started = tokio::time::Instant::now();
+        assert!(wait_for_handshake(&stream).await.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::SynReceived);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_wait_is_woken_by_peer_ack() {
+        let (stream, syn_ack, mut up_rx) = open(u16::MAX, &[]).await;
+        let started = tokio::time::Instant::now();
+        let wait = wait_for_handshake(&stream);
+        tokio::pin!(wait);
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(std::future::Future::poll(wait.as_mut(), &mut cx).is_pending());
+        stream
+            .stream_sender()
+            .send(peer_ack(syn_ack.acknowledgment_number, syn_ack.sequence_number.wrapping_add(1)))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert!(woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(std::future::Future::poll(wait.as_mut(), &mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// Data written before the task that answers the SYN has run must not leave ahead of the
+    /// SYN-ACK.
     #[tokio::test]
-    async fn syn_with_window_scale_is_answered_and_honoured() {
-        let (stream, syn_ack, mut up_rx) = open(4000, &[TcpOptionElement::WindowScale(7)]).await;
+    async fn write_before_the_syn_ack_waits_for_it() {
+        let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
+        syn.syn = true;
+        let mut stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"early").is_pending(),
+            "a write was accepted before the SYN-ACK went out"
+        );
+        let packets = written(&mut up_rx).await;
+        assert!(
+            woken.load(std::sync::atomic::Ordering::SeqCst),
+            "the SYN-ACK did not wake the writer"
+        );
+        assert!(
+            matches!(packets.as_slice(), [packet] if tcp_header_of(packet).syn),
+            "the SYN-ACK is not the first packet"
+        );
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"early"), Poll::Ready(Ok(5))));
+        let packets = written(&mut up_rx).await;
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].payload.as_deref(), Some(&b"early"[..]));
+    }
+
+    // --- Window scaling, MSS & send-window flow-control tests ---
+
+    /// A peer offering a window scale gets this stack's shift of 0 back and has its windows
+    /// honoured shifted by the offered count, clamped to RFC 7323 §2.3's maximum of 14.
+    #[rstest]
+    #[case::valid(7, 7)]
+    #[case::clamped(20, 14)]
+    #[tokio::test]
+    async fn syn_with_window_scale_is_answered_and_honoured(#[case] offered_shift: u8, #[case] applied_shift: u8) {
+        let (stream, syn_ack, mut up_rx) = open(4000, &[TcpOptionElement::WindowScale(offered_shift)]).await;
         assert_eq!(
             window_scale_of(&syn_ack),
             Some(0),
@@ -2255,66 +1701,32 @@ mod tests {
         up_rx.recv().await.unwrap();
         up_rx.recv().await.unwrap();
 
-        assert_eq!(stream.tcb.lock().unwrap().get_send_window(), 40_000 << 7);
-    }
-
-    /// A peer offering a shift above the RFC 7323 §2.3 maximum has its windows honoured shifted by 14.
-    #[tokio::test]
-    async fn syn_with_a_malformed_window_scale_is_clamped() {
-        let (stream, syn_ack, mut up_rx) = open(4000, &[TcpOptionElement::WindowScale(20)]).await;
-
-        let peer_seq = SeqNum(syn_ack.acknowledgment_number);
-        feed(&stream, &syn_ack, peer_seq, 40_000, &[1; 4]);
-        feed(&stream, &syn_ack, peer_seq + 4, 40_000, &[2; 4]);
-        up_rx.recv().await.unwrap();
-        up_rx.recv().await.unwrap();
-
         let tcb = stream.tcb.lock().unwrap();
         assert_eq!(tcb.get_state(), TcpState::Established);
-        assert_eq!(tcb.get_send_window(), 40_000 << 14);
-    }
-
-    #[tokio::test]
-    async fn pending_reader_wakes_for_each_new_segment() {
-        let (mut stream, syn_ack, mut up_rx) = open(4000, &[]).await;
-        let peer_seq = SeqNum(syn_ack.acknowledgment_number);
-        feed(&stream, &syn_ack, peer_seq, 4000, &[]);
-        tokio::task::yield_now().await;
-
-        for offset in 0..2 {
-            let (woken, waker) = recording_waker();
-            let mut cx = Context::from_waker(&waker);
-            let mut bytes = [0; 4];
-            let mut buf = tokio::io::ReadBuf::new(&mut bytes);
-            assert!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf).is_pending());
-
-            feed(&stream, &syn_ack, peer_seq + offset * 4, 4000, b"data");
-            up_rx.recv().await.unwrap();
-            assert!(woken.load(std::sync::atomic::Ordering::SeqCst));
-            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf), Poll::Ready(Ok(()))));
-            assert_eq!(buf.filled(), b"data");
-        }
+        assert_eq!(tcb.get_send_window(), 40_000 << applied_shift);
     }
 
     /// RFC 9293 §3.7.1: a segment never carries more payload than the MSS the peer announced in its
     /// SYN, and an announced MSS below 88 (Linux's TCP_MIN_MSS) is read as 88.
+    #[rstest]
+    #[case(600, 600)]
+    #[case(100, 100)]
+    #[case::clamped_to_min_mss(40, 88)]
     #[tokio::test]
-    async fn segments_stay_within_the_peers_mss() {
-        for (announced, expected) in [(600, 600), (100, 100), (40, 88)] {
-            let (mut stream, syn_ack, mut up_rx) = open(u16::MAX, &[TcpOptionElement::MaximumSegmentSize(announced)]).await;
-            let peer_seq = SeqNum(syn_ack.acknowledgment_number);
-            feed(&stream, &syn_ack, peer_seq, u16::MAX, &[1; 4]);
-            up_rx.recv().await.unwrap();
+    async fn segments_stay_within_the_peers_mss(#[case] announced: u16, #[case] expected: usize) {
+        let (mut stream, syn_ack, mut up_rx) = open(u16::MAX, &[TcpOptionElement::MaximumSegmentSize(announced)]).await;
+        let peer_seq = SeqNum(syn_ack.acknowledgment_number);
+        feed(&stream, &syn_ack, peer_seq, u16::MAX, &[1; 4]);
+        up_rx.recv().await.unwrap();
 
-            let (_, waker) = recording_waker();
-            let mut cx = Context::from_waker(&waker);
-            let written = match Pin::new(&mut stream).poll_write(&mut cx, &[7; 1460]) {
-                Poll::Ready(Ok(n)) => n,
-                other => panic!("the write did not complete: {other:?}"),
-            };
-            assert_eq!(written, expected, "peer MSS {announced}: wrong write size");
-            assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(expected));
-        }
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let written = match Pin::new(&mut stream).poll_write(&mut cx, &[7; 1460]) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("the write did not complete: {other:?}"),
+        };
+        assert_eq!(written, expected, "peer MSS {announced}: wrong write size");
+        assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(expected));
     }
 
     /// A closed peer window holds the writer, and the segment that reopens it wakes the writer, both
@@ -2377,40 +1789,886 @@ mod tests {
         assert!(Pin::new(&mut stream).poll_write(&mut cx, &chunk).is_pending());
     }
 
-    /// Data written before the task that answers the SYN has run must not leave ahead of the
-    /// SYN-ACK.
+    /// RFC 9293 §3.8.6.1: a sender keeps the data in flight within the peer's window, so the last
+    /// segment before the window fills is cut to the room left rather than sent whole.
     #[tokio::test]
-    async fn write_before_the_syn_ack_waits_for_it() {
-        let (peer, local) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
-        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
-        let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
-        syn.syn = true;
-        let mut stream = IpStackTcpStream::new(peer, local, syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+    async fn segments_stay_inside_the_peers_window() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        stream.stream_sender().send(peer_segment(1001, local_seq, ACK, 3000, &[])).unwrap();
+        written(&mut up_rx).await;
+
+        // More than the window: the write parks once the window is full.
+        let _ = tokio::time::timeout(Duration::from_millis(100), stream.write_all(&[7; 4000])).await;
+        let sent: Vec<usize> = written(&mut up_rx)
+            .await
+            .iter()
+            .filter_map(|p| p.payload.as_ref().map(Vec::len))
+            .collect();
+        assert_eq!(sent.iter().sum::<usize>(), 3000, "sent {sent:?} into a 3000-byte window");
+    }
+
+    // --- Receive path, out-of-order & FIN-with-data tests ---
+
+    #[tokio::test]
+    async fn pending_reader_wakes_for_each_new_segment() {
+        let (mut stream, syn_ack, mut up_rx) = open(4000, &[]).await;
+        let peer_seq = SeqNum(syn_ack.acknowledgment_number);
+        feed(&stream, &syn_ack, peer_seq, 4000, &[]);
+        tokio::task::yield_now().await;
+
+        for offset in 0..2 {
+            let (woken, waker) = recording_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut bytes = [0; 4];
+            let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+            assert!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf).is_pending());
+
+            feed(&stream, &syn_ack, peer_seq + offset * 4, 4000, b"data");
+            up_rx.recv().await.unwrap();
+            assert!(woken.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut buf), Poll::Ready(Ok(()))));
+            assert_eq!(buf.filled(), b"data");
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_reserves_before_consuming() {
+        let (up_tx, _up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let read_notify = Arc::new(AtomicWaker::new());
+        let nt = NetworkTuple::new("1.1.1.1:1".parse().unwrap(), "2.2.2.2:2".parse().unwrap(), true);
+
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+        tcb.change_state(TcpState::Established);
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]);
+        tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]);
+        tcb.acknowledge_unordered_packets();
+
+        // first extract fills the single channel slot and advances ack over the first chunk
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_ack(), SeqNum(2000));
+
+        // channel is full: extract advances ack over the tail and holds it for the reader
+        tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]);
+        tcb.acknowledge_unordered_packets();
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_ack(), SeqNum(2500));
+        assert_eq!(tcb.get_available_read_buffer_size(), READ_BUFFER_SIZE - 500);
+
+        // draining the reader frees a slot, and the next extract flushes the tail
+        let first = data_rx.recv().await.unwrap();
+        assert_eq!(first.len(), 1000);
+        extract_data_n_write_upstream(&up_tx, &mut tcb, nt, &data_tx, &read_notify).unwrap();
+        assert_eq!(tcb.get_ack(), SeqNum(2500));
+        assert_eq!(tcb.get_available_read_buffer_size(), READ_BUFFER_SIZE);
+    }
+
+    /// A multi-segment upload reaches `read_to_end` whole, whether the peer's FIN arrives on its
+    /// own segment afterward or rides on the last data segment.
+    #[rstest]
+    #[case::separate_fin(false)]
+    #[case::fin_on_last_segment(true)]
+    #[tokio::test(start_paused = true)]
+    async fn upload_arrives_whole(#[case] fin_with_data: bool) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let data: Vec<u8> = (0..4321).map(|i| (i % 251) as u8).collect();
+        let chunks: Vec<&[u8]> = data.chunks(1000).collect();
+        let mut seq = 1001;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_last = i + 1 == chunks.len();
+            let flags = if fin_with_data && is_last { ACK | PSH | FIN } else { ACK | PSH };
+            stream
+                .stream_sender()
+                .send(peer_segment(seq, local_seq, flags, u16::MAX, chunk))
+                .unwrap();
+            seq += chunk.len() as u32;
+        }
+        if !fin_with_data {
+            stream
+                .stream_sender()
+                .send(peer_segment(seq, local_seq, ACK | FIN, u16::MAX, &[]))
+                .unwrap();
+        }
+        let mut received = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut received).await.unwrap();
+        assert_eq!(received, data);
+        assert_eq!(acks(&mut up_rx).await.last(), Some(&(seq + 1)));
+    }
+
+    /// RFC 5681 §4.2: an out-of-order segment is answered at once with a duplicate ACK, whether or
+    /// not it carries PSH, and is kept for when the gap fills.
+    #[rstest]
+    #[case::ack(ACK)]
+    #[case::ack_psh(ACK | PSH)]
+    #[tokio::test(start_paused = true)]
+    async fn out_of_order_segment_is_answered_with_a_duplicate_ack(#[case] flags: TcpFlags) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        // Bytes 1001..1009 are missing; 1009..1013 arrive first.
+        stream
+            .stream_sender()
+            .send(peer_segment(1009, local_seq, flags, u16::MAX, &[3; 4]))
+            .unwrap();
+        let acks: Vec<u32> = written(&mut up_rx)
+            .await
+            .iter()
+            .map(|p| tcp_header_of(p).acknowledgment_number)
+            .collect();
+        assert_eq!(acks, [1001], "flags {flags:?}: the out-of-order segment got no duplicate ACK");
+
+        // The gap fills: the ACK covers both segments and the reader sees them in order.
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, flags, u16::MAX, &[1; 8]))
+            .unwrap();
+        let acks: Vec<u32> = written(&mut up_rx)
+            .await
+            .iter()
+            .map(|p| tcp_header_of(p).acknowledgment_number)
+            .collect();
+        assert_eq!(acks.last(), Some(&1013), "flags {flags:?}: the buffered segment was not kept");
+        let mut buf = [0u8; 12];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(buf[..8], [1; 8]);
+        assert_eq!(buf[8..], [3; 4]);
+    }
+
+    /// RFC 9293 §3.10.7.4: a FIN may ride on the last data segment (Linux does this on
+    /// `shutdown(SHUT_WR)` with data queued). The payload must reach the reader and be
+    /// acknowledged together with the FIN, whether or not PSH is set.
+    #[rstest]
+    #[case::ack_fin(ACK | FIN)]
+    #[case::ack_psh_fin(ACK | PSH | FIN)]
+    #[tokio::test(start_paused = true)]
+    async fn data_segment_carrying_fin_keeps_its_payload(#[case] flags: TcpFlags) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, flags, u16::MAX, b"tail"))
+            .unwrap();
+        // One ACK covering the 4 payload bytes and the FIN together.
+        assert_eq!(
+            acks(&mut up_rx).await,
+            [1006],
+            "flags {flags:?}: payload and FIN must be acknowledged by one ACK"
+        );
+
+        let mut buf = [0u8; 4];
+        let read = tokio::time::timeout(Duration::from_secs(1), tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(_))),
+            "flags {flags:?}: payload of the FIN segment never reached the reader"
+        );
+        assert_eq!(&buf, b"tail", "flags {flags:?}");
+    }
+
+    /// RFC 5681 §4.2: a FIN segment arriving after a gap is answered with a duplicate ACK. Its
+    /// payload is not buffered, so filling the gap cannot advance past the unseen FIN; the peer's
+    /// retransmission of the FIN segment then completes the stream.
+    #[rstest]
+    #[case::ack_fin(ACK | FIN)]
+    #[case::ack_psh_fin(ACK | PSH | FIN)]
+    #[tokio::test(start_paused = true)]
+    async fn out_of_order_fin_segment_gets_duplicate_ack(#[case] flags: TcpFlags) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream
+            .stream_sender()
+            .send(peer_segment(1005, local_seq, flags, u16::MAX, b"tail"))
+            .unwrap();
+        assert_eq!(
+            acks(&mut up_rx).await,
+            [1001],
+            "flags {flags:?}: out-of-order FIN segment got no duplicate ACK"
+        );
+
+        // The gap fills; the FIN was not seen yet, so ACK stops at the end of the buffered data.
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, ACK, u16::MAX, b"head"))
+            .unwrap();
+        assert_eq!(acks(&mut up_rx).await.last(), Some(&1009), "flags {flags:?}");
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+
+        // The peer retransmits the FIN segment.
+        stream
+            .stream_sender()
+            .send(peer_segment(1005, local_seq, flags, u16::MAX, b"tail"))
+            .unwrap();
+        assert_eq!(acks(&mut up_rx).await, [1010], "flags {flags:?}");
+
+        let mut buf = [0u8; 8];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"headtail");
+    }
+
+    /// When the receive window takes only part of a FIN segment, the peer retransmits the whole
+    /// segment from its original sequence number, now behind our ACK. The overlap is trimmed and
+    /// the FIN is taken once the remaining payload fits.
+    #[tokio::test(start_paused = true)]
+    async fn retransmitted_fin_segment_after_partial_accept_is_taken() {
+        let config = TcpConfig {
+            read_buffer_size: 4,
+            ..TcpConfig::default()
+        };
+        let (mut stream, mut up_rx, local_seq) = established_with(None, config).await;
+        let payload = b"tail-data"; // 9 bytes: needs several rounds through a 4-byte window.
+
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut received = Vec::new();
+        let mut last_ack = 0;
+        for _ in 0..10 {
+            stream
+                .stream_sender()
+                .send(peer_segment(1001, local_seq, ACK | PSH | FIN, u16::MAX, payload))
+                .unwrap();
+            last_ack = written(&mut up_rx)
+                .await
+                .iter()
+                .map(|p| tcp_header_of(p).acknowledgment_number)
+                .max()
+                .unwrap_or(last_ack);
+            // The application drains what has arrived, reopening the window.
+            loop {
+                let mut storage = [0u8; 16];
+                let mut read = tokio::io::ReadBuf::new(&mut storage);
+                match Pin::new(&mut stream).poll_read(&mut cx, &mut read) {
+                    Poll::Ready(Ok(())) if !read.filled().is_empty() => received.extend_from_slice(read.filled()),
+                    _ => break,
+                }
+            }
+            if last_ack == 1011 {
+                break;
+            }
+            assert!(last_ack < 1010, "FIN acknowledged before all payload was accepted: ack {last_ack}");
+        }
+        assert_eq!(last_ack, 1011, "retransmitted FIN segment was never taken, last ack {last_ack}");
+        assert_eq!(received, payload);
+    }
+
+    // --- Retransmission & R2 backoff tests ---
+
+    /// RFC 6298 §5.4: a segment with nothing behind it is retransmitted once its deadline passes,
+    /// with no packet arriving to prompt it.
+    #[tokio::test(start_paused = true)]
+    async fn lost_segment_is_retransmitted_without_an_arrival() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream.write_all(b"hello").await.unwrap();
+        let sent = up_rx.recv().await.unwrap();
+        assert_eq!(tcp_header_of(&sent).sequence_number, local_seq);
+
+        let again = advance(Duration::from_secs(BACKOFF[0]), &mut up_rx)
+            .await
+            .expect("no retransmission");
+        assert_eq!(tcp_header_of(&again).sequence_number, local_seq);
+        assert_eq!(again.payload.as_deref(), Some(&b"hello"[..]));
+    }
+
+    /// RFC 6298 §5.4 retransmits the earliest unacknowledged segment, so every attempt carries the
+    /// sequence number and payload of the first.
+    #[tokio::test(start_paused = true)]
+    async fn retransmissions_carry_the_original_segment() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream.write_all(b"hello").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        for seconds in BACKOFF.iter().take(4) {
+            let packet = advance(Duration::from_secs(*seconds), &mut up_rx).await.expect("no retransmission");
+            assert_eq!(tcp_header_of(&packet).sequence_number, local_seq);
+            assert_eq!(packet.payload.as_deref(), Some(&b"hello"[..]));
+        }
+    }
+
+    /// An acknowledgement retires the segment, so no deadline remains, the connection stays open,
+    /// and a further segment flows.
+    #[tokio::test(start_paused = true)]
+    async fn an_acknowledgement_stops_retransmission() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream.write_all(b"hello").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        for seconds in BACKOFF.iter().take(5) {
+            advance(Duration::from_secs(*seconds), &mut up_rx).await.expect("no retransmission");
+        }
+
+        stream.stream_sender().send(peer_ack(1001, local_seq + 5)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(stream.tcb.lock().unwrap().get_retransmission_deadline().is_none());
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+
+        stream.write_all(b"more").await.unwrap();
+        let sent = up_rx.recv().await.unwrap();
+        assert_eq!(sent.payload.as_deref(), Some(&b"more"[..]));
+    }
+
+    /// RFC 9293 §3.8.3: the connection closes when a segment's transmissions reach R2, one timeout
+    /// after the last retransmission and past the 100 seconds SHLD-11 asks for.
+    #[tokio::test(start_paused = true)]
+    async fn unacknowledged_segment_closes_the_connection_at_r2() {
+        let (mut stream, mut up_rx, _) = established().await;
+        let opened = tokio::time::Instant::now();
+        let just_before = |seconds: u64| Duration::from_secs(seconds) - Duration::from_millis(1);
+
+        stream.write_all(b"hello").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        for seconds in BACKOFF.iter().take(MAX_RETRANSMIT_COUNT - 1) {
+            assert!(advance(just_before(*seconds), &mut up_rx).await.is_none());
+            let packet = advance(Duration::from_millis(1), &mut up_rx).await.expect("no retransmission");
+            assert!(!tcp_header_of(&packet).rst);
+        }
+
+        assert!(advance(just_before(BACKOFF[MAX_RETRANSMIT_COUNT - 1]), &mut up_rx).await.is_none());
+
+        // Leave both halves waiting immediately before the final timeout closes the connection.
+        stream.reset_timeout();
+        let (reader_woken, reader_waker) = recording_waker();
+        let mut read_cx = Context::from_waker(&reader_waker);
+        let mut bytes = [0; 1];
+        let mut read_buf = tokio::io::ReadBuf::new(&mut bytes);
+        assert!(Pin::new(&mut stream).poll_read(&mut read_cx, &mut read_buf).is_pending());
+        // The default window cap is 16 KiB; fill the remainder behind the initial five bytes.
+        let remaining = vec![0; MAX_UNACK as usize - 5];
+        stream.tcb.lock().unwrap().add_inflight_packet(remaining).unwrap();
+        let (writer_woken, writer_waker) = recording_waker();
+        let mut write_cx = Context::from_waker(&writer_waker);
+        assert!(Pin::new(&mut stream).poll_write(&mut write_cx, b"waiting").is_pending());
+
+        let reset = advance(Duration::from_millis(1), &mut up_rx).await.expect("no reset");
+        assert!(tcp_header_of(&reset).rst);
+        assert!(up_rx.try_recv().is_err());
+
+        assert!((tokio::time::Instant::now() - opened).as_secs() > 100);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert!(reader_woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(writer_woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut read_cx, &mut read_buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(read_buf.filled().is_empty());
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut write_cx, b"waiting"),
+            Poll::Ready(Err(err)) if err.kind() == BrokenPipe
+        ));
+    }
+
+    // --- Reset (RST) handling tests ---
+
+    /// A reset wakes blocked operations and ends the session task without waiting for a timer
+    /// or a second packet. Exercise both RST and RST|ACK with no time advancement.
+    #[rstest]
+    #[case::rst(RST)]
+    #[case::rst_ack(RST | ACK)]
+    #[tokio::test(start_paused = true)]
+    async fn reset_wakes_pending_read_write_and_shutdown(#[case] flags: TcpFlags) {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+        stream.write_all(b"outstanding").await.unwrap();
+        written(&mut up_rx).await;
+        stream.stream_sender().send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+        written(&mut up_rx).await;
+
+        let (read_woken, read_waker) = recording_waker();
+        let mut read_cx = Context::from_waker(&read_waker);
+        let mut storage = [0; 16];
+        let mut read = tokio::io::ReadBuf::new(&mut storage);
+        assert!(Pin::new(&mut stream).poll_read(&mut read_cx, &mut read).is_pending());
+
+        let (write_woken, write_waker) = recording_waker();
+        let mut write_cx = Context::from_waker(&write_waker);
+        assert!(Pin::new(&mut stream).poll_write(&mut write_cx, b"blocked").is_pending());
+
+        let (shutdown_woken, shutdown_waker) = recording_waker();
+        let mut shutdown_cx = Context::from_waker(&shutdown_waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
+
+        let now = tokio::time::Instant::now();
+        stream.stream_sender().send(peer_segment(1001, local_seq, flags, 0, &[])).unwrap();
+        written(&mut up_rx).await;
+        assert_eq!(tokio::time::Instant::now(), now);
+        assert!(read_woken.load(std::sync::atomic::Ordering::SeqCst), "RST did not wake the reader");
+        assert!(write_woken.load(std::sync::atomic::Ordering::SeqCst), "RST did not wake the writer");
+        assert!(
+            shutdown_woken.load(std::sync::atomic::Ordering::SeqCst),
+            "RST did not wake shutdown"
+        );
+        assert!(
+            stream.task_handle.as_ref().unwrap().is_finished(),
+            "the reset session task is still running"
+        );
+        assert_eq!(destroy_rx.try_recv(), Ok(()), "RST must notify the stack to clean up the session");
+
+        let mut read = tokio::io::ReadBuf::new(&mut storage);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut read_cx, &mut read),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(read.filled().is_empty());
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut write_cx, b"blocked"),
+            Poll::Ready(Err(_))
+        ));
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx), Poll::Ready(Ok(()))));
+    }
+
+    /// Closing on RST must not discard bytes already accepted for the application.
+    #[tokio::test(start_paused = true)]
+    async fn reset_preserves_queued_data_before_eof() {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, ACK | PSH, u16::MAX, b"hello"))
+            .unwrap();
+        written(&mut up_rx).await;
+        stream
+            .stream_sender()
+            .send(peer_segment(1006, local_seq, RST | ACK, u16::MAX, &[]))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert!(stream.task_handle.as_ref().unwrap().is_finished());
+
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut output = Vec::new();
+        // Small reads exercise both the queued data and the temporary read buffer.
+        loop {
+            let mut storage = [0; 2];
+            let mut read = tokio::io::ReadBuf::new(&mut storage);
+            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut read), Poll::Ready(Ok(()))));
+            if read.filled().is_empty() {
+                break;
+            }
+            output.extend_from_slice(read.filled());
+            assert!(output.len() <= 5);
+        }
+        assert_eq!(output, b"hello");
+        assert!(stream.write_all(b"late").await.is_err());
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reset_wakes_the_latest_shutdown_waiter() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let (old_woken, old_waker) = recording_waker();
+        let mut old_cx = Context::from_waker(&old_waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut old_cx).is_pending());
+        written(&mut up_rx).await;
+
+        let (new_woken, new_waker) = recording_waker();
+        let mut new_cx = Context::from_waker(&new_waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut new_cx).is_pending());
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, RST | ACK, u16::MAX, &[]))
+            .unwrap();
+        written(&mut up_rx).await;
+        assert!(new_woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!old_woken.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut new_cx), Poll::Ready(Ok(()))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_during_read_registration_does_not_lose_wakeup() {
+        let (mut stream, _up_rx, local_seq) = established().await;
+        reset_after_state_snapshot(&mut stream, local_seq);
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut storage = [0; 16];
+        let mut read = tokio::io::ReadBuf::new(&mut storage);
+        let result = Pin::new(&mut stream).poll_read(&mut cx, &mut read);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        if result.is_pending() {
+            assert!(
+                woken.load(std::sync::atomic::Ordering::SeqCst),
+                "read missed RST during registration"
+            );
+            assert!(matches!(Pin::new(&mut stream).poll_read(&mut cx, &mut read), Poll::Ready(Ok(()))));
+        } else {
+            assert!(matches!(result, Poll::Ready(Ok(()))));
+        }
+        assert!(read.filled().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_during_shutdown_registration_does_not_lose_wakeup() {
+        let (mut stream, _up_rx, local_seq) = established().await;
+        reset_after_state_snapshot(&mut stream, local_seq);
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert!(stream.shutdown.poll_ready(&mut cx).is_ready());
+    }
+
+    /// RFC 9293 §3.10.7.4: a reset closes the connection and ends its retransmission.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_stops_retransmission() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream.write_all(b"hello").await.unwrap();
+        up_rx.recv().await.unwrap();
+
+        let (src, dst) = (PEER.parse().unwrap(), LOCAL.parse().unwrap());
+        let reset = create_raw_packet(src, dst, |_, _| usize::MAX, RST, TTL, 1001, local_seq, u16::MAX, Vec::new(), &[]).unwrap();
+        stream.stream_sender().send(reset).unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(advance(Duration::from_secs(BACKOFF[0]), &mut up_rx).await.is_none());
+    }
+
+    // --- Shutdown, half-close & close state-machine tests ---
+
+    #[test]
+    fn shutdown_completion_is_remembered_before_any_waiter() {
+        let signal = ShutdownSignal::default();
+        signal.complete();
+        signal.complete();
+
+        // Completion stays ready across polls, including polls with a different task waker.
+        for _ in 0..2 {
+            let (_, waker) = recording_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(signal.poll_ready(&mut cx).is_ready());
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn final_ack_wakes_shutdown(#[values(true, false)] same_task: bool, #[values(ACK, ACK | PSH)] ack_flags: TcpFlags) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let (write_woken, write_waker) = recording_waker();
+        let mut write_cx = Context::from_waker(&write_waker);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut write_cx, b"hello"),
+            Poll::Ready(Ok(5))
+        ));
+        up_rx.recv().await.unwrap();
+
+        let (shutdown_woken, shutdown_waker) = if same_task { (write_woken, write_waker) } else { recording_waker() };
+        let mut shutdown_cx = Context::from_waker(&shutdown_waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
+        assert!(up_rx.try_recv().is_err(), "FIN must wait for outstanding data");
+
+        // A partial ACK must not send FIN or wake an independent shutdown waiter.
+        stream.stream_sender().send(peer_ack(1001, local_seq + 2)).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stream.tcb.lock().unwrap().get_inflight_packets_total_len() != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(up_rx.try_recv().is_err());
+        if !same_task {
+            assert!(!shutdown_woken.load(Ordering::SeqCst));
+        }
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
+        shutdown_woken.store(false, Ordering::SeqCst);
+
+        // The final ACK can also carry peer data; both paths must wake shutdown.
+        let payload: &[u8] = if ack_flags.contains(PSH) { b"reply" } else { b"" };
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq + 5, ack_flags, u16::MAX, payload))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stream.tcb.lock().unwrap().is_inflight_queue_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(shutdown_woken.load(Ordering::SeqCst), "final ACK did not wake shutdown");
+
+        // Waking requests another poll; it must not mark shutdown complete.
+        assert!(!stream.shutdown.completed.load(Ordering::Acquire));
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx).is_pending());
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
+        let packets = written(&mut up_rx).await;
+        let fins: Vec<_> = packets.iter().map(tcp_header_of).filter(|header| header.fin).collect();
+        assert_eq!(fins.len(), 1, "shutdown must send exactly one FIN");
+        assert_eq!(fins[0].sequence_number, local_seq + 5);
+    }
+
+    /// The application writes a request, shuts its write side down (`shutdown`), and reads the
+    /// peer's multi-segment reply until EOF:
+    /// - `fin_with_reply`: the peer's FIN rides on the last reply segment rather than a separate one
+    /// - `before_ack`: the peer sends the reply and its FIN before acknowledging our FIN
+    #[rstest]
+    #[case::then_separate_fin(false, false)]
+    #[case::with_fin(true, false)]
+    #[case::with_fin_before_our_fin_is_acknowledged(true, true)]
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_then_reply(#[case] fin_with_reply: bool, #[case] before_ack: bool) {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+        let sender = stream.stream_sender();
+        let reply: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+
+        let app = async {
+            stream.write_all(b"request").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut received).await.unwrap();
+            received
+        };
+        let remote = async {
+            let data_pkt = up_rx.recv().await.unwrap();
+            assert_eq!(data_pkt.payload.as_deref(), Some(&b"request"[..]));
+            let after_req = local_seq + b"request".len() as u32;
+            sender.send(peer_ack(1001, after_req)).unwrap();
+
+            let fin_pkt = up_rx.recv().await.unwrap();
+            assert!(tcp_header_of(&fin_pkt).fin);
+            let fin_ack = if before_ack {
+                after_req
+            } else {
+                let ack = after_req + 1;
+                sender.send(peer_ack(1001, ack)).unwrap();
+                ack
+            };
+
+            let chunks: Vec<&[u8]> = reply.chunks(1000).collect();
+            let mut seq = 1001;
+            for (i, chunk) in chunks.iter().enumerate() {
+                let is_last = i + 1 == chunks.len();
+                let flags = if fin_with_reply && is_last { ACK | PSH | FIN } else { ACK | PSH };
+                sender.send(peer_segment(seq, fin_ack, flags, u16::MAX, chunk)).unwrap();
+                seq += chunk.len() as u32;
+            }
+            if !fin_with_reply {
+                sender.send(peer_segment(seq, fin_ack, ACK | FIN, u16::MAX, &[])).unwrap();
+            }
+            if before_ack {
+                sender.send(peer_ack(seq + 1, after_req + 1)).unwrap();
+            }
+        };
+
+        let (received, ()) = tokio::join!(app, remote);
+        assert_eq!(received, reply);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::TimeWait);
+
+        drop(stream);
+        tokio::time::advance(TWO_MSL).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    /// In FinWait1, a data segment carrying the peer's FIN must deliver its payload and take the
+    /// FIN (moving to TimeWait), not leave the connection waiting in FinWait2.
+    #[rstest]
+    #[case::ack_fin(ACK | FIN)]
+    #[case::ack_psh_fin(ACK | PSH | FIN)]
+    #[tokio::test(start_paused = true)]
+    async fn fin_wait1_data_segment_carrying_fin_is_taken(#[case] flags: TcpFlags) {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        let _ = Pin::new(&mut stream).poll_shutdown(&mut cx);
+        let sent = written(&mut up_rx).await;
+        assert!(sent.iter().any(|p| tcp_header_of(p).fin), "shutdown did not send FIN");
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
+
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq + 1, flags, u16::MAX, b"tail"))
+            .unwrap();
+        assert_eq!(
+            acks(&mut up_rx).await,
+            [1006],
+            "flags {flags:?}: payload and FIN must be acknowledged by one ACK"
+        );
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::TimeWait, "flags {flags:?}");
+
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(buf, b"tail");
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fin_wait1_slow_reader_probes_without_reset_and_resends_when_window_reopens() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+        let sender = stream.stream_sender();
+
+        // Slow reader advertises a zero receive window before shutdown.
+        sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+        tokio::task::yield_now().await;
 
         let (woken, waker) = recording_waker();
         let mut cx = Context::from_waker(&waker);
-        assert!(
-            Pin::new(&mut stream).poll_write(&mut cx, b"early").is_pending(),
-            "a write was accepted before the SYN-ACK went out"
-        );
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        let first_fin = up_rx.recv().await.unwrap();
+        assert!(tcp_header_of(&first_fin).fin);
+
+        // Over 100 minutes with window == 0, an alive slow reader answering probes keeps the
+        // connection open without exhausting R2.
+        let mut probe_count = 0;
+        for _ in 0..100 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            let sent = written(&mut up_rx).await;
+            assert!(!sent.is_empty());
+            assert!(sent.iter().all(|p| {
+                let h = tcp_header_of(p);
+                h.fin && !h.rst && h.sequence_number == local_seq
+            }));
+            probe_count += sent.len();
+            sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+            tokio::task::yield_now().await;
+        }
+        assert!(probe_count >= 100);
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
+        assert!(!woken.load(Ordering::SeqCst));
+
+        // Peer opens its window without ACKing the FIN -> stack immediately resends FIN.
+        sender.send(peer_segment(1001, local_seq, ACK, u16::MAX, &[])).unwrap();
+        let resent_fin = up_rx.recv().await.unwrap();
+        assert!(tcp_header_of(&resent_fin).fin);
+        assert_eq!(tcp_header_of(&resent_fin).sequence_number, local_seq);
+
+        // With window > 0, if that resend is also lost, the timer retries and counts toward R2.
+        let timed_out_fin = advance(Duration::from_secs(60), &mut up_rx)
+            .await
+            .expect("expected RTO FIN resend after reopen");
+        assert!(tcp_header_of(&timed_out_fin).fin);
+        assert_eq!(tcp_header_of(&timed_out_fin).sequence_number, local_seq);
+
+        sender.send(peer_ack(1001, local_seq + 1)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(woken.load(Ordering::SeqCst));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait2);
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fin_wait1_window_flapping_still_reaches_r2() {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+        let sender = stream.stream_sender();
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        assert!(tcp_header_of(&up_rx.recv().await.unwrap()).fin);
+
+        // Even if the peer opens mid-interval and drops back to 0 right before every timer tick,
+        // the connection still reaches R2.
+        for _ in 0..200 {
+            sender.send(peer_segment(1001, local_seq, ACK, u16::MAX, &[])).unwrap();
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            if stream.tcb.lock().unwrap().get_state() == TcpState::Closed {
+                break;
+            }
+        }
+
         let packets = written(&mut up_rx).await;
-        assert!(
-            woken.load(std::sync::atomic::Ordering::SeqCst),
-            "the SYN-ACK did not wake the writer"
-        );
-        assert!(
-            matches!(packets.as_slice(), [packet] if tcp_header_of(packet).syn),
-            "the SYN-ACK is not the first packet"
-        );
-        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"early"), Poll::Ready(Ok(5))));
+        assert!(packets.iter().any(|p| tcp_header_of(p).rst));
+        assert!(woken.load(Ordering::SeqCst));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fin_wait1_dead_zero_window_peer_closes_after_unanswered_probes() {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+        let sender = stream.stream_sender();
+
+        sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
+        tokio::task::yield_now().await;
+
+        let (woken, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        assert!(tcp_header_of(&up_rx.recv().await.unwrap()).fin);
+
+        let mut rto = RTO;
+        for _ in 1..MAX_RETRANSMIT_COUNT {
+            let probe = advance(rto, &mut up_rx).await.expect("expected zero-window probe");
+            let hdr = tcp_header_of(&probe);
+            assert!(hdr.fin && !hdr.rst);
+            assert_eq!(hdr.sequence_number, local_seq);
+            assert!(destroy_rx.try_recv().is_err());
+            rto = (rto * 2).min(Duration::from_secs(60));
+        }
+
+        let rst = advance(rto, &mut up_rx)
+            .await
+            .expect("expected RST after unanswered zero-window probes");
+        assert!(tcp_header_of(&rst).rst);
+        tokio::task::yield_now().await;
+        assert!(woken.load(Ordering::SeqCst));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drop_in_fin_wait1_cleans_up_after_timeout() {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (stream, mut up_rx, _) = established_with_destroy(Some(destroy_tx)).await;
+
+        drop(stream);
+        let fin = up_rx.recv().await.unwrap();
+        assert!(tcp_header_of(&fin).fin);
+        assert!(destroy_rx.try_recv().is_err());
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(TIMEOUT).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drop_with_inflight_data_sends_fin_after_ack() {
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
+        let sender = stream.stream_sender();
+
+        stream.write_all(b"reply").await.unwrap();
+        let data_pkt = up_rx.recv().await.unwrap();
+        assert_eq!(data_pkt.payload.as_deref(), Some(&b"reply"[..]));
+
+        // Dropping while data is in flight must not send FIN yet or destroy the session.
+        drop(stream);
+        assert!(written(&mut up_rx).await.is_empty());
+        assert!(destroy_rx.try_recv().is_err());
+
+        // Once the peer ACKs the in-flight data, the stack sends FIN.
+        sender.send(peer_ack(1001, local_seq + 5)).unwrap();
         let packets = written(&mut up_rx).await;
-        assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].payload.as_deref(), Some(&b"early"[..]));
+        assert!(packets.iter().any(|p| tcp_header_of(p).fin));
     }
 
     #[tokio::test(start_paused = true)]
     async fn peer_fin_half_closes_and_keeps_write_open() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
+        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
+        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
 
         let (read_woken, read_waker) = recording_waker();
         let mut read_cx = Context::from_waker(&read_waker);
@@ -2456,6 +2714,7 @@ mod tests {
         assert!(shutdown_woken.load(Ordering::SeqCst));
         assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut shutdown_cx), Poll::Ready(Ok(()))));
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
+        assert_eq!(destroy_rx.try_recv(), Ok(()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2492,28 +2751,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn drop_with_inflight_data_sends_fin_after_ack() {
-        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
-        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
-        let sender = stream.stream_sender();
-
-        stream.write_all(b"reply").await.unwrap();
-        let data_pkt = up_rx.recv().await.unwrap();
-        assert_eq!(data_pkt.payload.as_deref(), Some(&b"reply"[..]));
-
-        // Dropping while data is in flight must not send FIN yet or destroy the session.
-        drop(stream);
-        assert!(written(&mut up_rx).await.is_empty());
-        assert!(destroy_rx.try_recv().is_err());
-
-        // Once the peer ACKs the in-flight data, the stack sends FIN.
-        sender.send(peer_ack(1001, local_seq + 5)).unwrap();
-        let packets = written(&mut up_rx).await;
-        assert!(packets.iter().any(|p| tcp_header_of(p).fin));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn last_ack_retransmits_fin_with_original_seq() {
+    async fn close_wait_timeout_resets_on_write_and_blocks_writes_after_fin() {
         let (mut stream, mut up_rx, local_seq) = established().await;
 
         stream
@@ -2522,17 +2760,27 @@ mod tests {
             .unwrap();
         written(&mut up_rx).await;
 
-        let (_, waker) = recording_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
-        let first_fin = up_rx.recv().await.unwrap();
-        assert!(tcp_header_of(&first_fin).fin);
-        assert_eq!(tcp_header_of(&first_fin).sequence_number, local_seq);
-
+        // Write after half of CLOSE_WAIT_TIMEOUT (and peer ACKs it), resetting the backstop.
+        let half = CLOSE_WAIT_TIMEOUT / 2;
+        tokio::time::advance(half).await;
+        stream.write_all(b"chunk").await.unwrap();
+        up_rx.recv().await.unwrap();
+        stream.stream_sender().send(peer_ack(1002, local_seq + 5)).unwrap();
         tokio::task::yield_now().await;
-        let retry_fin = advance(LAST_ACK_TIMEOUT, &mut up_rx).await.expect("no FIN retransmission");
-        assert!(tcp_header_of(&retry_fin).fin);
-        assert_eq!(tcp_header_of(&retry_fin).sequence_number, local_seq);
+
+        // Advance another half: past the original timeout from FIN, but before timeout from last write.
+        tokio::time::advance(half).await;
+        tokio::task::yield_now().await;
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::CloseWait);
+
+        // Advance the remaining half: backstop sends FIN -> LastAck; further writes fail with BrokenPipe.
+        tokio::time::advance(half).await;
+        tokio::task::yield_now().await;
+        let packets = written(&mut up_rx).await;
+        assert!(packets.iter().any(|p| tcp_header_of(p).fin));
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::LastAck);
+        let err = stream.write_all(b"after-fin").await.unwrap_err();
+        assert_eq!(err.kind(), BrokenPipe);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2558,6 +2806,29 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
         assert_eq!(destroy_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_ack_retransmits_fin_with_original_seq() {
+        let (mut stream, mut up_rx, local_seq) = established().await;
+
+        stream
+            .stream_sender()
+            .send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[]))
+            .unwrap();
+        written(&mut up_rx).await;
+
+        let (_, waker) = recording_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+        let first_fin = up_rx.recv().await.unwrap();
+        assert!(tcp_header_of(&first_fin).fin);
+        assert_eq!(tcp_header_of(&first_fin).sequence_number, local_seq);
+
+        tokio::task::yield_now().await;
+        let retry_fin = advance(LAST_ACK_TIMEOUT, &mut up_rx).await.expect("no FIN retransmission");
+        assert!(tcp_header_of(&retry_fin).fin);
+        assert_eq!(tcp_header_of(&retry_fin).sequence_number, local_seq);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2631,56 +2902,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn close_wait_timeout_resets_on_write_and_blocks_writes_after_fin() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-
-        stream
-            .stream_sender()
-            .send(peer_segment(1001, local_seq, ACK | FIN, u16::MAX, &[]))
-            .unwrap();
-        written(&mut up_rx).await;
-
-        // Write after half of CLOSE_WAIT_TIMEOUT (and peer ACKs it), resetting the backstop.
-        let half = CLOSE_WAIT_TIMEOUT / 2;
-        tokio::time::advance(half).await;
-        stream.write_all(b"chunk").await.unwrap();
-        up_rx.recv().await.unwrap();
-        stream.stream_sender().send(peer_ack(1002, local_seq + 5)).unwrap();
-        tokio::task::yield_now().await;
-
-        // Advance another half: past the original timeout from FIN, but before timeout from last write.
-        tokio::time::advance(half).await;
-        tokio::task::yield_now().await;
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::CloseWait);
-
-        // Advance the remaining half: backstop sends FIN -> LastAck; further writes fail with BrokenPipe.
-        tokio::time::advance(half).await;
-        tokio::task::yield_now().await;
-        let packets = written(&mut up_rx).await;
-        assert!(packets.iter().any(|p| tcp_header_of(p).fin));
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::LastAck);
-        let err = stream.write_all(b"after-fin").await.unwrap_err();
-        assert_eq!(err.kind(), BrokenPipe);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn drop_in_fin_wait1_cleans_up_after_timeout() {
-        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
-        let (stream, mut up_rx, _) = established_with_destroy(Some(destroy_tx)).await;
-
-        drop(stream);
-        let fin = up_rx.recv().await.unwrap();
-        assert!(tcp_header_of(&fin).fin);
-        assert!(destroy_rx.try_recv().is_err());
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(TIMEOUT).await;
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-        assert_eq!(destroy_rx.try_recv(), Ok(()));
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn last_ack_exhaustion_completes_shutdown() {
         let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
         let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
@@ -2711,61 +2932,6 @@ mod tests {
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
         assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
         assert_eq!(destroy_rx.try_recv(), Ok(()));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn fin_wait1_slow_reader_probes_without_reset_and_resends_when_window_reopens() {
-        let (mut stream, mut up_rx, local_seq) = established().await;
-        let sender = stream.stream_sender();
-
-        // Slow reader advertises a zero receive window before shutdown.
-        sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
-        tokio::task::yield_now().await;
-
-        let (woken, waker) = recording_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
-        let first_fin = up_rx.recv().await.unwrap();
-        assert!(tcp_header_of(&first_fin).fin);
-
-        // Over 100 minutes with window == 0, an alive slow reader answering probes keeps the
-        // connection open without exhausting R2.
-        let mut probe_count = 0;
-        for _ in 0..100 {
-            tokio::time::advance(Duration::from_secs(60)).await;
-            tokio::task::yield_now().await;
-            let sent = written(&mut up_rx).await;
-            assert!(!sent.is_empty());
-            assert!(sent.iter().all(|p| {
-                let h = tcp_header_of(p);
-                h.fin && !h.rst && h.sequence_number == local_seq
-            }));
-            probe_count += sent.len();
-            sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
-            tokio::task::yield_now().await;
-        }
-        assert!(probe_count >= 100);
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait1);
-        assert!(!woken.load(Ordering::SeqCst));
-
-        // Peer opens its window without ACKing the FIN -> stack immediately resends FIN.
-        sender.send(peer_segment(1001, local_seq, ACK, u16::MAX, &[])).unwrap();
-        let resent_fin = up_rx.recv().await.unwrap();
-        assert!(tcp_header_of(&resent_fin).fin);
-        assert_eq!(tcp_header_of(&resent_fin).sequence_number, local_seq);
-
-        // With window > 0, if that resend is also lost, the timer retries and counts toward R2.
-        let timed_out_fin = advance(Duration::from_secs(60), &mut up_rx)
-            .await
-            .expect("expected RTO FIN resend after reopen");
-        assert!(tcp_header_of(&timed_out_fin).fin);
-        assert_eq!(tcp_header_of(&timed_out_fin).sequence_number, local_seq);
-
-        sender.send(peer_ack(1001, local_seq + 1)).unwrap();
-        tokio::task::yield_now().await;
-        assert!(woken.load(Ordering::SeqCst));
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::FinWait2);
-        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2850,74 +3016,6 @@ mod tests {
         assert!(woken.load(Ordering::SeqCst));
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::TimeWait);
         assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn fin_wait1_window_flapping_still_reaches_r2() {
-        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
-        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
-        let sender = stream.stream_sender();
-
-        let (woken, waker) = recording_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
-        assert!(tcp_header_of(&up_rx.recv().await.unwrap()).fin);
-
-        // Even if the peer opens mid-interval and drops back to 0 right before every timer tick,
-        // the connection still reaches R2.
-        for _ in 0..200 {
-            sender.send(peer_segment(1001, local_seq, ACK, u16::MAX, &[])).unwrap();
-            tokio::time::advance(Duration::from_millis(500)).await;
-            tokio::task::yield_now().await;
-            sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
-            tokio::time::advance(Duration::from_millis(500)).await;
-            tokio::task::yield_now().await;
-            if stream.tcb.lock().unwrap().get_state() == TcpState::Closed {
-                break;
-            }
-        }
-
-        let packets = written(&mut up_rx).await;
-        assert!(packets.iter().any(|p| tcp_header_of(p).rst));
-        assert!(woken.load(Ordering::SeqCst));
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
-        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
-        assert_eq!(destroy_rx.try_recv(), Ok(()));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn fin_wait1_dead_zero_window_peer_closes_after_unanswered_probes() {
-        let (destroy_tx, mut destroy_rx) = tokio::sync::oneshot::channel();
-        let (mut stream, mut up_rx, local_seq) = established_with_destroy(Some(destroy_tx)).await;
-        let sender = stream.stream_sender();
-
-        sender.send(peer_segment(1001, local_seq, ACK, 0, &[])).unwrap();
-        tokio::task::yield_now().await;
-
-        let (woken, waker) = recording_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
-        assert!(tcp_header_of(&up_rx.recv().await.unwrap()).fin);
-
-        let mut rto = RTO;
-        for _ in 1..MAX_RETRANSMIT_COUNT {
-            let probe = advance(rto, &mut up_rx).await.expect("expected zero-window probe");
-            let hdr = tcp_header_of(&probe);
-            assert!(hdr.fin && !hdr.rst);
-            assert_eq!(hdr.sequence_number, local_seq);
-            assert!(destroy_rx.try_recv().is_err());
-            rto = (rto * 2).min(Duration::from_secs(60));
-        }
-
-        let rst = advance(rto, &mut up_rx)
-            .await
-            .expect("expected RST after unanswered zero-window probes");
-        assert!(tcp_header_of(&rst).rst);
-        tokio::task::yield_now().await;
-        assert!(woken.load(Ordering::SeqCst));
-        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Closed);
-        assert!(matches!(Pin::new(&mut stream).poll_shutdown(&mut cx), Poll::Ready(Ok(()))));
-        assert_eq!(destroy_rx.try_recv(), Ok(()));
     }
 
     #[tokio::test(start_paused = true)]

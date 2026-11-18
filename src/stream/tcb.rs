@@ -607,24 +607,11 @@ impl InflightPacket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn test_in_flight_packet() {
-        let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50]);
-
-        assert!(p.contains_seq_num((u32::MAX - 1).into()));
-        assert!(p.contains_seq_num(u32::MAX.into()));
-        assert!(p.contains_seq_num(0.into()));
-        assert!(p.contains_seq_num(1.into()));
-        assert!(p.contains_seq_num(2.into()));
-
-        assert!(!p.contains_seq_num(3.into()));
-    }
-
-    #[test]
-    fn test_get_unordered_packets_with_max_bytes() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
+    fn default_tcb(ack: SeqNum) -> Tcb {
+        Tcb::new(
+            ack,
             u16::MAX,
             None,
             1500,
@@ -633,7 +620,96 @@ mod tests {
             MAX_COUNT_FOR_DUP_ACK,
             RTO,
             MAX_RETRANSMIT_COUNT,
-        );
+        )
+    }
+
+    fn tcb_with_rto(rto: Duration) -> Tcb {
+        Tcb::new(
+            SeqNum(1000),
+            u16::MAX,
+            None,
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            rto,
+            MAX_RETRANSMIT_COUNT,
+        )
+    }
+
+    // A `Tcb` opened by a SYN advertising `peer_window` under `peer_window_shift`.
+    fn window_tcb(peer_window: u16, peer_window_shift: Option<u8>, read_buffer_size: usize) -> Tcb {
+        Tcb::new(
+            SeqNum(1000),
+            peer_window,
+            peer_window_shift,
+            1500,
+            MAX_UNACK,
+            read_buffer_size,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        )
+    }
+
+    // --- In-flight packet & queue tests ---
+
+    #[rstest]
+    #[case(u32::MAX - 1, true)]
+    #[case(u32::MAX, true)]
+    #[case(0, true)]
+    #[case(1, true)]
+    #[case(2, true)]
+    #[case(3, false)]
+    fn test_in_flight_packet(#[case] seq: u32, #[case] expected: bool) {
+        let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50]);
+        assert_eq!(p.contains_seq_num(seq.into()), expected);
+    }
+
+    #[test]
+    fn test_update_inflight_packet_queue() {
+        let mut tcb = default_tcb(SeqNum(1000));
+        tcb.seq = SeqNum(100); // setting the initial seq
+
+        // insert 3 consecutive packets
+        tcb.add_inflight_packet(vec![1; 500]).unwrap(); // seq=100, len=500
+        tcb.add_inflight_packet(vec![2; 500]).unwrap(); // seq=600, len=500
+        tcb.add_inflight_packet(vec![3; 500]).unwrap(); // seq=1100, len=500
+
+        // test 1: confirm partial packets (ack=800)
+        tcb.update_inflight_packet_queue(SeqNum(800));
+        assert_eq!(tcb.inflight_packets.len(), 2); // remaining two packets
+        let first_packet = tcb.inflight_packets.first_key_value().unwrap().1;
+        assert_eq!(first_packet.seq, SeqNum(800)); // the remaining part of the first packet
+        assert_eq!(first_packet.payload.len(), 300); // remaining 300 bytes in the first packet
+        let second_packet = tcb.inflight_packets.last_key_value().unwrap().1;
+        assert_eq!(second_packet.seq, SeqNum(1100)); // no change in the second packet
+
+        // test 2: confirm all packets (ack=2000)
+        tcb.update_inflight_packet_queue(SeqNum(2000));
+        assert_eq!(tcb.inflight_packets.len(), 0); // all packets are acknowledged
+    }
+
+    #[test]
+    fn test_update_inflight_packet_queue_cumulative_ack() {
+        let mut tcb = default_tcb(SeqNum(1000));
+        tcb.seq = SeqNum(1000);
+
+        // Insert 3 consecutive packets
+        tcb.add_inflight_packet(vec![1; 500]).unwrap(); // seq=1000, len=500
+        tcb.add_inflight_packet(vec![2; 500]).unwrap(); // seq=1500, len=500
+        tcb.add_inflight_packet(vec![3; 500]).unwrap(); // seq=2000, len=500
+
+        // Emulate cumulative ACK: ack=2500
+        tcb.update_inflight_packet_queue(SeqNum(2500));
+        assert_eq!(tcb.inflight_packets.len(), 0); // all packets should be removed
+    }
+
+    // --- Unordered packet & receive buffer tests ---
+
+    #[test]
+    fn test_get_unordered_packets_with_max_bytes() {
+        let mut tcb = default_tcb(SeqNum(1000));
 
         // insert 3 consecutive packets
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]); // seq=1000, len=500
@@ -667,17 +743,7 @@ mod tests {
     /// trims a segment to the part that lies in the window), instead of being dropped whole.
     #[test]
     fn test_add_unordered_packet_keeps_the_new_part_of_a_straddling_segment() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = default_tcb(SeqNum(1000));
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 100]);
         tcb.consume_unordered_packets(usize::MAX).unwrap();
         assert_eq!(tcb.ack, SeqNum(1100));
@@ -694,17 +760,7 @@ mod tests {
 
     #[test]
     fn test_add_unordered_packet_keeps_straddling_tail_across_sequence_wrap() {
-        let mut tcb = Tcb::new(
-            SeqNum(3),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = default_tcb(SeqNum(3));
 
         // MAX-2, MAX-1, MAX, 0, 1, 2 are already acknowledged; 3 and 4 are new.
         tcb.add_unordered_packet(SeqNum(u32::MAX - 2), vec![10, 11, 12, 13, 14, 15, 16, 17]);
@@ -721,17 +777,7 @@ mod tests {
 
     #[test]
     fn test_add_unordered_packet_enforces_read_buffer() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = default_tcb(SeqNum(1000));
 
         // fill the receive buffer to its limit
         tcb.add_unordered_packet(SeqNum(1000), vec![7; READ_BUFFER_SIZE]);
@@ -744,17 +790,7 @@ mod tests {
 
     #[test]
     fn test_consume_trims_overlapping_head_entry() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = default_tcb(SeqNum(1000));
 
         // an out-of-order segment stored ahead of ack
         tcb.add_unordered_packet(SeqNum(1200), vec![2; 300]);
@@ -768,79 +804,12 @@ mod tests {
         assert_eq!(tcb.unordered_packets.len(), 0);
     }
 
-    #[test]
-    fn test_update_inflight_packet_queue() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
-        tcb.seq = SeqNum(100); // setting the initial seq
-
-        // insert 3 consecutive packets
-        tcb.add_inflight_packet(vec![1; 500]).unwrap(); // seq=100, len=500
-        tcb.add_inflight_packet(vec![2; 500]).unwrap(); // seq=600, len=500
-        tcb.add_inflight_packet(vec![3; 500]).unwrap(); // seq=1100, len=500
-
-        // test 1: confirm partial packets (ack=800)
-        tcb.update_inflight_packet_queue(SeqNum(800));
-        assert_eq!(tcb.inflight_packets.len(), 2); // remaining two packets
-        let first_packet = tcb.inflight_packets.first_key_value().unwrap().1;
-        assert_eq!(first_packet.seq, SeqNum(800)); // the remaining part of the first packet
-        assert_eq!(first_packet.payload.len(), 300); // remaining 300 bytes in the first packet
-        let second_packet = tcb.inflight_packets.last_key_value().unwrap().1;
-        assert_eq!(second_packet.seq, SeqNum(1100)); // no change in the second packet
-
-        // test 2: confirm all packets (ack=2000)
-        tcb.update_inflight_packet_queue(SeqNum(2000));
-        assert_eq!(tcb.inflight_packets.len(), 0); // all packets are acknowledged
-    }
-
-    #[test]
-    fn test_update_inflight_packet_queue_cumulative_ack() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
-        tcb.seq = SeqNum(1000);
-
-        // Insert 3 consecutive packets
-        tcb.add_inflight_packet(vec![1; 500]).unwrap(); // seq=1000, len=500
-        tcb.add_inflight_packet(vec![2; 500]).unwrap(); // seq=1500, len=500
-        tcb.add_inflight_packet(vec![3; 500]).unwrap(); // seq=2000, len=500
-
-        // Emulate cumulative ACK: ack=2500
-        tcb.update_inflight_packet_queue(SeqNum(2500));
-        assert_eq!(tcb.inflight_packets.len(), 0); // all packets should be removed
-    }
+    // --- Retransmission timer & backoff tests ---
 
     /// RFC 6298 §5's note: the backed-off timeout collapses once a segment sent exactly once is acknowledged
     #[tokio::test(start_paused = true)]
     async fn test_backoff_collapses_on_an_unretransmitted_segment() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = default_tcb(SeqNum(1000));
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
         tokio::time::advance(RTO).await;
@@ -862,17 +831,7 @@ mod tests {
     /// RFC 6298 §2.4: a configured timeout below one second is raised to one second.
     #[tokio::test(start_paused = true)]
     async fn test_timeout_below_one_second_is_raised() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            Duration::from_millis(100),
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = tcb_with_rto(Duration::from_millis(100));
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
         assert_eq!(
@@ -884,17 +843,7 @@ mod tests {
     /// A configured timeout beyond the clock's range gives a deadline of `None`.
     #[tokio::test(start_paused = true)]
     async fn test_timeout_too_large_for_the_clock_has_no_deadline() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            Duration::MAX,
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = tcb_with_rto(Duration::MAX);
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
         assert!(tcb.get_retransmission_deadline().is_none());
@@ -904,17 +853,7 @@ mod tests {
     /// retransmitted before the backed-off timeout has run from that expiry.
     #[tokio::test(start_paused = true)]
     async fn test_expiry_restarts_the_timer_for_every_segment() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = default_tcb(SeqNum(1000));
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
         tokio::time::advance(Duration::from_millis(900)).await;
@@ -936,17 +875,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_backoff_never_shortens_a_large_configured_timeout() {
         let rto = Duration::from_secs(120);
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            rto,
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = tcb_with_rto(rto);
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
         tokio::time::advance(rto).await;
@@ -958,17 +887,7 @@ mod tests {
     /// after a longer wait each time, and it stays outstanding once R2 reports the connection closed.
     #[tokio::test(start_paused = true)]
     async fn test_retransmit_with_exponential_backoff() {
-        let mut tcb = Tcb::new(
-            SeqNum(1000),
-            u16::MAX,
-            None,
-            1500,
-            MAX_UNACK,
-            READ_BUFFER_SIZE,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        );
+        let mut tcb = default_tcb(SeqNum(1000));
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
@@ -998,41 +917,28 @@ mod tests {
         assert!(!tcb.is_inflight_queue_empty());
     }
 
-    /// A peer shift of 7 is applied to every window the peer advertises after the handshake.
-    #[test]
-    fn test_peer_window_shift_is_taken_from_the_syn() {
-        let mut tcb = window_tcb(4000, Some(7), READ_BUFFER_SIZE);
+    // --- Window scaling tests ---
+
+    /// RFC 7323 §2.3: peer window shift is taken from the SYN, omitted when absent, and clamped to 14.
+    #[rstest]
+    #[case::no_option(None, 40_000, None)]
+    #[case::from_syn(Some(7), 40_000 << 7, Some(0))]
+    #[case::clamped_above_max(Some(15), 40_000 << MAX_WINDOW_SHIFT, Some(0))]
+    fn test_peer_window_shift(#[case] peer_shift: Option<u8>, #[case] expected_send_window: u32, #[case] expected_recv_shift: Option<u8>) {
+        let mut tcb = window_tcb(4000, peer_shift, READ_BUFFER_SIZE);
         assert_eq!(tcb.get_send_window(), 4000); // the SYN's own window is unscaled
+        assert_eq!(tcb.get_recv_window_shift(), expected_recv_shift);
 
         tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
-        assert_eq!(tcb.get_send_window(), 40_000 << 7);
-    }
-
-    /// A peer that offers no window scale option has its windows honoured as they stand.
-    #[test]
-    fn test_no_window_scale_option_leaves_the_window_unshifted() {
-        let mut tcb = window_tcb(4000, None, READ_BUFFER_SIZE);
-        assert_eq!(tcb.get_send_window(), 4000);
-
-        tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
-        assert_eq!(tcb.get_send_window(), 40_000);
-        assert_eq!(tcb.get_recv_window_shift(), None);
-    }
-
-    /// RFC 7323 §2.3 limits the shift count to 14, so a larger one is used as 14.
-    #[test]
-    fn test_peer_window_shift_above_the_maximum_is_clamped() {
-        let mut tcb = window_tcb(4000, Some(15), READ_BUFFER_SIZE);
-
-        tcb.update_send_window(&TcpHeader::new(1, 2, 1000, 40_000));
-        assert_eq!(tcb.get_send_window(), 40_000 << MAX_WINDOW_SHIFT);
+        assert_eq!(tcb.get_send_window(), expected_send_window);
     }
 
     /// A peer opening with a closed window is held to it, whatever shift the same SYN offers.
-    #[test]
-    fn test_zero_peer_window_is_honoured() {
-        assert_eq!(window_tcb(0, None, READ_BUFFER_SIZE).get_send_window(), 0);
-        assert_eq!(window_tcb(0, Some(7), READ_BUFFER_SIZE).get_send_window(), 0);
+    #[rstest]
+    #[case::unscaled(None)]
+    #[case::scaled(Some(7))]
+    fn test_zero_peer_window_is_honoured(#[case] peer_window_shift: Option<u8>) {
+        assert_eq!(window_tcb(0, peer_window_shift, READ_BUFFER_SIZE).get_send_window(), 0);
     }
 
     /// The announced shift is the smallest expressing the read buffer in 16 bits, the advertised
@@ -1053,20 +959,5 @@ mod tests {
         // the advertised window shrinks as the buffer fills
         tcb.add_unordered_packet(SeqNum(1000), vec![0; buffer - 1000]);
         assert_eq!(usize::from(tcb.get_scaled_recv_window()), 1000 >> 5);
-    }
-
-    // A `Tcb` opened by a SYN advertising `peer_window` under `peer_window_shift`.
-    fn window_tcb(peer_window: u16, peer_window_shift: Option<u8>, read_buffer_size: usize) -> Tcb {
-        Tcb::new(
-            SeqNum(1000),
-            peer_window,
-            peer_window_shift,
-            1500,
-            MAX_UNACK,
-            read_buffer_size,
-            MAX_COUNT_FOR_DUP_ACK,
-            RTO,
-            MAX_RETRANSMIT_COUNT,
-        )
     }
 }

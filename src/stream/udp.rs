@@ -226,6 +226,7 @@ impl Drop for IpStackUdpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use tokio::io::AsyncReadExt;
 
     fn stream(first_payload: Vec<u8>) -> IpStackUdpStream {
@@ -281,22 +282,23 @@ mod tests {
 
     // A datagram larger than the caller's buffer used to panic `put_slice`; it
     // must now truncate to the buffer instead. Covers both branches of poll_read.
-
+    #[rstest]
+    #[case::first_payload(true, 7)]
+    #[case::relayed_datagram(false, 9)]
     #[tokio::test]
-    async fn poll_read_truncates_oversized_first_payload() {
-        let mut s = stream(vec![7u8; 1250]);
+    async fn poll_read_truncates_oversized_datagram(#[case] is_first_payload: bool, #[case] fill: u8) {
+        let payload = vec![fill; 1250];
+        let mut s = if is_first_payload {
+            stream(payload)
+        } else {
+            let mut s = stream(Vec::new());
+            s.first_payload = None; // skip to the stream_receiver branch
+            let pkt = s.create_rev_packet(64, payload).unwrap();
+            s.stream_sender().send(pkt).unwrap();
+            s
+        };
         let mut small = [0u8; 502];
         assert_eq!(s.read(&mut small).await.unwrap(), 502);
-        assert!(small.iter().all(|&b| b == 7));
-    }
-
-    #[tokio::test]
-    async fn poll_read_truncates_oversized_relayed_datagram() {
-        let mut s = stream(Vec::new());
-        s.first_payload = None; // skip to the stream_receiver branch
-        let pkt = s.create_rev_packet(64, vec![9u8; 1250]).unwrap();
-        s.stream_sender().send(pkt).unwrap();
-        let mut small = [0u8; 502];
-        assert_eq!(s.read(&mut small).await.unwrap(), 502);
+        assert!(small.iter().all(|&b| b == fill));
     }
 }
