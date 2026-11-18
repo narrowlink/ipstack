@@ -72,6 +72,7 @@ pub(crate) struct Tcb {
     recv_window_shift: Option<u8>,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
+    inflight_syn: Option<InflightSyn>,
     inflight_fin: Option<InflightFin>,
     time_wait_deadline: Option<tokio::time::Instant>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
@@ -140,6 +141,7 @@ impl Tcb {
             recv_window_shift,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
+            inflight_syn: None,
             inflight_fin: None,
             time_wait_deadline: None,
             unordered_packets: BTreeMap::new(),
@@ -435,6 +437,22 @@ impl Tcb {
         self.inflight_packets.get(&seq)
     }
 
+    pub(crate) fn arm_inflight_syn(&mut self, seq: SeqNum) {
+        self.inflight_syn = Some(InflightSyn {
+            seq,
+            send_time: tokio::time::Instant::now(),
+            retransmit_count: 0,
+        });
+    }
+
+    pub(crate) fn inflight_syn_seq(&self) -> Option<SeqNum> {
+        self.inflight_syn.map(|syn| syn.seq)
+    }
+
+    pub(crate) fn clear_inflight_syn(&mut self) {
+        self.inflight_syn = None;
+    }
+
     pub(crate) fn arm_inflight_fin(&mut self, seq: SeqNum) {
         self.inflight_fin = Some(InflightFin {
             seq,
@@ -471,12 +489,21 @@ impl Tcb {
         self.time_wait_deadline = None;
     }
 
+    fn backoff_rto(&mut self) {
+        self.current_rto = self.current_rto.saturating_mul(2).min(MAX_RTO.max(self.rto));
+    }
+
     /// The deadline the connection waits on: the earliest send time in the inflight queue (or an
-    /// active-close FIN, including zero-window probes) plus the current retransmission timeout,
-    /// when the sum fits the clock.
+    /// unacknowledged SYN|ACK or active-close FIN, including zero-window probes) plus the current
+    /// retransmission timeout, when the sum fits the clock.
     pub(crate) fn get_retransmission_deadline(&self) -> Option<tokio::time::Instant> {
         if let Some(packet) = self.inflight_packets.values().next() {
             return packet.send_time.checked_add(self.current_rto);
+        }
+        if self.state == TcpState::SynReceived
+            && let Some(syn) = self.inflight_syn
+        {
+            return syn.send_time.checked_add(self.current_rto);
         }
         if matches!(self.state, TcpState::FinWait1 | TcpState::Closing)
             && let Some(fin) = self.inflight_fin
@@ -484,6 +511,29 @@ impl Tcb {
             return fin.send_time.checked_add(self.current_rto);
         }
         None
+    }
+
+    /// Returns the unacknowledged SYN|ACK sequence number if its RTO elapsed, or `exhausted = true`
+    /// once R2 transmissions are reached.
+    #[must_use]
+    pub(crate) fn collect_timed_out_inflight_syn(&mut self) -> (Option<SeqNum>, bool) {
+        if self.state != TcpState::SynReceived {
+            return (None, false);
+        }
+        let Some(syn) = self.inflight_syn.as_mut() else {
+            return (None, false);
+        };
+        if syn.send_time.elapsed() < self.current_rto {
+            return (None, false);
+        }
+        if syn.retransmit_count + 1 >= self.max_retransmit_count {
+            return (None, true);
+        }
+        syn.retransmit_count += 1;
+        syn.send_time = tokio::time::Instant::now();
+        let seq = syn.seq;
+        self.backoff_rto();
+        (Some(seq), false)
     }
 
     /// Returns the unacknowledged FIN sequence number if its RTO elapsed, or `exhausted = true`
@@ -513,8 +563,9 @@ impl Tcb {
             fin.unanswered_probes += 1;
         }
         fin.send_time = tokio::time::Instant::now();
-        self.current_rto = self.current_rto.saturating_mul(2).min(MAX_RTO.max(self.rto));
-        (Some(fin.seq), false)
+        let seq = fin.seq;
+        self.backoff_rto();
+        (Some(seq), false)
     }
 
     #[must_use]
@@ -540,7 +591,7 @@ impl Tcb {
         if !retransmit_list.is_empty() {
             let now = tokio::time::Instant::now();
             self.inflight_packets.values_mut().for_each(|packet| packet.send_time = now); // restart the timer, per RFC 6298 §5.6
-            self.current_rto = self.current_rto.saturating_mul(2).min(MAX_RTO.max(self.rto)); // back off the timer, per RFC 6298 §5.5
+            self.backoff_rto(); // back off the timer, per RFC 6298 §5.5
         }
         (retransmit_list, false)
     }
@@ -568,6 +619,13 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         self.get_usable_send_window() == 0
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InflightSyn {
+    seq: SeqNum,
+    send_time: tokio::time::Instant,
+    retransmit_count: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -915,6 +973,36 @@ mod tests {
 
         // the segment stays outstanding at R2; the connection closes rather than the queue losing it
         assert!(!tcb.is_inflight_queue_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_inflight_syn_retransmit_backoff_and_r2() {
+        let mut tcb = default_tcb(SeqNum(1000));
+        let syn_seq = tcb.get_seq();
+        tcb.increase_seq();
+        tcb.change_state(TcpState::SynReceived);
+        tcb.arm_inflight_syn(syn_seq);
+
+        assert_eq!(tcb.inflight_syn_seq(), Some(syn_seq));
+        assert_eq!(tcb.collect_timed_out_inflight_syn(), (None, false));
+
+        for i in 0..MAX_RETRANSMIT_COUNT {
+            let wait = tcb.get_retransmission_deadline().unwrap() - tokio::time::Instant::now();
+            tokio::time::advance(wait).await;
+
+            let (seq, exhausted) = tcb.collect_timed_out_inflight_syn();
+            if i + 1 < MAX_RETRANSMIT_COUNT {
+                assert_eq!(seq, Some(syn_seq));
+                assert!(!exhausted);
+            } else {
+                assert_eq!(seq, None);
+                assert!(exhausted);
+            }
+        }
+
+        tcb.clear_inflight_syn();
+        assert_eq!(tcb.inflight_syn_seq(), None);
+        assert!(tcb.get_retransmission_deadline().is_none());
     }
 
     // --- Window scaling tests ---
