@@ -1,4 +1,5 @@
 use crate::error::IpStackError;
+use bitflags::bitflags;
 use etherparse::{Ipv4Header, Ipv6Header, NetSlice, SlicedPacket, TcpHeader, UdpHeader};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -22,39 +23,17 @@ impl std::fmt::Display for NetworkTuple {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TcpFlags(u8);
-
-impl TcpFlags {
-    pub(crate) const CWR: Self = Self(0b10000000);
-    pub(crate) const ECE: Self = Self(0b01000000);
-    pub(crate) const URG: Self = Self(0b00100000);
-    pub(crate) const ACK: Self = Self(0b00010000);
-    pub(crate) const PSH: Self = Self(0b00001000);
-    pub(crate) const RST: Self = Self(0b00000100);
-    pub(crate) const SYN: Self = Self(0b00000010);
-    pub(crate) const FIN: Self = Self(0b00000001);
-
-    fn empty() -> Self {
-        Self(0)
-    }
-
-    pub(crate) fn contains(self, flags: Self) -> bool {
-        self.0 & flags.0 == flags.0
-    }
-}
-
-impl std::ops::BitOr for TcpFlags {
-    type Output = Self;
-
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-impl std::ops::BitOrAssign for TcpFlags {
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.0 |= rhs.0;
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct TcpFlags: u8 {
+        const CWR = 0b10000000;
+        const ECE = 0b01000000;
+        const URG = 0b00100000;
+        const ACK = 0b00010000;
+        const PSH = 0b00001000;
+        const RST = 0b00000100;
+        const SYN = 0b00000010;
+        const FIN = 0b00000001;
     }
 }
 

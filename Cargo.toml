@@ -12,6 +12,7 @@ readme = "README.md"
 [dependencies]
 atomic-waker = "1.1.2"
 ahash = { version = "0.8.12", default-features = false, features = ["std"] }
+bitflags = "2.13.2"
 etherparse = { version = "0.21.0", default-features = false, features = [
     "std",
 ] }
